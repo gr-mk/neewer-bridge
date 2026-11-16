@@ -404,8 +404,15 @@ SKY_TOP_ELEVATION = 10.0
 # orange sun on the horizon, then whitening. Unlike the brightness this is an
 # approximation, not a measured table; the last point is the --kelvin target.
 SKY_KELVIN = ((-12, 7500), (-5, 7500), (-3, 6000), (-1.5, 4000), (0, 2800), (2, 3200), (5, 4000))
-# Assumed colour of the warm and cold white LEDs when mixing them below 1%.
-WARM_KELVIN, COLD_KELVIN = 2500, 7500
+# The sky sunrise runs wholly in the channels frame, because switching between
+# it and the white frame shows a wrong colour for a moment. Matched by eye on
+# this light against the white frame at 2800K, at 1% and at 10%:
+#   channels brightness b with levels adding up to 176 is as bright as white b%
+#   2800K is about 95% warm and 5% cold, which puts the warm LEDs near 2700K
+#   a little red (about 1 part in 60) takes off a green cast
+CHANNELS_FULL = 176
+WARM_KELVIN, COLD_KELVIN = 2700, 7500
+SKY_RED_SHARE = 3 / 176.0
 
 
 def interpolate(table, x, log=False):
@@ -423,7 +430,7 @@ def interpolate(table, x, log=False):
 
 def sky_start_elevation(top_brightness):
     """The elevation at which the real sky is as dim as the light's faintest level."""
-    floor = interpolate(SKY_LUX, SKY_TOP_ELEVATION, log=True) / (top_brightness * 255.0)
+    floor = interpolate(SKY_LUX, SKY_TOP_ELEVATION, log=True) / (top_brightness * float(CHANNELS_FULL))
     low, high = SKY_LUX[0][0], SKY_TOP_ELEVATION
     for _ in range(40):
         middle = (low + high) / 2
@@ -450,20 +457,22 @@ def sky_setting(progress, top_brightness, top_kelvin):
         SKY_LUX, SKY_TOP_ELEVATION, log=True)
     colour = interpolate(SKY_KELVIN + ((SKY_TOP_ELEVATION, top_kelvin),), elevation)
     colour = max(KELVIN_MIN, min(KELVIN_MAX, colour))
-    if percent >= 1.0:
-        return ("white", int(round(colour / 100.0)) * 100, min(top_brightness, int(round(percent))))
-    # Below 1%: the white LEDs through the channels frame, mixed to the colour.
-    level = max(1, min(255, int(round(255 * percent))))
+    # The frame's brightness is a whole percent, so take the next one up and
+    # trim with the levels: steps stay fine all the way to the top.
+    brightness = max(1, min(100, int(math.ceil(percent - 1e-9))))
+    level = max(1, min(CHANNELS_FULL, int(round(CHANNELS_FULL * percent / brightness))))
     share = (1e6 / WARM_KELVIN - 1e6 / colour) / (1e6 / WARM_KELVIN - 1e6 / COLD_KELVIN)
     cold = int(round(level * max(0.0, min(1.0, share))))
-    levels = {name: value for name, value in (("cold", cold), ("warm", level - cold)) if value}
-    return ("channels", 1, levels)
+    red = int(round(level * SKY_RED_SHARE))
+    levels = {name: value for name, value in (("red", red), ("cold", cold), ("warm", level - cold)) if value}
+    return ("channels", brightness, levels)
 
 
 def sunrise_setting(progress, top_brightness, top_kelvin, style="sky"):
     """The light setting at a point in the sunrise, from 0.0 (start) to 1.0 (end).
 
     Returns ("channels", brightness, levels) or ("white", kelvin, brightness).
+    The sky style only ever returns the first kind.
     """
     if style == "sky":
         return sky_setting(progress, top_brightness, top_kelvin)
@@ -500,6 +509,8 @@ def glow_setting(progress, top_brightness, top_kelvin):
 def describe_setting(setting):
     if setting[0] == "channels":
         lit = ", ".join("%s %d" % (name, level) for name, level in sorted(setting[2].items()) if level)
+        if setting[1] > 1:
+            return "channels at %d%%: %s" % (setting[1], lit)
         return "faint: %s" % lit
     return "white %dK at %d%%" % (setting[1], setting[2])
 
@@ -586,7 +597,7 @@ def cmd_sunrise(light, args):
                     lost_since = None
                 last = setting
                 if args.style == "sky":
-                    name = "twilight" if setting[0] == "channels" else "daylight coming up"
+                    name = "twilight" if setting[1] == 1 else "daylight coming up"
                 elif setting[0] == "channels":
                     name = "warm white coming in" if setting[2].get("warm") else "red glow"
                 else:
