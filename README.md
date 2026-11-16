@@ -24,6 +24,7 @@ neewer faint 5              # dimmer than 1%: level 1 (dimmest) to 255
 neewer faint 5 --white both # use the cold white LEDs as well as the warm ones
 neewer channels 1 --warm 20 # drive the five LED channels directly, 0-255 each
 neewer sunrise --minutes 30 # ramp up the way a real sunrise brightens
+neewer follow               # show whether the light is following the sun
 neewer status
 ```
 
@@ -61,6 +62,47 @@ A sunrise usually runs with nobody watching, so:
 - If the light drops out, the ramp waits for it and carries on from wherever it should be by then, switching the light on again first. It gives up 5 minutes after the ramp should have ended.
 
 To start one at a set time, use the Sunrise switch in Apple Home (below).
+
+## Following the sun
+
+`./install.sh follow` makes the light follow the sun through the day. Once a minute it sets brightness and colour temperature from the sun's height: full and cool white by day, dimming and warming through sunset, then low and warm all night.
+
+It does not work out the sun's position itself. It reads the file that sundial writes every minute (`~/.local/state/sundial/state.json`). sundial is a separate program, not part of this project, that does the same job for the monitors. So the light and the screens move together and the location is set in one place. Without sundial running, the light is left alone.
+
+```
+neewer follow            # show what it is doing and why
+neewer follow off        # pause it; the light stays as it is
+neewer follow on         # start again, and take the light over now
+```
+
+The rules:
+
+- **It never switches the light on or off.** While the light is off it does nothing. At night it stops at the night level and stays lit.
+- **A setting made elsewhere wins.** If you set the light from Apple Home or with another `neewer` command, it leaves the light alone for two hours from that change, then follows again. `neewer follow on` ends the wait early. Switching the light off and on is not a new setting.
+- **It keeps out of a sunrise.** Nothing is sent while `neewer sunrise` runs. What the sunrise leaves is then held for two hours like any other setting.
+- **It only sends when the target changes.** That is about once a minute around sunrise and sunset, and not at all at midday or at night.
+- If the bridge or the light cannot be reached, it tries again each minute and writes one line to the log, not one a minute.
+
+The settings are in `follow.json` in the settings folder, and are read each minute:
+
+```
+{
+  "enabled": true,
+  "day_brightness": 100,
+  "night_brightness": 5,
+  "night_kelvin": 2700,
+  "hold_minutes": 120
+}
+```
+
+- Brightness runs from `night_brightness` to `day_brightness` with sundial's "daylight" share. With sundial's defaults that is the night level until the sun is 6 degrees below the horizon and the day level once it is 20 degrees up.
+- Colour is sundial's colour, kept within the light's 2500-7500K. While the sun goes from the horizon to 6 degrees below, it moves to `night_kelvin`.
+- `night_brightness` cannot go below 1, because 0 would switch the light off.
+- `hold_minutes` is how long a setting made elsewhere is left alone.
+
+It uses the ordinary white frame. After a sunrise the light is in the channels mode, so there is one brief wrong colour when following takes over.
+
+Each change goes to `~/Library/Logs/neewer-follow.log`. `python3 tests/test_follow.py` checks the rules without a light.
 
 ## Apple Home
 
@@ -109,10 +151,10 @@ Restart the service after changing it: `launchctl kickstart -k gui/$(id -u)/loca
 |---|---|
 | Bridge app | `~/Applications/NeewerBridge.app` |
 | Apple Home launcher app | `~/Applications/NeewerHomeKit.app` |
-| Background agents | `~/Library/LaunchAgents/local.neewer-bridge.plist`, `local.neewer-homekit.plist` |
+| Background agents | `~/Library/LaunchAgents/local.neewer-bridge.plist`, `local.neewer-homekit.plist`, `local.neewer-follow.plist` |
 | Command | `~/.local/bin/neewer` |
 | Settings, last state, Python environment, pairing keys | `~/Library/Application Support/NeewerBridge/` |
-| Logs | `~/Library/Logs/neewer-bridge.log`, `neewer-homekit.log` |
+| Logs | `~/Library/Logs/neewer-bridge.log`, `neewer-homekit.log`, `neewer-follow.log` |
 
 `bridge.json` in the settings folder takes `port`, `namePrefixes`, `name`, `peripheralID`, `probeSeconds` and `logWrites`. Restart the bridge after changing it:
 
@@ -126,6 +168,7 @@ launchctl kickstart -k gui/$(id -u)/local.neewer-bridge
 ./install.sh          # builds only if the bridge source changed
 ./install.sh cli      # reinstall just the command
 ./install.sh homekit  # install or update the Apple Home service
+./install.sh follow   # make the light follow the sun
 ./uninstall.sh        # add --purge to remove settings, pairing keys and logs too
 ```
 

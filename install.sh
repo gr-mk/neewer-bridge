@@ -6,6 +6,7 @@
 #                          `neewer` command, and (re)load the bridge agent
 #   ./install.sh cli       reinstall only the `neewer` command
 #   ./install.sh homekit   install or update the Apple Home service
+#   ./install.sh follow    make the light follow the sun, once a minute
 #
 # Rebuilding the bridge changes its code signature, and macOS then asks for
 # Bluetooth permission again. That is why the build is skipped when the bridge
@@ -127,12 +128,67 @@ install_homekit() {
 	echo "Setup code: \"$venv/bin/python\" \"$SUPPORT/homekit/neewer_homekit.py\" --pairing"
 }
 
+# Runs `neewer follow apply` once a minute. Unlike the two services this is a
+# timer, not a program that stays running, so it has its own agent file.
+install_follow() {
+	local label=local.neewer-follow log="$HOME/Library/Logs/neewer-follow.log"
+	local agent="$HOME/Library/LaunchAgents/$label.plist"
+	if [ ! -f "$HOME/.local/state/sundial/state.json" ]; then
+		echo "note: sundial has written no state file yet; the light is left alone until it does" >&2
+	fi
+	install_cli
+	mkdir -p "$SUPPORT" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+	if [ ! -f "$SUPPORT/follow.json" ]; then
+		printf '{\n  "enabled": true,\n  "day_brightness": 100,\n  "night_brightness": 5,\n  "night_kelvin": 2700,\n  "hold_minutes": 120\n}\n' >"$SUPPORT/follow.json"
+		echo "wrote default $SUPPORT/follow.json"
+	fi
+	cat >"$agent" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$label</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$CLI_DIR/neewer</string>
+		<string>follow</string>
+		<string>apply</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>StandardOutPath</key>
+	<string>$log</string>
+	<key>StandardErrorPath</key>
+	<string>$log</string>
+</dict>
+</plist>
+EOF
+	launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
+	local attempt
+	for attempt in 1 2 3 4 5; do
+		if launchctl bootstrap "$DOMAIN" "$agent" 2>/dev/null; then
+			echo "agent $label loaded; log at $log"
+			echo "Pause it with: neewer follow off"
+			return
+		fi
+		sleep 1
+	done
+	echo "could not load the agent; try: launchctl bootstrap $DOMAIN \"$agent\"" >&2
+	exit 1
+}
+
 case "${1:-}" in
 "") install_bridge ;;
 cli) install_cli ;;
 homekit) install_homekit ;;
+follow) install_follow ;;
 *)
-	echo "usage: $0 [cli|homekit]" >&2
+	echo "usage: $0 [cli|homekit|follow]" >&2
 	exit 2
 	;;
 esac

@@ -614,6 +614,239 @@ def cmd_sunrise(light, args):
     note("sunrise finished: %s" % describe(light.state))
 
 
+# ---------------------------------------------------------------- follow the sun
+
+# `neewer follow apply` runs once a minute and sets the light from the sun.
+# It does not work the sun out itself. sundial, the program that does the same
+# job for the monitors, writes the sun's height and its own target to a file
+# every minute, and this reads that file.
+FOLLOW_FILE = os.path.join(APP_DIR, "follow.json")
+FOLLOW_MEMORY_FILE = os.path.join(APP_DIR, "follow-state.json")
+SUNDIAL_STATE_FILE = os.path.expanduser("~/.local/state/sundial/state.json")
+SUNDIAL_STALE_SECONDS = 300
+FOLLOW_DEFAULTS = {
+    "enabled": True,
+    "day_brightness": 100,   # brightness with the sun well up
+    "night_brightness": 5,   # brightness after dark; never below 1, so never off
+    "night_kelvin": 2700,    # colour after dark
+    "hold_minutes": 120,     # how long a setting made elsewhere is left alone
+}
+# The colour moves from sundial's colour to the night colour while the sun goes
+# from the horizon down to the end of civil twilight.
+NIGHT_COLOUR_FROM, NIGHT_COLOUR_BY = 0.0, -6.0
+
+
+def follow_settings():
+    """follow.json over the defaults; a value of the wrong kind is ignored."""
+    given = read_json(FOLLOW_FILE, {})
+    settings = dict(FOLLOW_DEFAULTS)
+    for key, default in FOLLOW_DEFAULTS.items():
+        value = given.get(key, default)
+        if isinstance(default, bool):
+            good = isinstance(value, bool)
+        else:
+            good = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if good:
+            settings[key] = value
+    settings["night_brightness"] = int(max(1, min(100, settings["night_brightness"])))
+    settings["day_brightness"] = int(max(settings["night_brightness"], min(100, settings["day_brightness"])))
+    settings["night_kelvin"] = int(max(KELVIN_MIN, min(KELVIN_MAX, settings["night_kelvin"])))
+    settings["hold_minutes"] = max(0, settings["hold_minutes"])
+    return settings
+
+
+def follow_target(sun, settings):
+    """(kelvin, brightness) for the light, from sundial's target.
+
+    Brightness runs from the night level to the day level with sundial's
+    "daylight" share. Colour is sundial's, moving to the night colour as the
+    sun goes below the horizon, and kept inside what the light can show.
+    """
+    daylight = max(0.0, min(1.0, float(sun["daylight"])))
+    low, high = settings["night_brightness"], settings["day_brightness"]
+    brightness = int(round(low + (high - low) * daylight))
+    night = (NIGHT_COLOUR_FROM - float(sun["sun_elevation"])) / (NIGHT_COLOUR_FROM - NIGHT_COLOUR_BY)
+    night = max(0.0, min(1.0, night))
+    colour = float(sun["kelvin"]) + (settings["night_kelvin"] - float(sun["kelvin"])) * night
+    colour = int(round(colour / 100.0)) * 100
+    return max(KELVIN_MIN, min(KELVIN_MAX, colour)), max(1, min(100, brightness))
+
+
+def sundial_target(now):
+    """What sundial last worked out, or a Failure if it is missing or old."""
+    try:
+        age = now - os.stat(SUNDIAL_STATE_FILE).st_mtime
+    except OSError:
+        raise Failure("sundial has written no state file (%s)" % SUNDIAL_STATE_FILE)
+    if age > SUNDIAL_STALE_SECONDS:
+        raise Failure("sundial last ran %s ago" % duration(age))
+    sun = read_json(SUNDIAL_STATE_FILE, {}).get("target")
+    try:
+        float(sun["daylight"]), float(sun["sun_elevation"]), float(sun["kelvin"])
+    except (KeyError, TypeError, ValueError):
+        raise Failure("sundial's state file has no usable target")
+    return sun
+
+
+def sunrise_is_running():
+    """True while a `neewer sunrise` ramp is running, from a terminal or from Home."""
+    try:
+        listing = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in listing.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        words = command.split()
+        if pid == str(os.getpid()) or "--plan" in words:
+            continue
+        for index, word in enumerate(words):
+            if os.path.basename(word) in ("neewer", "neewer_cli.py") and "sunrise" in words[index + 1:]:
+                return True
+    return False
+
+
+def state_stamp():
+    try:
+        return os.stat(STATE_FILE).st_mtime_ns
+    except OSError:
+        return None
+
+
+def follow_look(state):
+    """The part of the last setting that says how the light looks.
+
+    Power is left out, so switching the light off and on is not taken for a
+    new setting. For white, only what the white frame carries counts: Apple
+    Home rewrites the other keys when it switches the light.
+    """
+    if state.get("mode") == "white":
+        return {key: state.get(key, 0) for key in ("mode", "kelvin", "brightness", "tint")}
+    return {key: value for key, value in state.items() if key != "on"}
+
+
+def follow_step(light, memory, now, send=True, sunrise_running=sunrise_is_running):
+    """Decides what to do this minute and, if `send`, does it.
+
+    Returns (situation, sentence, sent). `memory` is what the follower keeps
+    between runs, and is updated in place:
+      stamp, sent   the state file as the follower last left it
+      manual        a setting made elsewhere, and when it was made
+    """
+    settings = follow_settings()
+    if not settings["enabled"]:
+        return "off", "following is switched off", False
+    state = light.state
+    stamp = state_stamp()
+    look = follow_look(state)
+
+    # Whose setting is this? The follower's own, if the state file is as it
+    # left it, or shows the same setting (only the power was switched).
+    until = None
+    if stamp == memory.get("stamp") or look == memory.get("sent"):
+        memory.pop("manual", None)
+        memory["stamp"] = stamp
+    else:
+        manual = memory.get("manual")
+        if not isinstance(manual, dict) or manual.get("look") != look:
+            manual = memory["manual"] = {"look": look, "since": (stamp or 0) / 1e9}
+        until = manual["since"] + settings["hold_minutes"] * 60
+
+    if state.get("on") is not True:
+        return "light off", "the light is off; leaving it alone", False
+    if sunrise_running():
+        return "sunrise", "a sunrise is running; leaving it alone", False
+    if until is not None and now < until:
+        at = time.strftime("%H:%M", time.localtime(until))
+        return "hold " + at, "the light was set elsewhere (%s); following again at %s" % (describe(state), at), False
+
+    sun = sundial_target(now)
+    kelvin_now, brightness = follow_target(sun, settings)
+    wanted = {"mode": "white", "kelvin": kelvin_now, "brightness": brightness, "tint": 0}
+    wanted_text = "white %dK at %d%%" % (kelvin_now, brightness)
+    if look == wanted:
+        if send:
+            memory.pop("manual", None)
+            memory["stamp"], memory["sent"] = stamp, look
+        return "following", "following the sun; the light is already at %s" % wanted_text, False
+    if not send:
+        return "following", "following the sun; about to set %s" % wanted_text, False
+    if state_stamp() != stamp:
+        # Something else set the light a moment ago. Look again next minute.
+        return memory.get("situation", "following"), None, False
+    light.white(kelvin_now, brightness, 0, "linear", no_power=True)
+    memory.pop("manual", None)
+    memory["stamp"], memory["sent"] = state_stamp(), follow_look(light.state)
+    return "following", "sun %+.1f  %s" % (float(sun["sun_elevation"]), wanted_text), True
+
+
+def follow_apply(light, now=None, sunrise_running=sunrise_is_running):
+    """One run of the follower. Returns the line to log, or None.
+
+    A line is logged when the light is set and when the situation changes, so
+    an outage or a hold is one line, not one a minute.
+    """
+    now = time.time() if now is None else now
+    memory = read_json(FOLLOW_MEMORY_FILE, {})
+    before = json.dumps(memory, sort_keys=True)
+    try:
+        situation, sentence, sent = follow_step(light, memory, now, True, sunrise_running)
+    except Failure as failure:
+        situation, sentence, sent = "stuck", "cannot follow the sun: %s" % failure, False
+    changed = situation != memory.get("situation")
+    memory["situation"] = situation
+    if json.dumps(memory, sort_keys=True) != before:
+        write_json(FOLLOW_MEMORY_FILE, memory)
+    return sentence if sentence and (sent or changed) else None
+
+
+def cmd_follow(light, args):
+    light.quiet = True
+    if args.action == "apply":
+        # The minute timer runs this, so it must never fail loudly.
+        try:
+            line = follow_apply(light)
+        except Exception as error:  # noqa: BLE001
+            line = "unexpected error: %r" % (error,)
+        if line:
+            print("%s  %s" % (time.strftime("%F %T"), line), flush=True)
+        return
+    if args.action in ("on", "off"):
+        saved = dict(FOLLOW_DEFAULTS)
+        saved.update(read_json(FOLLOW_FILE, {}))
+        saved["enabled"] = args.action == "on"
+        write_json(FOLLOW_FILE, saved)
+        if args.action == "off":
+            print("following is off; the light stays as it is")
+            return
+        # Switching on also ends any hold: take the light over now.
+        memory = read_json(FOLLOW_MEMORY_FILE, {})
+        memory.pop("manual", None)
+        memory["stamp"], memory["sent"] = state_stamp(), follow_look(light.state)
+        write_json(FOLLOW_MEMORY_FILE, memory)
+        line = follow_apply(light)
+        print("following is on" + (": " + line if line else ""))
+        return
+    settings = follow_settings()
+    print("Following: %s (day %d%%, night %d%% at %dK, hold %g min)" % (
+        "on" if settings["enabled"] else "off", settings["day_brightness"],
+        settings["night_brightness"], settings["night_kelvin"], settings["hold_minutes"]))
+    now = time.time()
+    try:
+        sun = sundial_target(now)
+        print("Sun:       %+.1f degrees, daylight %d%%" % (
+            float(sun["sun_elevation"]), round(float(sun["daylight"]) * 100)))
+        print("Target:    white %dK at %d%%" % follow_target(sun, settings))
+    except Failure as failure:
+        print("Sun:       unknown (%s)" % failure)
+    print("Light:     %s" % describe(light.state))
+    try:
+        sentence = follow_step(light, read_json(FOLLOW_MEMORY_FILE, {}), now, send=False)[1]
+    except Failure as failure:
+        sentence = "cannot follow the sun: %s" % failure
+    print("Now:       %s" % sentence)
+
+
 def minutes(text):
     try:
         value = float(text)
@@ -778,6 +1011,10 @@ def build_parser():
     sunrise.add_argument("--style", choices=["sky", "glow"], default="sky",
                          help="sky follows the real sky's brightness (default); glow is the red-glow ramp")
     sunrise.add_argument("--plan", action="store_true", help="print the steps and send nothing")
+
+    follow = add("follow", cmd_follow, "follow the sun through the day: neewer follow on")
+    follow.add_argument("action", nargs="?", choices=["on", "off", "status", "apply"], default="status",
+                        help="on, off, status (default), or apply: set the light once, as the minute timer does")
 
     brightness = add("brightness", cmd_brightness, "change brightness, keep the colour", aliases=["dim"])
     brightness.add_argument("brightness", type=whole_percent, help="0-100")
