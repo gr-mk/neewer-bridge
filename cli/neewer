@@ -386,6 +386,10 @@ def cmd_brightness(light, args):
 # Red level at which warm white starts to come in. Red alone is the dimmest
 # thing the light can show, so the ramp opens with it.
 SUNRISE_RED_TOP = 32
+# A sunrise usually runs unattended, so a lost link is waited out rather than
+# ending the ramp. It gives up only this long after the ramp should have ended.
+SUNRISE_RETRY_SECONDS = 2.0
+SUNRISE_GIVE_UP_SECONDS = 300.0
 
 
 def sunrise_setting(progress, top_brightness, top_kelvin):
@@ -442,44 +446,83 @@ def cmd_sunrise(light, args):
         except OSError:
             return None
 
+    def note(text):
+        if not quiet:
+            print(text, flush=True)
+
+    own_stamp = None
+
+    def send(setting):
+        nonlocal own_stamp
+        if setting[0] == "channels":
+            levels = dict.fromkeys(CHANNELS, 0)
+            levels.update(setting[2])
+            light.channels(setting[1], levels, no_power=True)
+        else:
+            light.white(setting[1], setting[2], 0, "linear", no_power=True)
+        own_stamp = stamp()
+
+    def switch_on(setting):
+        """Always sends power on: the state file only says what was last sent,
+        and the light may have been put in standby on its own button, or lost
+        power. The step goes out before the power frame as well as after it, so
+        a light that keeps settings while in standby wakes faint, not at its
+        old setting."""
+        nonlocal own_stamp
+        send(setting)
+        light.power(True)
+        own_stamp = stamp()
+        time.sleep(0.3)  # a light coming out of standby ignores what follows too closely
+
     quiet, light.quiet = light.quiet, True  # one line per stage, not per step
-    light.wake_if_needed(False)
     interval = max(0.1, min(1.0, total / 900.0))
     started = time.monotonic()
-    last = stage = own_stamp = None
+    last = stage = lost_since = None
+    awake = False
     try:
         while True:
             progress = min(1.0, (time.monotonic() - started) / total)
             setting = sunrise_setting(progress, args.brightness, args.kelvin)
-            if setting != last:
+            if setting != last or not awake:
                 # Anything else that sets the light (Home, another neewer
                 # command) rewrites the state file; treat that as "stop".
                 if own_stamp is not None and stamp() != own_stamp:
-                    if not quiet:
-                        print("sunrise stopped: the light was changed elsewhere")
+                    note("sunrise stopped: the light was changed elsewhere")
                     return
+                try:
+                    if not awake:
+                        switch_on(setting)
+                        awake = True
+                    send(setting)
+                except Failure as failure:
+                    # After an outage the light may have lost power, so it is
+                    # switched on again once it is back.
+                    awake = False
+                    if lost_since is None:
+                        lost_since = time.monotonic()
+                        note("lost the light (%s); retrying" % failure)
+                    if progress >= 1.0 and time.monotonic() - started > total + SUNRISE_GIVE_UP_SECONDS:
+                        raise Failure("sunrise gave up: %s" % failure)
+                    time.sleep(SUNRISE_RETRY_SECONDS)
+                    continue
+                if lost_since is not None:
+                    note("the light is back after %s" % duration(time.monotonic() - lost_since))
+                    lost_since = None
+                last = setting
                 if setting[0] == "channels":
-                    levels = dict.fromkeys(CHANNELS, 0)
-                    levels.update(setting[2])
-                    light.channels(setting[1], levels, no_power=True)
                     name = "warm white coming in" if setting[2].get("warm") else "red glow"
                 else:
-                    light.white(setting[1], setting[2], 0, "linear", no_power=True)
                     name = "white, brightening"
-                own_stamp = stamp()
-                last = setting
-                if name != stage and not quiet:
-                    print("%s (%s)" % (name, describe_setting(setting)), flush=True)
+                if name != stage:
+                    note("%s (%s)" % (name, describe_setting(setting)))
                 stage = name
             if progress >= 1.0:
                 break
             time.sleep(interval)
     except KeyboardInterrupt:
-        if not quiet:
-            print("sunrise stopped at %s" % describe(light.state))
+        note("sunrise stopped at %s" % describe(light.state))
         return
-    if not quiet:
-        print("sunrise finished: %s" % describe(light.state))
+    note("sunrise finished: %s" % describe(light.state))
 
 
 def minutes(text):

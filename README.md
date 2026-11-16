@@ -51,6 +51,13 @@ Each stage gets time in proportion to the number of doublings it covers, so with
 
 Setting the light any other way, from Apple Home or with another `neewer` command, stops the ramp. Where stage 2 hands over to stage 3 has not been measured, only watched.
 
+A sunrise usually runs with nobody watching, so:
+
+- It always switches the light on, whatever the last setting says, in case the light was put in standby on its own button. The first step is sent before the power frame as well as after it, so a light that keeps a new setting while in standby wakes as a faint glow instead of at its old setting. Whether the CB200C keeps it has not been checked.
+- If the light drops out, the ramp waits for it and carries on from wherever it should be by then, switching the light on again first. It gives up 5 minutes after the ramp should have ended.
+
+To start one at a set time, use the Sunrise switch in Apple Home (below).
+
 ## Apple Home
 
 `./install.sh homekit` installs the service. It runs [HAP-python](https://github.com/ikalchev/HAP-python) in its own Python environment, under a small launcher app (`NeewerHomeKit.app`) so macOS has one named program to attach the local-network permission to.
@@ -68,12 +75,28 @@ Add `--qr code.svg` in place of `--pairing` to write the QR code to a file.
 - Home and the `neewer` command share one record of the last setting, so a change made with either shows up in the other within a few seconds.
 - If the bridge loses the light, Home shows "No Response" rather than a state it cannot change.
 - The pairing keys are in `homekit-data/` in the settings folder, readable only by you. Deleting that folder unpairs the light; remove it from the Home app first.
-- `homekit.json` in the settings folder takes `name` and `port` (default 51826).
+- `homekit.json` in the settings folder takes `name`, `port` (default 51826) and `sunrise` (below).
+
+### Sunrise switch
+
+The accessory has a second tile, a switch named Sunrise. Turning it on runs `neewer sunrise`; it turns itself off when the ramp ends, and turning it off stops the ramp. Any change to the light from Home also stops it.
+
+To wake up to it, make an automation in the Home app: Automation, then A Time of Day, pick the time the ramp should start (30 minutes before the alarm, with the default ramp), and choose the Sunrise switch, turned on. Time-of-day automations need a home hub (an Apple TV or HomePod), and the Mac has to be awake when it fires.
+
+The ramp is set in `homekit.json`; leave out any value to use the command's default:
+
+```
+{
+  "sunrise": {"minutes": 30, "brightness": 100, "kelvin": 5600}
+}
+```
+
+Restart the service after changing it: `launchctl kickstart -k gui/$(id -u)/local.neewer-homekit`. A value the command would reject is reported in `neewer-homekit.log` when the service starts, and the defaults are used. The ramp's progress goes to the same log.
 
 ## Things to know
 
 - **The light must be in Infinity mode.** If its display shows `CH` and a number in the top-left, it is in 2.4G mode and Bluetooth is off. Hold the button marked `2.4G` for two seconds to switch.
-- **The Mac must be logged in and awake.** macOS only allows Bluetooth inside a logged-in session.
+- **The Mac must be logged in and awake.** macOS only allows Bluetooth inside a logged-in session. For a Sunrise automation, that means awake at dawn too.
 - **The bridge does not know the light's Bluetooth address**, because macOS hides it from apps, but every command needs it. It is saved in `light.json`. `neewer address --detect` reads it from the system Bluetooth list.
 
 ## Files on the Mac

@@ -8,6 +8,9 @@ the local Neewer Bridge, using the same frame builder as the `neewer` command
 The light never reports its state, so Apple Home shows what was last sent, by
 Home or by the `neewer` command. Changes made on the light's own dial are not seen.
 
+A second tile, the Sunrise switch, runs `neewer sunrise`, so a Home automation
+can start the ramp at a set time. It turns itself off when the ramp ends.
+
     neewer_homekit.py            run the service
     neewer_homekit.py --pairing  print the setup code and pairing state as JSON
     neewer_homekit.py --qr FILE  write the pairing QR code to FILE as SVG
@@ -21,14 +24,17 @@ import os
 import secrets
 import signal
 import string
+import subprocess
 import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 import neewer_cli as cli  # noqa: E402
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+CLI_FILE = os.path.join(HERE, "neewer_cli.py")
 DATA_DIR = os.path.join(cli.APP_DIR, "homekit-data")
 KEYS_FILE = os.path.join(DATA_DIR, "accessory.state")
 PAIRING_FILE = os.path.join(DATA_DIR, "pairing.json")
@@ -123,6 +129,7 @@ class LightLink:
         self.sent_on = self.wanted["on"]
         self.sent_frame = None
         self.state_stamp = self.stamp()
+        self.sunrise = None  # a Sunrise, stopped whenever Home sets the light
         self.thread = threading.Thread(target=self.run, name="light-sender", daemon=True)
 
     @property
@@ -196,6 +203,10 @@ class LightLink:
             self.wake.clear()
             if self.stopping:
                 return
+            if self.sunrise is not None:
+                # A change from Home wins over a running sunrise. The ramp would
+                # notice by itself at its next step, but that can be a minute away.
+                self.sunrise.stop(wait=3)
             target = self.snapshot()
             try:
                 self.send(target)
@@ -263,9 +274,81 @@ class LightLink:
         return changed
 
 
+# ---------------------------------------------------------------- sunrise
+
+def sunrise_command(settings):
+    """The `neewer sunrise` command line, with options from homekit.json.
+
+    "sunrise": {"minutes": 30, "brightness": 100, "kelvin": 5600} in homekit.json
+    sets the ramp; any of the three may be left out. The options are checked with
+    the command's own parser now, so a mistake shows in the log at start, not at dawn.
+    """
+    given = settings.get("sunrise")
+    given = given if isinstance(given, dict) else {}
+    arguments = ["sunrise"]
+    for key in ("minutes", "brightness", "kelvin"):
+        if key in given:
+            arguments += ["--" + key, str(given[key])]
+    try:
+        cli.build_parser().parse_args(arguments)  # prints what is wrong, then exits
+    except SystemExit:
+        log.error("homekit.json: ignoring the sunrise settings %s and using the defaults", given)
+        arguments = ["sunrise"]
+    return [sys.executable, "-u", CLI_FILE] + arguments
+
+
+class Sunrise:
+    """Runs one `neewer sunrise` at a time for the Sunrise switch.
+
+    The ramp is the command itself, run as a child process, so it behaves exactly
+    as it does in a terminal: it stops when the light is set any other way, and
+    waits out a lost link. Its output goes to this service's log.
+    """
+
+    def __init__(self, command):
+        self.command = command
+        self.process = None
+        self.lock = threading.Lock()
+
+    def running(self):
+        with self.lock:
+            return self.process is not None and self.process.poll() is None
+
+    def start(self):
+        with self.lock:
+            if self.process is not None and self.process.poll() is None:
+                return
+            log.info("sunrise: starting (%s)", " ".join(self.command[3:]))
+            self.process = subprocess.Popen(
+                self.command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True)
+            threading.Thread(target=self.relay, args=(self.process,), name="sunrise-log", daemon=True).start()
+
+    @staticmethod
+    def relay(process):
+        for line in process.stdout:
+            log.info("sunrise: %s", line.rstrip())
+        code = process.wait()
+        if code:
+            log.warning("sunrise: ended with exit status %d", code)
+
+    def stop(self, wait=0):
+        with self.lock:
+            process = self.process
+        if process is None or process.poll() is not None:
+            return
+        # Ctrl-C, in effect: the command stops where it is and says so.
+        process.send_signal(signal.SIGINT)
+        if wait:
+            try:
+                process.wait(wait)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+
 # ---------------------------------------------------------------- the accessory
 
-def build_accessory(driver, name, light):
+def build_accessory(driver, name, light, sunrise):
     from pyhap.accessory import Accessory
     from pyhap.const import CATEGORY_LIGHTBULB
 
@@ -285,6 +368,12 @@ def build_accessory(driver, name, light):
             self.temperature = service.configure_char(
                 "ColorTemperature", properties={"minValue": MIRED_MIN, "maxValue": MIRED_MAX})
             service.setter_callback = self.home_wrote
+            service.is_primary_service = True
+            # Added after the light's own service, so the light keeps its
+            # characteristic ids and stays paired.
+            switch = self.add_preload_service("Switch", chars=["Name"])
+            switch.configure_char("Name", value="Sunrise")
+            self.sunrise_on = switch.configure_char("On", value=False, setter_callback=self.sunrise_wrote)
             self.address_at_start = driver.state.address
             self.was_paired = driver.state.paired
             self.ticks = 0
@@ -324,11 +413,22 @@ def build_accessory(driver, name, light):
             # Fill in the values Home did not send, such as the hue of a new white.
             self.show(light.snapshot(), notify=True, skip=values.keys())
 
+        def sunrise_wrote(self, value):
+            # Started even if the light is out of reach right now: the ramp
+            # waits for it, which suits an automation that fires at dawn.
+            if value:
+                sunrise.start()
+            else:
+                sunrise.stop()
+
         @Accessory.run_at_interval(3)
         def run(self):
             light.refresh_link()
             if light.adopt_outside_change():
                 self.show(light.snapshot(), notify=True)
+            running = sunrise.running()
+            if self.sunrise_on.get_value() != running:
+                self.sunrise_on.set_value(running, should_notify=True)
             paired = driver.state.paired
             if paired != self.was_paired:
                 self.was_paired = paired
@@ -351,6 +451,7 @@ def build_accessory(driver, name, light):
 
         def stop(self):
             light.stop()
+            sunrise.stop(wait=3)
 
     return NeewerLight()
 
@@ -395,7 +496,9 @@ def serve():
         interface_choice=[address],
     )
     driver.state.setup_id = pairing["setup_id"]  # keeps the QR code valid across restarts
-    accessory = build_accessory(driver, name, light)
+    sunrise = Sunrise(sunrise_command(settings))
+    light.sunrise = sunrise
+    accessory = build_accessory(driver, name, light, sunrise)
     driver.add_accessory(accessory)
     record_pairing(driver, accessory)
 
