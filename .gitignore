@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Runtime files live in ~/Library/Application Support/NeewerBridge, not here.
+# These rules are a backstop in case a copy ends up in the tree: they hold the
+# light's Bluetooth address and the Apple Home pairing keys and setup code.
+light.json
+bridge.json
+state.json
+homekit.json
+homekit-data/
+accessory.state
+pairing.json
+*pairing*.svg

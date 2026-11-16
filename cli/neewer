@@ -1,0 +1,509 @@
+#!/usr/bin/env python3
+"""neewer: control a Neewer "Infinity" Bluetooth light through the local Neewer Bridge.
+
+The bridge only moves bytes. This file holds the whole command format, so it is
+the place to experiment: nothing here needs the bridge rebuilt.
+
+Frame layout, confirmed on a CB200C (product code 20250017):
+
+    78 <tag> <size> <6 address bytes> <subtag> <values...> <checksum>
+
+    size      counts every byte after itself, up to but not including the checksum
+    checksum  low byte of the sum of every byte before it
+
+    power   tag 8D  subtag 81  values: 01 on, 02 off
+    white   tag 90  subtag 87  values: brightness 0-100, kelvin/100, tint+50, dimming curve
+    colour  tag 8F  subtag 86  values: hue low byte, hue high byte, saturation 0-100, brightness 0-100, 00
+"""
+
+import argparse
+import colorsys
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+APP_DIR = os.path.expanduser("~/Library/Application Support/NeewerBridge")
+LIGHT_FILE = os.path.join(APP_DIR, "light.json")
+STATE_FILE = os.path.join(APP_DIR, "state.json")
+
+DEFAULT_BRIDGE = "http://127.0.0.1:18490"
+KELVIN_MIN, KELVIN_MAX = 2500, 7500
+# The curve byte is taken from captures of sibling lights; "linear" is what the
+# NEEWER app sends by default. Whether the CB200C honours the others is untested.
+CURVES = {"linear": 0x04, "exp": 0x01, "log": 0x02, "s": 0x03}
+
+
+class Failure(Exception):
+    """An error to show the user as one plain line."""
+
+
+# ---------------------------------------------------------------- frames
+
+def checksum(frame):
+    return sum(frame) & 0xFF
+
+
+def tagged(mac, tag, subtag, values):
+    body = list(mac) + [subtag] + list(values)
+    frame = [0x78, tag, len(body)] + body
+    return frame + [checksum(frame)]
+
+
+def power_frame(mac, on):
+    return tagged(mac, 0x8D, 0x81, [0x01 if on else 0x02])
+
+
+def white_frame(mac, kelvin, brightness, tint=0, curve="linear"):
+    return tagged(mac, 0x90, 0x87, [brightness, kelvin // 100, tint + 50, CURVES[curve]])
+
+
+def colour_frame(mac, hue, saturation, brightness):
+    return tagged(mac, 0x8F, 0x86, [hue & 0xFF, hue >> 8, saturation, brightness, 0x00])
+
+
+def to_hex(frame):
+    return "".join("%02x" % byte for byte in frame)
+
+
+def parse_mac(text):
+    parts = text.replace("-", ":").split(":")
+    if len(parts) != 6:
+        raise Failure("'%s' is not a Bluetooth address like AA:BB:CC:DD:EE:FF" % text)
+    try:
+        mac = [int(part, 16) for part in parts]
+    except ValueError:
+        raise Failure("'%s' is not a Bluetooth address like AA:BB:CC:DD:EE:FF" % text)
+    if any(byte > 0xFF for byte in mac):
+        raise Failure("'%s' is not a Bluetooth address like AA:BB:CC:DD:EE:FF" % text)
+    return mac
+
+
+# ---------------------------------------------------------------- files
+
+def read_json(path, fallback):
+    try:
+        with open(path) as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else dict(fallback)
+    except (OSError, ValueError):
+        return dict(fallback)
+
+
+def write_json(path, value):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary = path + ".tmp"
+    with open(temporary, "w") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, path)
+
+
+# ---------------------------------------------------------------- bridge
+
+class Bridge:
+    def __init__(self, base):
+        self.base = base.rstrip("/")
+        # Never route a loopback call through a system proxy.
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def call(self, method, path, body=None):
+        request = urllib.request.Request(self.base + path, data=body, method=method)
+        try:
+            with self.opener.open(request, timeout=5) as response:
+                return response.status, response.read()
+        except urllib.error.HTTPError as error:
+            return error.code, error.read()
+        except (urllib.error.URLError, OSError) as error:
+            reason = getattr(error, "reason", error)
+            raise Failure("cannot reach the bridge at %s (%s). Is Neewer Bridge running?" % (self.base, reason))
+
+    def json(self, method, path, body=None):
+        status, raw = self.call(method, path, body)
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            raise Failure("the bridge sent an unreadable answer (HTTP %d)" % status)
+        return status, value
+
+    def send(self, frame):
+        status, value = self.json("POST", "/write", to_hex(frame).encode("ascii"))
+        if status != 200 or not value.get("ok"):
+            raise Failure(value.get("error", "the bridge refused the command (HTTP %d)" % status))
+        return value
+
+
+# ---------------------------------------------------------------- address lookup
+
+def addresses_known_to_macos():
+    """Names and addresses of Neewer lights in the system Bluetooth list.
+
+    macOS hides the address from apps, but the commands need it, so read it from
+    the same report the Bluetooth settings pane uses.
+    """
+    try:
+        output = subprocess.run(
+            ["/usr/sbin/system_profiler", "SPBluetoothDataType", "-json"],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+        report = json.loads(output)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, dict) and "device_address" in value:
+                    if key.startswith("NW-") or key.upper().startswith("NEEWER"):
+                        found.append((key, value["device_address"]))
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(report)
+    return found
+
+
+def light_address(settings, override):
+    if override:
+        return parse_mac(override)
+    if settings.get("mac"):
+        return parse_mac(settings["mac"])
+    found = addresses_known_to_macos()
+    if len(found) == 1:
+        settings["mac"] = found[0][1]
+        write_json(LIGHT_FILE, settings)
+        return parse_mac(found[0][1])
+    if not found:
+        raise Failure("I don't know the light's Bluetooth address. Run: neewer address AA:BB:CC:DD:EE:FF")
+    names = ", ".join("%s (%s)" % pair for pair in found)
+    raise Failure("more than one Neewer light is known (%s). Pick one with: neewer address <address>" % names)
+
+
+# ---------------------------------------------------------------- argument checks
+
+def whole_percent(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "'%s' is not a whole number. This light dims in 1%% steps, and 1 is the lowest lit level." % text)
+    if not 0 <= value <= 100:
+        raise argparse.ArgumentTypeError("must be between 0 and 100")
+    return value
+
+
+def kelvin(text):
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("'%s' is not a colour temperature like 5600" % text)
+    if value < 100:  # accept 56 as shorthand for 5600
+        value *= 100
+    value = int(round(value / 100.0)) * 100
+    if not KELVIN_MIN <= value <= KELVIN_MAX:
+        raise argparse.ArgumentTypeError("must be between %d and %d" % (KELVIN_MIN, KELVIN_MAX))
+    return value
+
+
+def bounded(low, high, what):
+    def check(text):
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError("'%s' is not a whole number" % text)
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError("%s must be between %d and %d" % (what, low, high))
+        return value
+    return check
+
+
+def rgb_hex(text):
+    digits = text.lstrip("#")
+    if len(digits) == 3:
+        digits = "".join(ch * 2 for ch in digits)
+    try:
+        if len(digits) != 6:
+            raise ValueError
+        return tuple(int(digits[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        raise argparse.ArgumentTypeError("'%s' is not a colour like ff8800" % text)
+
+
+# ---------------------------------------------------------------- commands
+
+def describe(state):
+    if not state:
+        return "nothing sent yet"
+    power = "on" if state.get("on") else "off" if state.get("on") is False else "power unknown"
+    if state.get("mode") == "white":
+        detail = "white %dK at %d%%" % (state.get("kelvin", 0), state.get("brightness", 0))
+        if state.get("tint"):
+            detail += ", tint %+d" % state["tint"]
+        if state.get("curve", "linear") != "linear":
+            detail += ", %s curve" % state["curve"]
+    elif state.get("mode") == "colour":
+        detail = "colour hue %d, saturation %d%%, at %d%%" % (
+            state.get("hue", 0), state.get("saturation", 0), state.get("brightness", 0))
+    else:
+        return power
+    return "%s, %s" % (power, detail)
+
+
+class Light:
+    def __init__(self, args):
+        self.settings = read_json(LIGHT_FILE, {})
+        self.state = read_json(STATE_FILE, {})
+        self.bridge = Bridge(args.bridge or self.settings.get("bridge") or DEFAULT_BRIDGE)
+        self.mac_override = args.mac
+        self.quiet = args.quiet
+        self._mac = None
+
+    @property
+    def mac(self):
+        if self._mac is None:
+            self._mac = light_address(self.settings, self.mac_override)
+        return self._mac
+
+    def say(self, text):
+        if not self.quiet:
+            print(text)
+
+    def remember(self, **changes):
+        self.state.update(changes)
+        write_json(STATE_FILE, self.state)
+
+    def wake_if_needed(self, skip):
+        """Mode commands do not wake a light in standby, so switch it on first."""
+        if skip or self.state.get("on") is True:
+            return
+        self.bridge.send(power_frame(self.mac, True))
+        self.remember(on=True)
+        time.sleep(0.3)
+
+    def power(self, on):
+        self.bridge.send(power_frame(self.mac, on))
+        self.remember(on=on)
+        self.say("on" if on else "off")
+
+    def white(self, kelvin_value, brightness, tint, curve, no_power=False):
+        self.wake_if_needed(no_power)
+        self.bridge.send(white_frame(self.mac, kelvin_value, brightness, tint, curve))
+        self.remember(mode="white", kelvin=kelvin_value, brightness=brightness, tint=tint, curve=curve)
+        self.say(describe(self.state))
+
+    def colour(self, hue, saturation, brightness, no_power=False):
+        self.wake_if_needed(no_power)
+        self.bridge.send(colour_frame(self.mac, hue, saturation, brightness))
+        self.remember(mode="colour", hue=hue, saturation=saturation, brightness=brightness)
+        self.say(describe(self.state))
+
+    def last_brightness(self):
+        return self.state.get("brightness", 10)
+
+
+def cmd_on(light, args):
+    light.power(True)
+
+
+def cmd_off(light, args):
+    light.power(False)
+
+
+def cmd_white(light, args):
+    brightness = light.last_brightness() if args.brightness is None else args.brightness
+    tint = light.state.get("tint", 0) if args.tint is None else args.tint
+    curve = light.state.get("curve", "linear") if args.curve is None else args.curve
+    light.white(args.kelvin, brightness, tint, curve, args.no_power)
+
+
+def cmd_colour(light, args):
+    brightness = light.last_brightness() if args.brightness is None else args.brightness
+    light.colour(args.hue % 360, args.saturation, brightness, args.no_power)
+
+
+def cmd_rgb(light, args):
+    red, green, blue = args.colour
+    hue, saturation, _ = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue / 255.0)
+    brightness = light.last_brightness() if args.brightness is None else args.brightness
+    light.colour(int(round(hue * 360)) % 360, int(round(saturation * 100)), brightness, args.no_power)
+
+
+def cmd_brightness(light, args):
+    state = light.state
+    if state.get("mode") == "colour":
+        light.colour(state.get("hue", 0), state.get("saturation", 100), args.brightness, args.no_power)
+    else:
+        light.white(
+            state.get("kelvin", 5600), args.brightness, state.get("tint", 0),
+            state.get("curve", "linear"), args.no_power)
+
+
+def cmd_raw(light, args):
+    try:
+        frame = list(bytes.fromhex(args.hex.replace(" ", "").replace(":", "").replace(",", "")))
+    except ValueError:
+        raise Failure("'%s' is not hex" % args.hex)
+    if not args.no_checksum:
+        frame.append(checksum(frame))
+    light.bridge.send(frame)
+    light.say("sent " + to_hex(frame))
+
+
+def duration(seconds):
+    if seconds is None:
+        return "?"
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return "%d h %d min" % (hours, minutes)
+    if minutes:
+        return "%d min" % minutes
+    return "%d s" % seconds
+
+
+def cmd_status(light, args):
+    status, info = light.bridge.json("GET", "/status")
+    if args.json:
+        print(json.dumps({"bridge": info, "last_set": light.state}, indent=2, sort_keys=True))
+        return
+    print("Bridge:    running (version %s), Bluetooth %s, permission %s" % (
+        info.get("version"), info.get("bluetooth"), info.get("permission")))
+    if info.get("connected"):
+        signal = "signal unknown"
+        if info.get("rssi") is not None:
+            signal = "signal %s dBm, checked %s ago" % (info["rssi"], duration(info.get("rssiSecondsAgo")))
+        print("Light:     connected to %s for %s (%s)" % (
+            info.get("name"), duration(info.get("connectedSeconds")), signal))
+    elif info.get("permission") != "allowed":
+        print("Light:     not connected. Bluetooth permission is '%s'; allow Neewer Bridge in"
+              " System Settings > Privacy & Security > Bluetooth." % info.get("permission"))
+    else:
+        print("Light:     not connected (%s). Check it is on and in Infinity mode." % (
+            "scanning" if info.get("scanning") else "waiting"))
+    print("Last set:  %s" % describe(light.state))
+    print("           (what this command last sent; changes made on the light itself are not seen)")
+
+
+def cmd_replies(light, args):
+    status, value = light.bridge.json("GET", "/replies")
+    replies = value.get("replies", [])
+    if not replies:
+        print("the light has sent nothing back")
+    for reply in replies:
+        print("%4d  %6s ago  %s" % (reply["sequence"], duration(reply["secondsAgo"]), reply["hex"]))
+
+
+def cmd_address(light, args):
+    if args.address:
+        parse_mac(args.address)
+        light.settings["mac"] = args.address.upper().replace("-", ":")
+        write_json(LIGHT_FILE, light.settings)
+        print("saved " + light.settings["mac"])
+        return
+    if args.detect:
+        found = addresses_known_to_macos()
+        if not found:
+            raise Failure("macOS has no Neewer light in its Bluetooth list; connect it first")
+        for name, address in found:
+            print("%s  %s" % (address, name))
+        return
+    print(light.settings.get("mac") or "not set")
+
+
+def cmd_selftest(light, args):
+    """Checks the frame builder against frames captured from real lights."""
+    cases = [
+        ("power on", power_frame(parse_mac("F7:AC:16:F1:58:96"), True), "788d08f7ac16f158968101" + "27"),
+        ("white", white_frame(parse_mac("DF:24:3A:B4:46:5D"), 6500, 29, 50, "linear"), "78900bdf243ab4465d871d416404" + "f4"),
+        ("colour", colour_frame(parse_mac("F7:AC:16:F1:58:96"), 69, 92, 50), "788f0cf7ac16f1589686" + "45005c3200" + "04"),
+    ]
+    failed = 0
+    for name, frame, expected in cases:
+        actual = to_hex(frame)
+        ok = actual == expected
+        failed += 0 if ok else 1
+        print("%-9s %s  %s" % (name, "ok  " if ok else "FAIL", actual if ok else "%s != %s" % (actual, expected)))
+    if failed:
+        raise Failure("%d frame(s) do not match the captures" % failed)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="neewer", description="Control a Neewer Infinity light through the local Neewer Bridge.")
+    parser.add_argument("--bridge", help="bridge address (default %s)" % DEFAULT_BRIDGE)
+    parser.add_argument("--mac", help="the light's Bluetooth address, overriding the saved one")
+    parser.add_argument("-q", "--quiet", action="store_true", help="print nothing on success")
+    commands = parser.add_subparsers(dest="command", metavar="command")
+    commands.required = True
+
+    def add(name, function, help_text, aliases=()):
+        sub = commands.add_parser(name, help=help_text, aliases=list(aliases))
+        sub.set_defaults(function=function)
+        return sub
+
+    def add_no_power(sub):
+        sub.add_argument("--no-power", action="store_true",
+                         help="do not switch the light on first if it was last set off")
+
+    add("on", cmd_on, "switch on")
+    add("off", cmd_off, "switch to standby")
+
+    white = add("white", cmd_white, "white light: neewer white 5600 10", aliases=["cct"])
+    white.add_argument("kelvin", type=kelvin, help="colour temperature, %d-%d" % (KELVIN_MIN, KELVIN_MAX))
+    white.add_argument("brightness", type=whole_percent, nargs="?", help="0-100 (default: last used)")
+    white.add_argument("--tint", type=bounded(-50, 50, "tint"), help="green/magenta, -50 to 50")
+    white.add_argument("--curve", choices=sorted(CURVES), help="dimming curve (experimental)")
+    add_no_power(white)
+
+    colour = add("colour", cmd_colour, "colour by hue: neewer colour 240 100 10", aliases=["color", "hsi"])
+    colour.add_argument("hue", type=bounded(0, 360, "hue"), help="0-360")
+    colour.add_argument("saturation", type=bounded(0, 100, "saturation"), help="0-100")
+    colour.add_argument("brightness", type=whole_percent, nargs="?", help="0-100 (default: last used)")
+    add_no_power(colour)
+
+    rgb = add("rgb", cmd_rgb, "colour by hex: neewer rgb ff8800 10")
+    rgb.add_argument("colour", type=rgb_hex, help="like ff8800")
+    rgb.add_argument("brightness", type=whole_percent, nargs="?", help="0-100 (default: last used)")
+    add_no_power(rgb)
+
+    brightness = add("brightness", cmd_brightness, "change brightness, keep the colour", aliases=["dim"])
+    brightness.add_argument("brightness", type=whole_percent, help="0-100")
+    add_no_power(brightness)
+
+    status = add("status", cmd_status, "show the bridge, the link and the last setting")
+    status.add_argument("--json", action="store_true")
+
+    raw = add("raw", cmd_raw, "send a frame given as hex; the checksum is added for you")
+    raw.add_argument("hex")
+    raw.add_argument("--no-checksum", action="store_true", help="send the bytes exactly as given")
+
+    add("replies", cmd_replies, "show frames the light has sent back")
+
+    address = add("address", cmd_address, "show, set or look up the light's Bluetooth address")
+    address.add_argument("address", nargs="?")
+    address.add_argument("--detect", action="store_true", help="list Neewer lights macOS knows")
+
+    add("selftest", cmd_selftest, "check the frame builder against captured frames")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        args.function(Light(args), args)
+    except Failure as failure:
+        print("neewer: %s" % failure, file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
