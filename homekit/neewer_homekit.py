@@ -279,14 +279,14 @@ class LightLink:
 def sunrise_command(settings):
     """The `neewer sunrise` command line, with options from homekit.json.
 
-    "sunrise": {"minutes": 30, "brightness": 100, "kelvin": 5600} in homekit.json
-    sets the ramp; any of the three may be left out. The options are checked with
+    "sunrise": {"minutes": 30, "brightness": 100, "kelvin": 5600, "style": "sky"} in homekit.json
+    sets the ramp; any of them may be left out. The options are checked with
     the command's own parser now, so a mistake shows in the log at start, not at dawn.
     """
     given = settings.get("sunrise")
     given = given if isinstance(given, dict) else {}
     arguments = ["sunrise"]
-    for key in ("minutes", "brightness", "kelvin"):
+    for key in ("minutes", "brightness", "kelvin", "style"):
         if key in given:
             arguments += ["--" + key, str(given[key])]
     try:

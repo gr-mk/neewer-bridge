@@ -392,16 +392,92 @@ SUNRISE_RETRY_SECONDS = 2.0
 SUNRISE_GIVE_UP_SECONDS = 300.0
 
 
-def sunrise_setting(progress, top_brightness, top_kelvin):
+# Clear-sky illuminance on level ground against the sun's elevation, in lux:
+# the standard natural-illumination table (Brown 1952, as carried in the
+# Explanatory Supplement to the Astronomical Almanac). -6 is the start of civil
+# twilight, -0.8 is sunrise as seen, 0 is the sun's centre on the horizon.
+SKY_LUX = ((-18, 6.5e-4), (-12, 8.3e-3), (-6, 3.4), (-0.8, 453), (0, 759),
+           (5, 4760), (10, 10900), (15, 18600), (20, 26700))
+# Where the "sky" sunrise ends: by 10 degrees up the fast change is over.
+SKY_TOP_ELEVATION = 10.0
+# Colour against elevation, for a view towards the sunrise: blue twilight, an
+# orange sun on the horizon, then whitening. Unlike the brightness this is an
+# approximation, not a measured table; the last point is the --kelvin target.
+SKY_KELVIN = ((-12, 7500), (-5, 7500), (-3, 6000), (-1.5, 4000), (0, 2800), (2, 3200), (5, 4000))
+# Assumed colour of the warm and cold white LEDs when mixing them below 1%.
+WARM_KELVIN, COLD_KELVIN = 2500, 7500
+
+
+def interpolate(table, x, log=False):
+    """Straight-line lookup in a sorted (x, y) table; in log y if asked."""
+    if x <= table[0][0]:
+        return table[0][1]
+    for (x0, y0), (x1, y1) in zip(table, table[1:]):
+        if x <= x1:
+            t = (x - x0) / (x1 - x0)
+            if log:
+                return math.exp(math.log(y0) + (math.log(y1) - math.log(y0)) * t)
+            return y0 + (y1 - y0) * t
+    return table[-1][1]
+
+
+def sky_start_elevation(top_brightness):
+    """The elevation at which the real sky is as dim as the light's faintest level."""
+    floor = interpolate(SKY_LUX, SKY_TOP_ELEVATION, log=True) / (top_brightness * 255.0)
+    low, high = SKY_LUX[0][0], SKY_TOP_ELEVATION
+    for _ in range(40):
+        middle = (low + high) / 2
+        if interpolate(SKY_LUX, middle, log=True) < floor:
+            low = middle
+        else:
+            high = middle
+    return high
+
+
+def sky_setting(progress, top_brightness, top_kelvin):
+    """The "sky" sunrise: the light follows the real sky's brightness.
+
+    The sun climbs at a steady rate, as it very nearly does around sunrise, from
+    the elevation where the sky is as dim as the light's faintest level up to
+    10 degrees. At each moment the light is as bright, relative to its target,
+    as the sky is relative to the sky at 10 degrees. So the ratios are the real
+    ones: about a third of the ramp is twilight below 1%, and brightness climbs
+    fastest just before the sun comes up, as it does outside.
+    """
+    start = sky_start_elevation(top_brightness)
+    elevation = start + (SKY_TOP_ELEVATION - start) * min(1.0, max(0.0, progress))
+    percent = top_brightness * interpolate(SKY_LUX, elevation, log=True) / interpolate(
+        SKY_LUX, SKY_TOP_ELEVATION, log=True)
+    colour = interpolate(SKY_KELVIN + ((SKY_TOP_ELEVATION, top_kelvin),), elevation)
+    colour = max(KELVIN_MIN, min(KELVIN_MAX, colour))
+    if percent >= 1.0:
+        return ("white", int(round(colour / 100.0)) * 100, min(top_brightness, int(round(percent))))
+    # Below 1%: the white LEDs through the channels frame, mixed to the colour.
+    level = max(1, min(255, int(round(255 * percent))))
+    share = (1e6 / WARM_KELVIN - 1e6 / colour) / (1e6 / WARM_KELVIN - 1e6 / COLD_KELVIN)
+    cold = int(round(level * max(0.0, min(1.0, share))))
+    levels = {name: value for name, value in (("cold", cold), ("warm", level - cold)) if value}
+    return ("channels", 1, levels)
+
+
+def sunrise_setting(progress, top_brightness, top_kelvin, style="sky"):
     """The light setting at a point in the sunrise, from 0.0 (start) to 1.0 (end).
+
+    Returns ("channels", brightness, levels) or ("white", kelvin, brightness).
+    """
+    if style == "sky":
+        return sky_setting(progress, top_brightness, top_kelvin)
+    return glow_setting(progress, top_brightness, top_kelvin)
+
+
+def glow_setting(progress, top_brightness, top_kelvin):
+    """The "glow" sunrise: a designed ramp, not the real sky.
 
     Three stages: a red glow that grows, warm white that takes over from the
     red (both below 1%, through the channels frame), then ordinary white that
     brightens and cools. The eye judges brightness by ratio, so each stage
     climbs by a constant ratio per unit of time, and each stage gets a share of
     the time in proportion to how many doublings it covers.
-
-    Returns ("channels", brightness, levels) or ("white", kelvin, brightness).
     """
     doublings = (math.log2(SUNRISE_RED_TOP), math.log2(255), math.log2(max(2, top_brightness)))
     red_ends = doublings[0] / sum(doublings)
@@ -433,7 +509,7 @@ def cmd_sunrise(light, args):
     if args.plan:
         last = None
         for tick in range(4001):
-            setting = sunrise_setting(tick / 4000.0, args.brightness, args.kelvin)
+            setting = sunrise_setting(tick / 4000.0, args.brightness, args.kelvin, args.style)
             if setting != last:
                 at = total * tick / 4000.0
                 print("%3d:%02d  %s" % (at // 60, at % 60, describe_setting(setting)))
@@ -482,7 +558,7 @@ def cmd_sunrise(light, args):
     try:
         while True:
             progress = min(1.0, (time.monotonic() - started) / total)
-            setting = sunrise_setting(progress, args.brightness, args.kelvin)
+            setting = sunrise_setting(progress, args.brightness, args.kelvin, args.style)
             if setting != last or not awake:
                 # Anything else that sets the light (Home, another neewer
                 # command) rewrites the state file; treat that as "stop".
@@ -509,7 +585,9 @@ def cmd_sunrise(light, args):
                     note("the light is back after %s" % duration(time.monotonic() - lost_since))
                     lost_since = None
                 last = setting
-                if setting[0] == "channels":
+                if args.style == "sky":
+                    name = "twilight" if setting[0] == "channels" else "daylight coming up"
+                elif setting[0] == "channels":
                     name = "warm white coming in" if setting[2].get("warm") else "red glow"
                 else:
                     name = "white, brightening"
@@ -681,11 +759,13 @@ def build_parser():
         channels.add_argument("--" + name, type=bounded(0, 255, name), default=0, help="0-255")
     add_no_power(channels)
 
-    sunrise = add("sunrise", cmd_sunrise, "ramp from the faintest red glow up to white: neewer sunrise --minutes 30")
+    sunrise = add("sunrise", cmd_sunrise, "ramp up like a real sunrise: neewer sunrise --minutes 30")
     sunrise.add_argument("--minutes", type=minutes, default=30.0, help="how long the ramp takes (default 30)")
     sunrise.add_argument("--brightness", type=bounded(1, 100, "brightness"), default=100,
                          help="where the ramp ends, 1-100 (default 100)")
     sunrise.add_argument("--kelvin", type=kelvin, default=5600, help="colour temperature at the end (default 5600)")
+    sunrise.add_argument("--style", choices=["sky", "glow"], default="sky",
+                         help="sky follows the real sky's brightness (default); glow is the red-glow ramp")
     sunrise.add_argument("--plan", action="store_true", help="print the steps and send nothing")
 
     brightness = add("brightness", cmd_brightness, "change brightness, keep the colour", aliases=["dim"])

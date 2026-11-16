@@ -23,7 +23,7 @@ neewer brightness 1         # keeps the current colour; 1 is the lowest ordinary
 neewer faint 5              # dimmer than 1%: level 1 (dimmest) to 255
 neewer faint 5 --white both # use the cold white LEDs as well as the warm ones
 neewer channels 1 --warm 20 # drive the five LED channels directly, 0-255 each
-neewer sunrise --minutes 30 # ramp from the faintest red glow up to full white
+neewer sunrise --minutes 30 # ramp up the way a real sunrise brightens
 neewer status
 ```
 
@@ -41,15 +41,17 @@ neewer sunrise --minutes 20 --brightness 60 --kelvin 5000
 neewer sunrise --minutes 30 --plan                # print the steps, send nothing
 ```
 
-It has three stages, all climbing by a constant ratio per unit of time, because that is how the eye judges brightness:
+The brightness follows the real sky. It uses the standard table of clear-sky illuminance against the sun's elevation: about 3.4 lux when the sun is 6 degrees below the horizon (the start of civil twilight), about 450 lux at sunrise, and about 10,900 lux with the sun 10 degrees up. The sun climbs at a steady rate through the ramp, as it very nearly does around sunrise, and at each moment the light is as bright, relative to its target, as the sky is relative to the sky at 10 degrees. So the ratios are the real ones, squeezed into the time you give it:
 
-1. A red glow, from the dimmest the light can show.
-2. Warm white coming in while the red fades out. Stages 1 and 2 are below 1% and use the channels frame.
-3. Ordinary white from 1% up to the target, cooling from 2500K to the target colour temperature.
+- It starts where the sky is as dim as the light's faintest level, with the sun about 7.5 degrees down. Roughly the first third of the ramp is twilight below 1%, through the channels frame.
+- Brightness climbs fastest just before the sun comes up, then eases, as it does outside.
+- With the default target the light passes 1% a third of the way in, and sunrise itself, at about 4%, falls near 40%.
 
-Each stage gets time in proportion to the number of doublings it covers, so with the default target about two thirds of the ramp is spent below 1%.
+The colour is an approximation, not a measured table. It is a view towards the sunrise: cold white in twilight, warming to about 2800K as the sun reaches the horizon, then whitening to the target. Below 1% the cold and warm white LEDs are mixed, taking them to be 7500K and 2500K.
 
-Setting the light any other way, from Apple Home or with another `neewer` command, stops the ramp. Where stage 2 hands over to stage 3 has not been measured, only watched.
+`neewer sunrise --style glow` is the older, designed ramp: a red glow, then warm white, then white, each climbing by a constant ratio.
+
+Setting the light any other way, from Apple Home or with another `neewer` command, stops the ramp. Whether the faint levels meet ordinary 1% without a visible step has not been measured, only watched.
 
 A sunrise usually runs with nobody watching, so:
 
@@ -87,7 +89,7 @@ The ramp is set in `homekit.json`; leave out any value to use the command's defa
 
 ```
 {
-  "sunrise": {"minutes": 30, "brightness": 100, "kelvin": 5600}
+  "sunrise": {"minutes": 30, "brightness": 100, "kelvin": 5600, "style": "sky"}
 }
 ```
 
