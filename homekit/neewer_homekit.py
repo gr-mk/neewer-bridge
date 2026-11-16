@@ -249,14 +249,18 @@ class LightLink:
         if stamp == self.state_stamp:
             return False
         self.state_stamp = stamp
-        on_disk = self.normalise(cli.read_json(cli.STATE_FILE, {}))
+        raw = cli.read_json(cli.STATE_FILE, {})
+        on_disk = self.normalise(raw)
+        # Home has no way to show the command's "channels" mode (used for levels
+        # below 1%), so it is shown as white. Forgetting the last frame makes
+        # sure the next change from Home is really sent.
+        shown_exactly = raw.get("mode") in ("white", "colour")
         with self.lock:
-            if on_disk == self.wanted:
-                return False
+            changed = on_disk != self.wanted
             self.wanted = on_disk
             self.sent_on = on_disk["on"]
-            self.sent_frame = self.mode_frame(on_disk) if on_disk["on"] else None
-        return True
+            self.sent_frame = self.mode_frame(on_disk) if on_disk["on"] and shown_exactly else None
+        return changed
 
 
 # ---------------------------------------------------------------- the accessory

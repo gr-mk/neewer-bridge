@@ -14,11 +14,17 @@ Frame layout, confirmed on a CB200C (product code 20250017):
     power   tag 8D  subtag 81  values: 01 on, 02 off
     white   tag 90  subtag 87  values: brightness 0-100, kelvin/100, tint+50, dimming curve
     colour  tag 8F  subtag 86  values: hue low byte, hue high byte, saturation 0-100, brightness 0-100, 00
+    channels tag A9 subtag A8  values: brightness 0-100, red, green, blue, cold white, warm white (0-255 each), 00
+
+The channels frame is the only way found to go below 1%: brightness 1 with a
+single white channel at a low level is far dimmer than "white ... 1", and it is
+still lit at level 1.
 """
 
 import argparse
 import colorsys
 import json
+import math
 import os
 import subprocess
 import sys
@@ -35,6 +41,7 @@ KELVIN_MIN, KELVIN_MAX = 2500, 7500
 # The curve byte is taken from captures of sibling lights; "linear" is what the
 # NEEWER app sends by default. Whether the CB200C honours the others is untested.
 CURVES = {"linear": 0x04, "exp": 0x01, "log": 0x02, "s": 0x03}
+CHANNELS = ("red", "green", "blue", "cold", "warm")
 
 
 class Failure(Exception):
@@ -63,6 +70,11 @@ def white_frame(mac, kelvin, brightness, tint=0, curve="linear"):
 
 def colour_frame(mac, hue, saturation, brightness):
     return tagged(mac, 0x8F, 0x86, [hue & 0xFF, hue >> 8, saturation, brightness, 0x00])
+
+
+def channels_frame(mac, brightness, red=0, green=0, blue=0, cold=0, warm=0):
+    """Drives the five LED channels directly; brightness scales all of them."""
+    return tagged(mac, 0xA9, 0xA8, [brightness, red, green, blue, cold, warm, 0x00])
 
 
 def to_hex(frame):
@@ -250,6 +262,9 @@ def describe(state):
     elif state.get("mode") == "colour":
         detail = "colour hue %d, saturation %d%%, at %d%%" % (
             state.get("hue", 0), state.get("saturation", 0), state.get("brightness", 0))
+    elif state.get("mode") == "channels":
+        lit = ["%s %d" % (name, state[name]) for name in CHANNELS if state.get(name)]
+        detail = "channels (%s of 255) at %d%%" % (", ".join(lit) or "all 0", state.get("brightness", 0))
     else:
         return power
     return "%s, %s" % (power, detail)
@@ -303,6 +318,12 @@ class Light:
         self.remember(mode="colour", hue=hue, saturation=saturation, brightness=brightness)
         self.say(describe(self.state))
 
+    def channels(self, brightness, levels, no_power=False):
+        self.wake_if_needed(no_power)
+        self.bridge.send(channels_frame(self.mac, brightness, **levels))
+        self.remember(mode="channels", brightness=brightness, **levels)
+        self.say(describe(self.state))
+
     def last_brightness(self):
         return self.state.get("brightness", 10)
 
@@ -334,14 +355,141 @@ def cmd_rgb(light, args):
     light.colour(int(round(hue * 360)) % 360, int(round(saturation * 100)), brightness, args.no_power)
 
 
+def cmd_channels(light, args):
+    levels = {name: getattr(args, name) for name in CHANNELS}
+    brightness = light.last_brightness() if args.brightness is None else args.brightness
+    light.channels(brightness, levels, args.no_power)
+
+
+def cmd_faint(light, args):
+    """Below 1%: brightness 1 with only white channels lit, at a level of 1-255."""
+    levels = dict.fromkeys(CHANNELS, 0)
+    for name in ("warm", "cold") if args.white == "both" else (args.white,):
+        levels[name] = args.level
+    light.channels(1, levels, args.no_power)
+
+
 def cmd_brightness(light, args):
     state = light.state
     if state.get("mode") == "colour":
         light.colour(state.get("hue", 0), state.get("saturation", 100), args.brightness, args.no_power)
+    elif state.get("mode") == "channels":
+        light.channels(args.brightness, {name: state.get(name, 0) for name in CHANNELS}, args.no_power)
     else:
         light.white(
             state.get("kelvin", 5600), args.brightness, state.get("tint", 0),
             state.get("curve", "linear"), args.no_power)
+
+
+# ---------------------------------------------------------------- sunrise
+
+# Red level at which warm white starts to come in. Red alone is the dimmest
+# thing the light can show, so the ramp opens with it.
+SUNRISE_RED_TOP = 32
+
+
+def sunrise_setting(progress, top_brightness, top_kelvin):
+    """The light setting at a point in the sunrise, from 0.0 (start) to 1.0 (end).
+
+    Three stages: a red glow that grows, warm white that takes over from the
+    red (both below 1%, through the channels frame), then ordinary white that
+    brightens and cools. The eye judges brightness by ratio, so each stage
+    climbs by a constant ratio per unit of time, and each stage gets a share of
+    the time in proportion to how many doublings it covers.
+
+    Returns ("channels", brightness, levels) or ("white", kelvin, brightness).
+    """
+    doublings = (math.log2(SUNRISE_RED_TOP), math.log2(255), math.log2(max(2, top_brightness)))
+    red_ends = doublings[0] / sum(doublings)
+    warm_ends = (doublings[0] + doublings[1]) / sum(doublings)
+    if progress < red_ends:
+        x = progress / red_ends
+        return ("channels", 1, {"red": max(1, int(round(SUNRISE_RED_TOP ** x)))})
+    if progress < warm_ends:
+        x = (progress - red_ends) / (warm_ends - red_ends)
+        return ("channels", 1, {
+            "red": int(round(SUNRISE_RED_TOP * (1 - x))),
+            "warm": max(1, int(round(255 ** x))),
+        })
+    x = min(1.0, (progress - warm_ends) / (1 - warm_ends))
+    brightness = max(1, int(round(top_brightness ** x)))
+    kelvin_now = KELVIN_MIN + (top_kelvin - KELVIN_MIN) * x
+    return ("white", int(round(kelvin_now / 100.0)) * 100, brightness)
+
+
+def describe_setting(setting):
+    if setting[0] == "channels":
+        lit = ", ".join("%s %d" % (name, level) for name, level in sorted(setting[2].items()) if level)
+        return "faint: %s" % lit
+    return "white %dK at %d%%" % (setting[1], setting[2])
+
+
+def cmd_sunrise(light, args):
+    total = args.minutes * 60.0
+    if args.plan:
+        last = None
+        for tick in range(4001):
+            setting = sunrise_setting(tick / 4000.0, args.brightness, args.kelvin)
+            if setting != last:
+                at = total * tick / 4000.0
+                print("%3d:%02d  %s" % (at // 60, at % 60, describe_setting(setting)))
+                last = setting
+        return
+
+    def stamp():
+        try:
+            return os.stat(STATE_FILE).st_mtime_ns
+        except OSError:
+            return None
+
+    quiet, light.quiet = light.quiet, True  # one line per stage, not per step
+    light.wake_if_needed(False)
+    interval = max(0.1, min(1.0, total / 900.0))
+    started = time.monotonic()
+    last = stage = own_stamp = None
+    try:
+        while True:
+            progress = min(1.0, (time.monotonic() - started) / total)
+            setting = sunrise_setting(progress, args.brightness, args.kelvin)
+            if setting != last:
+                # Anything else that sets the light (Home, another neewer
+                # command) rewrites the state file; treat that as "stop".
+                if own_stamp is not None and stamp() != own_stamp:
+                    if not quiet:
+                        print("sunrise stopped: the light was changed elsewhere")
+                    return
+                if setting[0] == "channels":
+                    levels = dict.fromkeys(CHANNELS, 0)
+                    levels.update(setting[2])
+                    light.channels(setting[1], levels, no_power=True)
+                    name = "warm white coming in" if setting[2].get("warm") else "red glow"
+                else:
+                    light.white(setting[1], setting[2], 0, "linear", no_power=True)
+                    name = "white, brightening"
+                own_stamp = stamp()
+                last = setting
+                if name != stage and not quiet:
+                    print("%s (%s)" % (name, describe_setting(setting)), flush=True)
+                stage = name
+            if progress >= 1.0:
+                break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        if not quiet:
+            print("sunrise stopped at %s" % describe(light.state))
+        return
+    if not quiet:
+        print("sunrise finished: %s" % describe(light.state))
+
+
+def minutes(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("'%s' is not a number of minutes" % text)
+    if not 0 < value <= 24 * 60:
+        raise argparse.ArgumentTypeError("must be more than 0 and at most 1440")
+    return value
 
 
 def cmd_raw(light, args):
@@ -417,8 +565,13 @@ def cmd_address(light, args):
 
 
 def cmd_selftest(light, args):
-    """Checks the frame builder against frames captured from real lights."""
+    """Checks the frame builder against known-good frames.
+
+    The first three are captures from other lights. The channels frame is the
+    one confirmed by eye on this light, with the address swapped for a placeholder.
+    """
     cases = [
+        ("channels", channels_frame(parse_mac("AA:BB:CC:DD:EE:FF"), 1, warm=20), "78a90eaabbccddeeffa8010000000014" + "00" + "e7"),
         ("power on", power_frame(parse_mac("F7:AC:16:F1:58:96"), True), "788d08f7ac16f158968101" + "27"),
         ("white", white_frame(parse_mac("DF:24:3A:B4:46:5D"), 6500, 29, 50, "linear"), "78900bdf243ab4465d871d416404" + "f4"),
         ("colour", colour_frame(parse_mac("F7:AC:16:F1:58:96"), 69, 92, 50), "788f0cf7ac16f1589686" + "45005c3200" + "04"),
@@ -471,6 +624,26 @@ def build_parser():
     rgb.add_argument("colour", type=rgb_hex, help="like ff8800")
     rgb.add_argument("brightness", type=whole_percent, nargs="?", help="0-100 (default: last used)")
     add_no_power(rgb)
+
+    # argparse formats help text with %, so a literal percent sign is doubled.
+    faint = add("faint", cmd_faint, "dimmer than 1%%: neewer faint 5 (level 1-255)")
+    faint.add_argument("level", type=bounded(1, 255, "level"), help="1 (dimmest) to 255")
+    faint.add_argument("--white", choices=["warm", "cold", "both"], default="warm",
+                       help="which white LEDs to use (default: warm)")
+    add_no_power(faint)
+
+    channels = add("channels", cmd_channels, "drive the five LED channels: neewer channels 1 --warm 20")
+    channels.add_argument("brightness", type=whole_percent, nargs="?", help="0-100 (default: last used)")
+    for name in CHANNELS:
+        channels.add_argument("--" + name, type=bounded(0, 255, name), default=0, help="0-255")
+    add_no_power(channels)
+
+    sunrise = add("sunrise", cmd_sunrise, "ramp from the faintest red glow up to white: neewer sunrise --minutes 30")
+    sunrise.add_argument("--minutes", type=minutes, default=30.0, help="how long the ramp takes (default 30)")
+    sunrise.add_argument("--brightness", type=bounded(1, 100, "brightness"), default=100,
+                         help="where the ramp ends, 1-100 (default 100)")
+    sunrise.add_argument("--kelvin", type=kelvin, default=5600, help="colour temperature at the end (default 5600)")
+    sunrise.add_argument("--plan", action="store_true", help="print the steps and send nothing")
 
     brightness = add("brightness", cmd_brightness, "change brightness, keep the colour", aliases=["dim"])
     brightness.add_argument("brightness", type=whole_percent, help="0-100")

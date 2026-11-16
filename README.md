@@ -19,13 +19,37 @@ neewer white 5600 10        # colour temperature in kelvin (2500-7500), brightne
 neewer white 3200 --tint -10
 neewer colour 240 100 10    # hue 0-360, saturation 0-100, brightness
 neewer rgb ff8800 10
-neewer brightness 1         # keeps the current colour; 1 is the lowest lit level
+neewer brightness 1         # keeps the current colour; 1 is the lowest ordinary level
+neewer faint 5              # dimmer than 1%: level 1 (dimmest) to 255
+neewer faint 5 --white both # use the cold white LEDs as well as the warm ones
+neewer channels 1 --warm 20 # drive the five LED channels directly, 0-255 each
+neewer sunrise --minutes 30 # ramp from the faintest red glow up to full white
 neewer status
 ```
 
-Brightness is a whole number. The light has no steps below 1%.
+Brightness is a whole number, and 1% is as low as the ordinary control goes. `neewer faint` goes below that. It uses the light's five-channel mode at brightness 1 with only the white LEDs lit, which is much dimmer than `white ... 1` and is still visibly lit at level 1.
 
 `neewer status` shows what the command last sent, not what the light is doing: the light does not report its state, so changes made on its own dial are not seen.
+
+## Sunrise
+
+`neewer sunrise` runs one ramp and exits when it reaches the top:
+
+```
+neewer sunrise --minutes 30                       # ends at 100%, 5600K
+neewer sunrise --minutes 20 --brightness 60 --kelvin 5000
+neewer sunrise --minutes 30 --plan                # print the steps, send nothing
+```
+
+It has three stages, all climbing by a constant ratio per unit of time, because that is how the eye judges brightness:
+
+1. A red glow, from the dimmest the light can show.
+2. Warm white coming in while the red fades out. Stages 1 and 2 are below 1% and use the channels frame.
+3. Ordinary white from 1% up to the target, cooling from 2500K to the target colour temperature.
+
+Each stage gets time in proportion to the number of doublings it covers, so with the default target about two thirds of the ramp is spent below 1%.
+
+Setting the light any other way, from Apple Home or with another `neewer` command, stops the ramp. Where stage 2 hands over to stage 3 has not been measured, only watched.
 
 ## Apple Home
 
@@ -88,11 +112,24 @@ Confirmed on a CB200C that advertises as `NW-20250017&00000000`:
 power   tag 8D  subtag 81  values: 01 on, 02 off
 white   tag 90  subtag 87  values: brightness, kelvin/100, tint+50, dimming curve (04 = linear)
 colour  tag 8F  subtag 86  values: hue low, hue high, saturation, brightness, 00
+channels tag A9 subtag A8  values: brightness, red, green, blue, cold white, warm white (0-255 each), 00
 ```
 
-`size` counts every byte after itself up to the checksum. The checksum is the low byte of the sum of all bytes before it. `neewer selftest` checks the builder against frames captured from real lights.
+`size` counts every byte after itself up to the checksum. The checksum is the low byte of the sum of all bytes before it. `neewer selftest` checks the builder against known-good frames.
 
-The older, shorter frames (`78 81 ...`, `78 87 ...`) are ignored by this light. The light sends nothing back, including to the read request `78 84 00`.
+What was tried on this light, judged by eye:
+
+- The older, shorter frames (`78 81 ...`, `78 87 ...`) are ignored.
+- The channels frame works and reaches below 1%. Brightness 1 with warm white at 20, 5 and 1 out of 255 were each dimmer than the last, and all still lit.
+- Red alone at level 1 (`neewer channels 1 --red 1`) is also lit, as a very dim red.
+- Brightness 0 is off, whatever else the frame says. A white frame with brightness 0 and an extra "decimal brightness" byte is dark, and so is a channels frame with brightness 0 and a decimal value of 5.
+- The dimming-curve byte in the white frame is ignored: the exponential and linear curves looked the same at 1% and at 10%.
+
+So the floor is brightness 1 with one channel at level 1, and nothing found goes lower without switching the light off.
+
+The light answers some address-tagged queries: device info (`78 9E 07 <address> 00`) and temperature and fan (`78 B3 06 <address>`). It does not answer the power-state query (`78 8E 08 <address> 84 00`) or the old read request `78 84 00`. Its device-info reply names the model CB300C, although it was sold as a CB200C; the two manuals differ only in wattage.
+
+The channels frame and the queries come from the protocol notes in [neewer-sacn](https://github.com/amattas/neewer-sacn).
 
 ## Credits
 
