@@ -67,6 +67,10 @@ SETTINGS_DEFAULTS = {
     # means: cold LED 0 and warm LED 42 at dimming 10 looks the same as white
     # 2700K at 1%. Empty means the bulbs are never driven directly.
     "raw_calibration": [],
+    # While a slider is dragged in Apple Home: how many times a second the
+    # newest setting is sent to the bulbs. 0 sends only when the bulbs have
+    # answered the last one.
+    "stream_rate": 10,
 }
 RAW_DIMMING = 10        # the dimming sent with raw LED levels; the bulbs take no less
 RAW_WARM_KELVIN = 2700  # the warm white LED alone
@@ -79,7 +83,20 @@ FOLLOW_DEFAULTS = {
     "night_brightness": 1,   # brightness after dark; above 0, so never off
     "night_kelvin": 2700,    # colour after dark
     "hold_minutes": 120,     # how long a setting made elsewhere is left alone
+    "bedtime_rule": True,    # fade out and switch off at bedtime
+    "morning_on": True,      # and switch on again before waking, if the rule switched it off
+    "fade_minutes": 5,       # how long the fade at bedtime takes
+    "morning_lead_minutes": 30,  # how long before the wake time it comes back on
+    "bedtime": "",           # "23:00"; empty means sundial's
+    "wake": "",              # "07:00"; empty means sundial's
 }
+SUNDIAL_CONFIG_FILE = os.path.expanduser("~/.config/sundial/config.ini")
+# Bedtime is acted on only this soon after it. Later than that (the Mac was
+# asleep, or the rule was only just installed) the night is left alone.
+BEDTIME_GRACE_SECONDS = 15 * 60
+FADE_STEP_SECONDS = 1.0
+pause = time.sleep      # the fade waits with this, and
+clock = time.monotonic  # measures with this; the tests replace both
 # The colour moves from sundial's colour to the night colour while the sun goes
 # from the horizon down to the end of civil twilight.
 NIGHT_COLOUR_FROM, NIGHT_COLOUR_BY = 0.0, -6.0
@@ -136,6 +153,7 @@ def settings():
             result[key] = value
     result["min_dimming"] = clamp(1, result["min_dimming"], 100)
     result["min_colour_dimming"] = clamp(1, result["min_colour_dimming"], 100)
+    result["stream_rate"] = clamp(0, result["stream_rate"], 30)
     if result["white_mode"] not in ("hybrid", "raw"):
         result["white_mode"] = "hybrid"
     points = []
@@ -689,6 +707,25 @@ class Fixture:
         answers = exchange("setPilot", values, absent) if values else {}
         return {mac for mac in bulbs if answers.get(self.addresses.get(mac), {}).get("success") is True}
 
+    def stream(self, setting, sock):
+        """Sends a setting to every bulb without waiting for answers or writing the record.
+
+        For a run of settings in quick succession, each replacing the last. A
+        bulb that misses one gets the next. The run must end with `apply`.
+        """
+        while True:  # throw away the answers to earlier sends
+            sock.settimeout(0)
+            try:
+                sock.recvfrom(4096)
+            except OSError:
+                break
+        for mac, bulb in self.plan(setting).items():
+            if mac in self.addresses:
+                try:
+                    sock.sendto(encode("setPilot", message_for(bulb)), (self.addresses[mac], PORT))
+                except OSError:
+                    pass
+
     def apply(self, setting, by):
         """Sets the whole fixture. Returns the MACs of bulbs that did not take it."""
         with self.locked():
@@ -828,10 +865,14 @@ def follow_settings():
         value = given.get(key, default)
         if isinstance(default, bool):
             good = isinstance(value, bool)
+        elif isinstance(default, str):
+            good = isinstance(value, str)
         else:
             good = isinstance(value, (int, float)) and not isinstance(value, bool)
         if good:
             result[key] = value
+    result["fade_minutes"] = max(0, result["fade_minutes"])
+    result["morning_lead_minutes"] = max(0, result["morning_lead_minutes"])
     result["night_brightness"] = clamp(0.001, float(result["night_brightness"]), 100.0)
     result["day_brightness"] = clamp(result["night_brightness"], float(result["day_brightness"]), 100.0)
     result["hold_minutes"] = max(0, result["hold_minutes"])
@@ -871,44 +912,271 @@ def sundial_target(now):
     return sun
 
 
-def follow_step(fixture, now, send=True):
+# ---------------------------------------------------------------- bedtime
+#
+# The one place the follower switches the fixture off and on. At bedtime it
+# fades the fixture out and switches it off, once. Before the wake time it
+# switches it on again, if it was the one that switched it off. Anything done
+# by hand in between is left alone until morning.
+#
+# memory["night"] is what it knows about the present night:
+#   start   when this night's bedtime was
+#   state   "off": the follower switched the fixture off
+#           "skip": the night is left alone
+#           "done": the morning has been dealt with
+
+def clock_minutes(text):
+    """"23:00" as minutes after midnight, or None."""
+    try:
+        hours, minutes = str(text).strip().split(":")
+        hours, minutes = int(hours), int(minutes)
+    except ValueError:
+        return None
+    return hours * 60 + minutes if 0 <= hours < 24 and 0 <= minutes < 60 else None
+
+
+def sleep_times(settings):
+    """(bedtime, wake) in minutes after midnight, or None if either is unknown.
+
+    follow.json's own "bedtime" and "wake" win. Otherwise they are sundial's,
+    read from its settings file each time, so there is one place to change them.
+    """
+    import configparser
+    sundial = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    try:
+        sundial.read(SUNDIAL_CONFIG_FILE)
+    except configparser.Error:
+        pass
+    times = []
+    for key in ("bedtime", "wake"):
+        minutes = clock_minutes(settings[key])
+        if minutes is None:
+            minutes = clock_minutes(sundial.get("sleep", key, fallback=""))
+        times.append(minutes)
+    return None if None in times else tuple(times)
+
+
+def night_window(now, bedtime, wake, lead_minutes):
+    """(start, morning): the latest bedtime that has passed, and when that night ends.
+
+    The night ends `lead_minutes` before the first wake time after it. From
+    then until the next bedtime it is day.
+    """
+    today = time.localtime(now)
+
+    def at(day, minutes):
+        return time.mktime((today.tm_year, today.tm_mon, today.tm_mday + day, minutes // 60, minutes % 60, 0, 0, 0, -1))
+    start = max(moment for moment in (at(-1, bedtime), at(0, bedtime)) if moment <= now)
+    woke = min(moment for moment in (at(-1, wake), at(0, wake), at(1, wake)) if moment > start)
+    return start, max(start, woke - lead_minutes * 60)
+
+
+def hhmm(moment):
+    return time.strftime("%H:%M", time.localtime(moment))
+
+
+def night_sentence(night, on, morning, settings):
+    if night["state"] == "off":
+        return "off for the night; on at %s" % hhmm(morning) if settings["morning_on"] else "off for the night"
+    if not on:
+        return "off by hand; left alone tonight"
+    if night.get("since"):
+        return "on by hand since %s; left alone tonight" % hhmm(night["since"])
+    return "on by hand; left alone tonight"
+
+
+def night_situation(sentence):
+    # One log line for each thing the night turns into, not one a minute.
+    return "night: " + sentence.split(";")[0]
+
+
+def bedtime_step(fixture, memory, follow, state, now, send):
+    """The bedtime rule's part of one run. None means: carry on following.
+
+    "fade" means: fade out now (done outside the lock, as it takes minutes).
+    Otherwise (situation, sentence, sent), as follow_step returns.
+    """
+    times = sleep_times(follow) if follow["bedtime_rule"] else None
+    if times is None:
+        memory.pop("night", None)
+        return None
+    start, morning = night_window(now, times[0], times[1], follow["morning_lead_minutes"])
+    night = memory.get("night")
+    if not isinstance(night, dict) or night.get("start") != start:
+        night = None
+    setting, on = state["setting"], state["setting"]["on"]
+
+    if now >= morning:
+        # Day. Switch on once, if the follower was the one that switched off.
+        if night is None or night["state"] != "off":
+            return None
+        if on or not follow["morning_on"]:
+            if send:
+                memory["night"] = dict(night, state="done")
+            return None
+        if not send:
+            return "morning", "about to switch on for the morning", False
+        kelvin, brightness = follow_target(sundial_target(now), follow, fixture)
+        wanted = dict(setting, on=True, mode="white", kelvin=kelvin, brightness=brightness)
+        missed = fixture.apply(wanted, "follow")
+        fixture.claim("follow")
+        memory["night"] = dict(night, state="done")
+        return "following", "morning: switched on at %s%s" % (
+            fixture.describe(wanted), "; not answering: %s" % ", ".join(missed) if missed else ""), True
+
+    if night is None:
+        # Bedtime has come. It is acted on once, and only close to the time.
+        if now - start > BEDTIME_GRACE_SECONDS:
+            night = {"start": start, "state": "skip", "why": "late"}
+        elif not on:
+            night = {"start": start, "state": "skip", "why": "off"}
+        elif not send:
+            return "bedtime", "about to fade out and switch off for the night", False
+        else:
+            return "fade"
+        if send:
+            memory["night"] = night
+    if night["state"] == "off" and on:
+        # Switched back on by hand. Left alone; it is not switched off twice.
+        night = {"start": start, "state": "skip", "why": "hand", "since": now}
+        if send:
+            memory["night"] = night
+    if night["state"] == "skip" and night.get("why") == "off" and on:
+        night = dict(night, why="hand", since=now)
+        if send:
+            memory["night"] = night
+    sentence = night_sentence(night, on, morning, follow)
+    return night_situation(sentence), sentence, False
+
+
+def bedtime_fade(fixture, memory, follow, now):
+    """Fades out and switches off, then says what happened, as follow_step returns."""
+    times = sleep_times(follow)
+    start, morning = night_window(now, times[0], times[1], follow["morning_lead_minutes"])
+    began = clock()
+    finished = fade_out(fixture, follow["fade_minutes"] * 60.0)
+    ended = now + (clock() - began)
+    if finished:
+        memory["night"] = night = {"start": start, "state": "off", "at": ended}
+        sentence = night_sentence(night, False, morning, follow)
+        return night_situation(sentence), "bedtime: faded out and switched off; " + sentence, True
+    # Set by someone during the fade: theirs now.
+    memory["night"] = night = {"start": start, "state": "skip", "why": "hand", "since": ended}
+    sentence = night_sentence(night, fixture.state()["setting"]["on"], morning, follow)
+    return night_situation(sentence), sentence, True
+
+
+def fade_out(fixture, seconds):
+    """Fades the fixture down to its lowest and switches every bulb off. True if it did.
+
+    It stops, leaving the fixture as it is, if anything else sets it meanwhile.
+    White goes down through the raw levels, to one bulb at its lowest. The
+    record keeps the setting from before the fade, and the bulbs are given it
+    as they are switched off, so switching on by hand brings that back and not
+    the fade's last step.
+    """
+    def mark():
+        state = fixture.state()
+        return state["setting"], state["by"], state["set_at"]
+    before = fixture.state()["setting"]
+    top = before["brightness"]
+    if before["mode"] == "white" and fixture.has_raw():
+        low = 1.0 / (fixture.anchor()[0] * len(fixture.macs))
+    else:
+        low = fixture.floor(before["mode"]) / float(len(fixture.macs))
+    mine, shown, began = mark(), fixture.plan(before), clock()
+    while top > low and clock() - began < seconds:
+        pause(FADE_STEP_SECONDS)
+        if mark() != mine:
+            return False
+        # Each step is the same share dimmer than the last, which looks even.
+        share = min(1.0, (clock() - began) / seconds)
+        setting = dict(before, brightness=tidy(top * (low / top) ** share))
+        bulbs = fixture.plan(setting)
+        if bulbs != shown:
+            fixture.apply(setting, "follow")
+            mine, shown = mark(), bulbs
+    if mark() != mine:
+        return False
+    fixture.apply(dict(before, on=False), "follow")
+    return True
+
+
+def bedtime_outlook(fixture, follow, memory, on, now):
+    """What the bedtime rule will do next, for `fixture follow`."""
+    if not follow["bedtime_rule"]:
+        return "the rule is switched off"
+    times = sleep_times(follow)
+    if times is None:
+        return "no bedtime known; set bedtime and wake in follow.json, or [sleep] in sundial's settings"
+    start, morning = night_window(now, times[0], times[1], follow["morning_lead_minutes"])
+    night = memory.get("night")
+    if not isinstance(night, dict) or night.get("start") != start:
+        night = None
+    if now < morning and night is not None and night["state"] in ("off", "skip"):
+        return night_sentence(night, on, morning, follow)
+    if now < morning and night is None:
+        return "bedtime was %s; fading out now" % hhmm(start) if now - start <= BEDTIME_GRACE_SECONDS \
+            else "on by hand; left alone tonight" if on else "off by hand; left alone tonight"
+    if night is not None and night["state"] == "off" and follow["morning_on"]:
+        return "switching on for the morning"
+    following = night_window(now + 86400, times[0], times[1], follow["morning_lead_minutes"])
+    text = "off at %02d:%02d" % (times[0] // 60, times[0] % 60)
+    if follow["morning_on"]:
+        text += ", on again at %s" % hhmm(following[1])
+    return text
+
+
+def follow_step(fixture, now, send=True, memory=None):
     """Decides what to do this minute and, if `send`, does it.
 
-    Returns (situation, sentence, sent).
+    Returns (situation, sentence, sent). `memory` is what the follower keeps
+    between runs, and is updated in place.
     """
+    memory = {} if memory is None else memory
     follow = follow_settings()
     if not follow["enabled"]:
         return "off", "following is switched off", False
     with fixture.locked():
         state, _ = fixture.reconcile(dry=not send)
-        setting = state["setting"]
-        if not setting["on"]:
-            return "light off", "the fixture is off; leaving it alone", False
-        # Whose setting is this? Anyone's but the follower's is left alone for a while.
-        mine = state["by"] == "follow"
-        until = state["set_at"] + follow["hold_minutes"] * 60
-        if not mine and now < until:
-            at = time.strftime("%H:%M", time.localtime(until))
-            return "hold " + at, "the fixture was set elsewhere (%s); following again at %s" % (
-                fixture.describe(setting), at), False
+        verdict = bedtime_step(fixture, memory, follow, state, now, send)
+        if verdict is None:
+            return follow_sun(fixture, follow, state, now, send)
+        if verdict != "fade":
+            return verdict
+    return bedtime_fade(fixture, memory, follow, now)
 
-        sun = sundial_target(now)
-        kelvin, brightness = follow_target(sun, follow, fixture)
-        wanted = dict(setting, mode="white", kelvin=kelvin, brightness=brightness)
-        text = fixture.describe(dict(wanted, on=True))
-        # Only what the bulbs would show counts: a target that moved by less
-        # than one bulb's step is not sent.
-        if state["bulbs"] == fixture.plan(wanted):
-            if send and not mine:
-                fixture.claim("follow")
-            return "following", "following the sun; the fixture is already at %s" % text, False
-        if not send:
-            return "following", "following the sun; about to set %s" % text, False
-        missed = fixture.apply(wanted, "follow")
-        fixture.claim("follow")
-        if missed:
-            text += "; not answering: %s" % ", ".join(missed)
-        return "following", "sun %+.1f  %s" % (float(sun["sun_elevation"]), text), True
+
+def follow_sun(fixture, follow, state, now, send):
+    """The ordinary minute: set the fixture from the sun, unless it is off or held."""
+    setting = state["setting"]
+    if not setting["on"]:
+        return "light off", "the fixture is off; leaving it alone", False
+    # Whose setting is this? Anyone's but the follower's is left alone for a while.
+    mine = state["by"] == "follow"
+    until = state["set_at"] + follow["hold_minutes"] * 60
+    if not mine and now < until:
+        at = time.strftime("%H:%M", time.localtime(until))
+        return "hold " + at, "the fixture was set elsewhere (%s); following again at %s" % (
+            fixture.describe(setting), at), False
+
+    sun = sundial_target(now)
+    kelvin, brightness = follow_target(sun, follow, fixture)
+    wanted = dict(setting, mode="white", kelvin=kelvin, brightness=brightness)
+    text = fixture.describe(dict(wanted, on=True))
+    # Only what the bulbs would show counts: a target that moved by less
+    # than one bulb's step is not sent.
+    if state["bulbs"] == fixture.plan(wanted):
+        if send and not mine:
+            fixture.claim("follow")
+        return "following", "following the sun; the fixture is already at %s" % text, False
+    if not send:
+        return "following", "following the sun; about to set %s" % text, False
+    missed = fixture.apply(wanted, "follow")
+    fixture.claim("follow")
+    if missed:
+        text += "; not answering: %s" % ", ".join(missed)
+    return "following", "sun %+.1f  %s" % (float(sun["sun_elevation"]), text), True
 
 
 def follow_apply(fixture, now=None):
@@ -919,13 +1187,15 @@ def follow_apply(fixture, now=None):
     """
     now = time.time() if now is None else now
     memory = read_json(path("follow-state.json"), {})
+    before = json.dumps(memory, sort_keys=True)
     try:
-        situation, sentence, sent = follow_step(fixture, now)
+        situation, sentence, sent = follow_step(fixture, now, True, memory)
     except Failure as failure:
         situation, sentence, sent = "stuck", "cannot follow the sun: %s" % failure, False
     changed = situation != memory.get("situation")
-    if changed:
-        write_json(path("follow-state.json"), {"situation": situation})
+    memory["situation"] = situation
+    if json.dumps(memory, sort_keys=True) != before:
+        write_json(path("follow-state.json"), memory)
     return sentence if sent or changed else None
 
 
@@ -976,6 +1246,33 @@ def cmd_colour(fixture, args):
 
 def cmd_brightness(fixture, args):
     set_fixture(fixture, on=True, brightness=args.brightness)
+
+
+def cmd_fade(fixture, args):
+    """Shows, or tries to set, how long the bulbs themselves take to change.
+
+    Each bulb fades to a new setting over its own saved time (fadeIn going
+    brighter, fadeOut going dimmer). The bulbs this was written for refuse the
+    change over the local network ("Invalid Request"), so it is checked by
+    reading it back, and a refusal is said plainly.
+    """
+    fixture.read_all()  # finds the bulbs
+    addresses = {fixture.addresses[mac]: mac for mac in fixture.macs if mac in fixture.addresses}
+    if args.milliseconds is not None:
+        values = {"fadeIn": args.milliseconds, "fadeOut": args.milliseconds}
+        exchange("setUserConfig", {address: values for address in addresses})
+    now = exchange("getUserConfig", {address: {} for address in addresses})
+    refused = 0
+    for address, mac in addresses.items():
+        if address not in now:
+            print("  %s  not answering" % mac)
+            continue
+        times = now[address].get("fadeIn"), now[address].get("fadeOut")
+        wrong = args.milliseconds is not None and times != (args.milliseconds, args.milliseconds)
+        refused += wrong
+        print("  %s  brighter in %s ms, dimmer in %s ms%s" % (mac, times[0], times[1], "  (refused)" if wrong else ""))
+    if refused:
+        raise Failure("%d bulbs would not take it; on these bulbs the fade can only be set in the WiZ app" % refused)
 
 
 def cmd_sweep(fixture, args):
@@ -1124,7 +1421,7 @@ def cmd_discover(fixture, args):
         saved["kelvin_max"] = min(high for _, high in kelvins)
     if floors:
         saved["min_dimming"] = max(floors)
-    for key in ("name", "port", "min_colour_dimming", "white_mode", "raw_calibration"):
+    for key in ("name", "port", "min_colour_dimming", "white_mode", "raw_calibration", "stream_rate"):
         saved.setdefault(key, SETTINGS_DEFAULTS[key])
     if len(saved["bulbs"]) == 7 and not saved.get("layout_mapped"):
         # A stand-in until someone looks at the fixture: the list order.
@@ -1170,9 +1467,12 @@ def cmd_follow(fixture, args):
         print("Target:    white %dK at %s" % (kelvin, percent(brightness)))
     except Failure as failure:
         print("Sun:       unknown (%s)" % failure)
+    memory = read_json(path("follow-state.json"), {})
     try:
-        print("Fixture:   %s" % fixture.describe(fixture.reconcile(dry=True)[0]["setting"]))
-        sentence = follow_step(fixture, now, send=False)[1]
+        setting = fixture.reconcile(dry=True)[0]["setting"]
+        print("Fixture:   %s" % fixture.describe(setting))
+        print("Bedtime:   %s" % bedtime_outlook(fixture, follow, memory, setting["on"], now))
+        sentence = follow_step(fixture, now, send=False, memory=dict(memory))[1]
     except Failure as failure:
         sentence = "cannot follow the sun: %s" % failure
     print("Now:       %s" % sentence)
@@ -1208,6 +1508,8 @@ def build_parser():
         colour.add_argument("brightness", type=level)
     brightness = add("brightness", cmd_brightness, "change the brightness, keep the colour")
     brightness.add_argument("brightness", type=level)
+    fade = add("fade", cmd_fade, "show the bulbs' own fade time, or try to set it: fixture fade 100")
+    fade.add_argument("milliseconds", nargs="?", type=whole(0, 10000, "milliseconds"))
     sweep = add("sweep", cmd_sweep, "move slowly between two brightnesses: fixture sweep 1.2 0.8 --seconds 60")
     sweep.add_argument("start", type=level)
     sweep.add_argument("end", type=level)

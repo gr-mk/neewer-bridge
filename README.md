@@ -79,7 +79,7 @@ neewer follow on         # start again, and take the light over now
 
 The rules:
 
-- **It never switches the light on or off.** While the light is off it does nothing. At night it stops at the night level and stays lit.
+- **It switches the light off and on only at bedtime and in the morning** (below). Otherwise it never does, and while the light is off it does nothing.
 - **A setting made elsewhere wins.** If you set the light from Apple Home or with another `neewer` command, it leaves the light alone for two hours from that change, then follows again. `neewer follow on` ends the wait early. Switching the light off and on is not a new setting.
 - **It keeps out of a sunrise.** Nothing is sent while `neewer sunrise` runs. What the sunrise leaves is then held for two hours like any other setting.
 - **It only sends when the target changes.** That is about once a minute around sunrise and sunset, and not at all at midday or at night.
@@ -93,7 +93,13 @@ The settings are in `follow.json` in the settings folder, and are read each minu
   "day_brightness": 100,
   "night_brightness": 5,
   "night_kelvin": 2700,
-  "hold_minutes": 120
+  "hold_minutes": 120,
+  "bedtime_rule": true,
+  "morning_on": true,
+  "fade_minutes": 5,
+  "morning_lead_minutes": 30,
+  "bedtime": "",
+  "wake": ""
 }
 ```
 
@@ -101,6 +107,24 @@ The settings are in `follow.json` in the settings folder, and are read each minu
 - Colour is sundial's colour, kept within the light's 2500-7500K. While the sun goes from the horizon to 6 degrees below, it moves to `night_kelvin`.
 - `night_brightness` cannot go below 1, because 0 would switch the light off.
 - `hold_minutes` is how long a setting made elsewhere is left alone.
+
+### Bedtime
+
+At bedtime the light fades out over five minutes and switches off. Half an hour before the wake time it switches on again, at whatever the sun calls for at that moment, and follows the dawn up.
+
+Bedtime and the wake time are sundial's (`[sleep]` in `~/.config/sundial/config.ini`, 23:00 and 07:00 as it stands). They are read from there every minute, not copied, so changing them in sundial changes them here. `"bedtime"` and `"wake"` in `follow.json` (as `"22:30"`) take their place if set.
+
+- **Once a night.** The light is switched off once, at bedtime. If anything switches it back on before morning, or sets it, it is left alone until morning: it is not switched off a second time, and it is not followed either. If it is already off at bedtime, nothing is done.
+- **On in the morning only if the follower switched it off.** If you switched it off yourself, at any point, it stays off.
+- **A setting made by hand does not put bedtime off.** A light set an hour before bedtime still goes off at bedtime.
+- **A setting made during the fade stops the fade**, and the light is yours for the night.
+- **Only near the time.** If the Mac was asleep at bedtime, or the rule was switched on in the middle of the night, that night is left alone. Bedtime is acted on within 15 minutes of it.
+- Switching on by hand after the fade brings back the setting from before the fade, not its last step. From Apple Home and the `neewer` command that is certain. The light's own button may wake it at 1%: the old setting is sent to the light as it is switched off, but whether it keeps a setting sent in standby is not known.
+- A `neewer sunrise` running at bedtime or at the morning time is left to itself.
+
+`neewer follow` says what the rule will do next: `off at 23:00, on again at 06:30`, `off for the night; on at 06:30`, `on by hand since 01:10; left alone tonight`.
+
+`"bedtime_rule": false` switches the whole rule off. `"morning_on": false` keeps the switching off and drops the switching on. `fade_minutes` and `morning_lead_minutes` are the five minutes and the half hour.
 
 It uses the ordinary white frame. After a sunrise the light is in the channels mode, so there is one brief wrong colour when following takes over.
 
@@ -158,12 +182,17 @@ fixture sweep 1.2 0.8 --seconds 60   # move slowly between two brightnesses
 fixture compare --bulb centre --raw-w 42   # set one bulb by hand; --restore puts it back
 fixture status              # asks every bulb what it is doing
 fixture discover            # lists the WiZ bulbs on the network and their limits
+fixture fade                # how long the bulbs themselves take to change
 fixture follow              # show whether the fixture is following the sun
 ```
 
 Every change goes to all the bulbs in one burst. A bulb that does not acknowledge is sent it again, up to four times in all over 3.5 seconds, and any bulb still silent is named. It is then sent what it missed as soon as it answers again.
 
 The bulbs save power between Wi-Fi beacons, so each one acts on a change anywhere from a tenth of a second to two seconds after it is sent. They do not all change at the same instant. That is the bulbs, not this program.
+
+### The bulbs' own fade
+
+Each bulb fades to a new setting over a time saved in the bulb: 450 ms going brighter and 500 ms going dimmer, as they came. `fixture fade` shows it. `fixture fade 100` tries to change it and reads it back, but these bulbs (firmware 1.33.39) refuse the change over the local network with "Invalid Request", in every form tried, and stay at 450 and 500. It can only be changed in the WiZ app, which these bulbs are not joined to.
 
 ### Which bulbs
 
@@ -297,6 +326,7 @@ To pair, open the Home app, choose Add Accessory, and scan the QR code or enter 
 Add `--qr code.svg` in place of `--pairing` to write the QR code to a file.
 
 - Home shows one light: on/off, brightness, colour and colour temperature (2200-6500K).
+- **Dragging a slider.** While Home is writing one change after another, the newest is sent to every bulb ten times a second without waiting for the bulbs to answer. When nothing new has come for a third of a second, the last one is sent again the careful way, waiting for every bulb, and only then is the record written. `stream_rate` in `fixture.json` is the ten; 0 goes back to waiting for the bulbs after every send. Measured on the seven bulbs with a two-second drag: each bulb showed 12 to 17 steps where it had shown 3 or 4, and all were at the last value 0.3 to 0.75 seconds after the drag ended, where it had taken 0.5 to 2.9. Twenty a second was no better.
 - Home's brightness is a whole number. A fraction set elsewhere is shown rounded, and anything lit shows as at least 1%.
 - A change made any other way shows up in Home within about 5 seconds.
 - If no bulb answers (the wall switch is off), Home shows "No Response". One bulb answering is enough.
@@ -315,12 +345,14 @@ fixture follow on         # start again, and take the fixture over now
 
 The rules are the Neewer light's:
 
-- **It never switches the fixture on or off.** While the fixture is off it does nothing.
+- **It switches the fixture off and on only at bedtime and in the morning**, by the same rule as the Neewer light (see Bedtime above), with the same settings in its own `follow.json`. Otherwise it never does, and while the fixture is off it does nothing.
 - **A setting made elsewhere wins.** After a change from Apple Home, the `fixture` command, the WiZ app or a single bulb's tile, it leaves the fixture alone for two hours, then follows again. `fixture follow on` ends the wait early.
 - **It only sends when what a bulb should show changes**, and writes one line to the log each time. It does not round brightness to a whole number, so through dusk and dawn the fixture moves one bulb at a time, in sevenths of a percent.
 - If no bulb answers, or sundial has stopped, it tries again each minute and writes one line, not one a minute.
 
-`follow.json` in the fixture's settings folder has the same five settings as the Neewer light's: `enabled`, `day_brightness` (100), `night_brightness` (1), `night_kelvin` (2700) and `hold_minutes` (120). Colour is kept within the bulbs' 2200-6500K. The night level of 1 is every bulb at dimming 1. It may be lower: 0.4 is every bulb on its raw warm LED at about level 17, and the ramp down to it at dusk is then smooth all the way.
+The fixture's fade at bedtime goes down through the raw levels below 1%, to a single bulb at its lowest, and then every bulb is switched off. The bulbs are given the setting from before the fade as they go off, so switching the fixture on by hand, from anywhere, brings that back. In the morning every bulb comes back on.
+
+`follow.json` in the fixture's settings folder has the same settings as the Neewer light's: `enabled`, `day_brightness` (100), `night_brightness` (1), `night_kelvin` (2700) and `hold_minutes` (120). Colour is kept within the bulbs' 2200-6500K. The night level of 1 is every bulb at dimming 1. It may be lower: 0.4 is every bulb on its raw warm LED at about level 17, and the ramp down to it at dusk is then smooth all the way.
 
 `python3 tests/test_fixture.py` checks all of this against seven pretend bulbs, without touching real ones.
 

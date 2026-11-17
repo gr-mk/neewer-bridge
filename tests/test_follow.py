@@ -42,16 +42,19 @@ class FakeBridge:
         FakeBridge.sent.append(cli.to_hex(frame))
 
 
-class FollowTest(unittest.TestCase):
+class Scaffold(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
         self.saved = {name: getattr(cli, name) for name in (
-            "LIGHT_FILE", "STATE_FILE", "FOLLOW_FILE", "FOLLOW_MEMORY_FILE", "SUNDIAL_STATE_FILE", "Bridge")}
+            "LIGHT_FILE", "STATE_FILE", "FOLLOW_FILE", "FOLLOW_MEMORY_FILE", "SUNDIAL_STATE_FILE",
+            "SUNDIAL_CONFIG_FILE", "Bridge", "pause")}
         self.addCleanup(lambda: [setattr(cli, name, value) for name, value in self.saved.items()])
         for name, file in (("LIGHT_FILE", "light.json"), ("STATE_FILE", "state.json"),
                            ("FOLLOW_FILE", "follow.json"), ("FOLLOW_MEMORY_FILE", "follow-state.json"),
-                           ("SUNDIAL_STATE_FILE", "sundial.json")):
+                           ("SUNDIAL_STATE_FILE", "sundial.json"),
+                           # No sundial settings: no bedtime, so these tests pass at any hour.
+                           ("SUNDIAL_CONFIG_FILE", "sundial.ini")):
             setattr(cli, name, os.path.join(self.folder.name, file))
         cli.Bridge = FakeBridge
         FakeBridge.sent, FakeBridge.broken = [], False
@@ -86,6 +89,8 @@ class FollowTest(unittest.TestCase):
     def white(self, kelvin, brightness):
         return cli.to_hex(cli.white_frame(cli.parse_mac(MAC), kelvin, brightness))
 
+
+class FollowTest(Scaffold):
     # -- the curve
 
     def test_curve_through_the_day(self):
@@ -287,6 +292,241 @@ class FollowTest(unittest.TestCase):
         cli.cmd_follow(cli.Light(arguments), arguments)
         self.assertEqual(len(FakeBridge.sent), 2)
         self.assertIs(cli.read_json(cli.FOLLOW_FILE, {})["enabled"], True)
+
+
+class BedtimeTest(Scaffold):
+    """The bedtime rule, with sundial saying bedtime 23:00 and wake 07:00."""
+
+    def setUp(self):
+        super().setUp()
+        with open(cli.SUNDIAL_CONFIG_FILE, "w") as handle:
+            handle.write("[sleep]\nwake = 07:00\nbedtime = 23:00   # a comment\n")
+        self.paused, self.during = 0.0, None
+        cli.pause = self.pause
+        self.midnight = time.mktime(time.localtime(self.now)[:3] + (0, 0, 0, 0, 0, -1))
+        # An evening: the follower has had the light at the night level for hours.
+        self.at(22, 0)
+        self.set_elsewhere({"on": True, "mode": "white", "kelvin": 4500, "brightness": 100, "tint": 0},
+                           minutes_ago=300)
+        self.sun(NIGHT)
+        self.assertIn("white 2700K at 5%", self.apply())
+        FakeBridge.sent = []
+
+    def pause(self, seconds):
+        self.paused += seconds
+        if self.during:
+            self.during()
+
+    def at(self, hour, minute, day=0):
+        self.now = self.midnight + day * 86400 + hour * 3600 + minute * 60
+        self.sun(self.sky if hasattr(self, "sky") else NIGHT)
+
+    def sun(self, target):
+        self.sky = target
+        super().sun(target)
+
+    def by_hand(self, **changes):
+        cli.write_json(cli.STATE_FILE, dict(self.state(), **changes))
+        os.utime(cli.STATE_FILE, (self.now, self.now))
+
+    def power(self, on):
+        return cli.to_hex(cli.power_frame(cli.parse_mac(MAC), on))
+
+    def status(self):
+        light = cli.Light(argparse.Namespace(bridge=None, mac=None, quiet=True))
+        return cli.bedtime_outlook(light, cli.follow_settings(), cli.read_json(cli.FOLLOW_MEMORY_FILE, {}), self.now)
+
+    def test_times_come_from_sundial(self):
+        self.assertEqual(cli.sleep_times(cli.follow_settings()), (23 * 60, 7 * 60))
+        self.assertEqual(self.status(), "off at 23:00, on again at 06:30")
+
+    def test_fade_and_off_at_bedtime(self):
+        self.at(23, 0)
+        line = self.apply()
+        self.assertEqual(line, "bedtime: faded out and switched off; off for the night; on at 06:30")
+        self.assertEqual(FakeBridge.sent, [self.white(2700, 4), self.white(2700, 3), self.white(2700, 2),
+                                           self.white(2700, 1), self.power(False), self.white(2700, 5)])
+        self.assertAlmostEqual(self.paused, 300.3, places=1)  # five minutes
+        # The record keeps the setting from before the fade, so "on" brings it back.
+        self.assertEqual((self.state()["on"], self.state()["brightness"]), (False, 5))
+        self.assertEqual(self.status(), "off for the night; on at 06:30")
+        FakeBridge.sent = []
+        for minute in (1, 30, 59):
+            self.at(23, minute)
+            self.assertIsNone(self.apply())
+        self.assertEqual(FakeBridge.sent, [])
+
+    def test_already_off_at_bedtime(self):
+        self.by_hand(on=False)
+        self.at(23, 0)
+        self.assertEqual(self.apply(), "off by hand; left alone tonight")
+        self.at(6, 30, day=1)
+        self.apply()
+        self.at(9, 0, day=1)
+        self.apply()
+        self.assertEqual(FakeBridge.sent, [])  # he switched it off; it stays off
+        self.assertIs(self.state()["on"], False)
+
+    def test_switched_back_on_in_the_night_is_left_alone(self):
+        self.at(23, 0)
+        self.apply()
+        FakeBridge.sent = []
+        self.at(1, 10, day=1)
+        self.by_hand(on=True)
+        self.assertEqual(self.apply(), "on by hand since 01:10; left alone tonight")
+        self.assertEqual(self.status(), "on by hand since 01:10; left alone tonight")
+        for hour in (2, 4, 6):  # well past the two-hour hold: still not switched off again
+            self.at(hour, 0, day=1)
+            self.assertIsNone(self.apply())
+        self.assertEqual(FakeBridge.sent, [])
+        self.assertIs(self.state()["on"], True)
+        # In the morning it follows again.
+        self.sun(DUSK)
+        self.at(6, 30, day=1)
+        self.assertIn("white 4100K at 29%", self.apply())
+
+    def test_set_brighter_in_the_night_is_left_alone(self):
+        self.at(23, 0)
+        self.apply()
+        self.at(0, 30, day=1)
+        self.by_hand(on=True, brightness=60)
+        self.apply()
+        FakeBridge.sent = []
+        self.at(3, 0, day=1)
+        self.assertIsNone(self.apply())
+        self.assertEqual(FakeBridge.sent, [])
+
+    def test_switched_off_by_hand_stays_off_in_the_morning(self):
+        self.at(23, 0)
+        self.apply()
+        self.at(1, 0, day=1)
+        self.by_hand(on=True)
+        self.apply()
+        self.at(2, 0, day=1)
+        self.by_hand(on=False)
+        self.assertEqual(self.apply(), "off by hand; left alone tonight")
+        FakeBridge.sent = []
+        for hour, minute in ((6, 30), (7, 0), (12, 0)):
+            self.at(hour, minute, day=1)
+            self.apply()
+        self.assertEqual(FakeBridge.sent, [])
+        self.assertIs(self.state()["on"], False)
+
+    def test_on_again_in_the_morning_and_following(self):
+        self.at(23, 0)
+        self.apply()
+        FakeBridge.sent = []
+        self.at(6, 29, day=1)
+        self.assertIsNone(self.apply())
+        self.sun({"sun_elevation": -5.0, "daylight": 0.04, "kelvin": 3400})
+        self.at(6, 30, day=1)
+        self.assertEqual(self.apply(), "morning: switched on at white 2800K at 9%")
+        self.assertEqual(FakeBridge.sent, [self.power(True), self.white(2800, 9)])
+        self.assertIs(self.state()["on"], True)
+        self.sun(DUSK)
+        self.at(6, 50, day=1)
+        self.assertIn("white 4100K at 29%", self.apply())  # no hold: it rises with the dawn
+        self.assertEqual(self.status(), "off at 23:00, on again at 06:30")
+
+    def test_morning_on_can_be_switched_off(self):
+        cli.write_json(cli.FOLLOW_FILE, {"morning_on": False})
+        self.at(23, 0)
+        self.assertEqual(self.apply(), "bedtime: faded out and switched off; off for the night")
+        FakeBridge.sent = []
+        self.at(6, 30, day=1)
+        self.apply()
+        self.at(8, 0, day=1)
+        self.apply()
+        self.assertEqual(FakeBridge.sent, [])
+
+    def test_a_sunrise_in_the_morning_is_left_alone(self):
+        self.at(23, 0)
+        self.apply()
+        FakeBridge.sent = []
+        self.sunrise = True
+        self.at(6, 30, day=1)
+        self.apply()
+        self.sunrise = False
+        self.at(6, 40, day=1)
+        self.apply()
+        self.assertEqual(FakeBridge.sent, [])  # the sunrise's business now, not switched on twice
+
+    def test_own_bedtime_and_wake(self):
+        cli.write_json(cli.FOLLOW_FILE, {"bedtime": "21:30", "wake": "06:00", "morning_lead_minutes": 15,
+                                         "fade_minutes": 1})
+        self.at(21, 29, day=1)
+        self.assertEqual(self.status(), "off at 21:30, on again at 05:45")
+        self.apply()
+        self.assertIs(self.state()["on"], True)
+        self.at(21, 30, day=1)
+        self.assertIn("on at 05:45", self.apply())
+        self.assertAlmostEqual(self.paused, 60.3, places=1)
+        FakeBridge.sent = []
+        self.at(5, 44, day=2)
+        self.assertIsNone(self.apply())
+        self.at(5, 45, day=2)
+        self.assertIn("morning: switched on", self.apply())
+
+    def test_the_rule_can_be_switched_off(self):
+        cli.write_json(cli.FOLLOW_FILE, {"bedtime_rule": False})
+        self.assertEqual(self.status(), "the rule is switched off")
+        self.at(23, 0)
+        self.assertIsNone(self.apply())
+        self.sun(DUSK)
+        self.at(23, 5)
+        self.assertIn("white 4100K at 29%", self.apply())  # still following, still on
+        self.assertIs(self.state()["on"], True)
+
+    def test_started_in_the_middle_of_the_night(self):
+        os.remove(cli.FOLLOW_MEMORY_FILE)
+        self.at(2, 45, day=1)
+        self.assertEqual(self.status(), "on by hand; left alone tonight")
+        self.assertEqual(self.apply(), "on by hand; left alone tonight")
+        self.at(3, 0, day=1)
+        self.assertIsNone(self.apply())
+        self.assertEqual(FakeBridge.sent, [])
+        self.at(9, 0, day=1)
+        self.apply()                       # day: following again
+        self.assertEqual(self.status(), "off at 23:00, on again at 06:30")
+        FakeBridge.sent = []
+        self.at(23, 0, day=1)              # the next bedtime is the first it acts on
+        self.assertIn("faded out and switched off", self.apply())
+
+    def test_a_late_start_after_bedtime_leaves_the_night_alone(self):
+        self.at(23, 40)                    # the Mac was asleep at 23:00
+        self.assertEqual(self.apply(), "on by hand; left alone tonight")
+        self.assertEqual(FakeBridge.sent, [])
+
+    def test_a_setting_made_during_the_fade_stops_it(self):
+        def meddle():
+            if self.paused >= 120 and self.state()["brightness"] != 50:
+                self.now += 120
+                self.by_hand(brightness=50)
+        self.during = meddle
+        self.at(23, 0)
+        line = self.apply()
+        self.assertIn("on by hand since", line)
+        self.assertNotIn(self.power(False), FakeBridge.sent)
+        self.assertEqual((self.state()["on"], self.state()["brightness"]), (True, 50))
+        FakeBridge.sent = []
+        self.at(23, 30)
+        self.assertIsNone(self.apply())
+        self.assertEqual(FakeBridge.sent, [])
+
+    def test_a_held_setting_is_still_switched_off_at_bedtime(self):
+        self.at(22, 30)
+        self.by_hand(brightness=40, kelvin=3000)
+        self.assertIn("set elsewhere", self.apply())
+        self.at(23, 0)
+        self.assertIn("faded out and switched off", self.apply())
+        self.assertEqual((self.state()["on"], self.state()["brightness"], self.state()["kelvin"]), (False, 40, 3000))
+
+    def test_no_bedtime_known(self):
+        os.remove(cli.SUNDIAL_CONFIG_FILE)
+        self.assertIn("no bedtime known", self.status())
+        self.at(23, 0)
+        self.assertIsNone(self.apply())
+        self.assertIs(self.state()["on"], True)
 
 
 if __name__ == "__main__":

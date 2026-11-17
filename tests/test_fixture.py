@@ -103,8 +103,11 @@ class Network:
     def answer(bulb, method, values):
         if method == "getPilot":
             return {"method": method, "env": "", "result": dict(bulb, rssi=-40)}
+        if method == "getUserConfig":
+            return {"method": method, "env": "", "result": {"fadeIn": 450, "fadeOut": 500}}
         if method != "setPilot":
-            return {"method": method, "env": "", "error": {"code": -32601}}
+            # As the real bulbs answer setUserConfig: they will not take it.
+            return {"method": method, "env": "", "error": {"code": -32600, "message": "Invalid Request"}}
         colour = any(key in values for key in "rgb")
         if "temp" in values:
             for key in "rgbcw":
@@ -130,10 +133,13 @@ class Case(unittest.TestCase):
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
         saved = {name: getattr(cli, name) for name in (
-            "APP_DIR", "SUNDIAL_STATE_FILE", "open_socket", "own_address", "WAITS", "SEARCH_WAIT")}
+            "APP_DIR", "SUNDIAL_STATE_FILE", "SUNDIAL_CONFIG_FILE", "open_socket", "own_address", "WAITS",
+            "SEARCH_WAIT", "pause", "clock")}
         self.addCleanup(lambda: [setattr(cli, name, value) for name, value in saved.items()])
         cli.APP_DIR = self.folder.name
         cli.SUNDIAL_STATE_FILE = os.path.join(self.folder.name, "sundial.json")
+        # No sundial settings: no bedtime, so the other tests pass at any hour.
+        cli.SUNDIAL_CONFIG_FILE = os.path.join(self.folder.name, "sundial.ini")
         self.net = Network()
         cli.open_socket = lambda: self.net
         cli.own_address = lambda: "10.0.0.2"
@@ -408,6 +414,8 @@ class BrightnessTest(Case):
         self.assertEqual(self.shown(), (7, [100]))
         self.assertEqual(cli.main(["white", "9000", "5"]), 1)  # outside what the bulbs show
         self.assertEqual(cli.main(["status"]), 0)
+        self.assertEqual(cli.main(["fade"]), 0)
+        self.assertEqual(cli.main(["fade", "100"]), 1)  # these bulbs refuse; it is checked by reading back
 
 
 class RawTest(Case):
@@ -932,6 +940,227 @@ class FollowTest(Case):
         self.assertEqual(cli.FOLLOW_DEFAULTS["night_brightness"], 1)
 
 
+class BedtimeTest(Case):
+    """The bedtime rule, with sundial saying bedtime 23:00 and wake 07:00."""
+
+    def setUp(self):
+        super().setUp()
+        saved = cli.read_json(cli.path("fixture.json"), {})
+        saved["raw_calibration"] = [{"kelvin": 2700, "percent": 1, "c": 0, "w": 42, "dimming": 10}]
+        cli.write_json(cli.path("fixture.json"), saved)
+        self.fixture = cli.Fixture()
+        with open(cli.SUNDIAL_CONFIG_FILE, "w") as handle:
+            handle.write("[sleep]\nwake = 07:00\nbedtime = 23:00   # a comment\n")
+        self.ticks, self.during = 0.0, None
+        cli.pause, cli.clock = self.pause, lambda: self.ticks
+        self.midnight = time.mktime(time.localtime(self.now)[:3] + (0, 0, 0, 0, 0, -1))
+        self.sky = NIGHT
+        # An evening: the follower has the fixture at the night level.
+        self.set(kelvin=4000, brightness=80)
+        self.fixture.claim("follow")
+        self.assertIn("white 2700K at 1%", self.apply(22, 0))
+        self.net.sent = []
+
+    def pause(self, seconds):
+        self.ticks += seconds
+        if self.during:
+            self.during()
+
+    def apply(self, hour, minute, day=0):
+        self.when = self.midnight + day * 86400 + hour * 3600 + minute * 60
+        cli.write_json(cli.SUNDIAL_STATE_FILE, {"target": self.sky})
+        os.utime(cli.SUNDIAL_STATE_FILE, (self.when, self.when))
+        return cli.follow_apply(self.fixture, self.when)
+
+    def status(self):
+        return cli.bedtime_outlook(self.fixture, cli.follow_settings(), cli.read_json(cli.path("follow-state.json"), {}),
+                                   self.fixture.state()["setting"]["on"], self.when)
+
+    def switch(self, on):
+        """The whole fixture switched by hand, at the bulbs."""
+        for bulb in self.net.bulbs.values():
+            bulb["state"] = on
+
+    def sets(self):
+        return len(self.net.packets("setPilot"))
+
+    def test_times_come_from_sundial(self):
+        self.assertEqual(cli.sleep_times(cli.follow_settings()), (23 * 60, 7 * 60))
+        self.assertEqual(self.status(), "off at 23:00, on again at 06:30")
+
+    def test_fade_and_off_at_bedtime(self):
+        totals = []
+
+        def watch():
+            lit = [bulb for bulb in self.net.bulbs.values() if bulb["state"]]
+            self.assertTrue(all("w" in bulb or bulb["dimming"] == 1 for bulb in lit))
+            totals.append(sum(bulb.get("w", 42) for bulb in lit))
+        self.during = watch
+        line = self.apply(23, 0)
+        self.assertEqual(line, "bedtime: faded out and switched off; off for the night; on at 06:30")
+        self.assertEqual(self.net.lit(), [])
+        self.assertAlmostEqual(self.ticks, 300, delta=2)           # five minutes
+        self.assertEqual(totals, sorted(totals, reverse=True))     # only ever dimmer
+        self.assertEqual((totals[0], totals[-1]), (294, 1))        # down through the raw levels to one bulb
+        self.assertGreater(len(set(totals)), 100)                  # in small steps
+        # The record and the bulbs keep the setting from before the fade.
+        setting = self.fixture.state()["setting"]
+        self.assertEqual((setting["on"], setting["brightness"], setting["kelvin"]), (False, 1, 2700))
+        for bulb in self.net.bulbs.values():
+            self.assertEqual((bulb["temp"], bulb["dimming"]), (2700, 1))
+        self.assertEqual(self.status(), "off for the night; on at 06:30")
+        sent = self.sets()
+        for minute in (1, 30, 59):
+            self.assertIsNone(self.apply(23, minute))
+        self.assertEqual(self.sets(), sent)
+
+    def test_a_bright_fixture_fades_all_the_way(self):
+        self.set(kelvin=3000, brightness=60)
+        self.fixture.claim("follow")
+        self.sky = DAY
+        self.apply(22, 30)
+        self.assertEqual(self.shown(), (7, [100]))
+        self.assertIn("faded out and switched off", self.apply(23, 0))
+        self.assertEqual(self.net.lit(), [])
+        self.assertEqual(self.fixture.state()["setting"]["brightness"], 100)
+
+    def test_already_off_at_bedtime(self):
+        self.switch(False)
+        self.assertEqual(self.apply(23, 0), "off by hand; left alone tonight")
+        self.net.sent = []
+        self.apply(6, 30, day=1)
+        self.apply(9, 0, day=1)
+        self.assertEqual(self.sets(), 0)  # he switched it off; it stays off
+        self.assertEqual(self.net.lit(), [])
+
+    def test_switched_back_on_in_the_night_is_left_alone(self):
+        self.apply(23, 0)
+        self.switch(True)
+        self.assertEqual(self.apply(1, 10, day=1), "on by hand since 01:10; left alone tonight")
+        self.assertEqual(self.status(), "on by hand since 01:10; left alone tonight")
+        sent = self.sets()
+        for hour in (2, 4, 6):  # well past the two-hour hold: still not switched off again
+            self.assertIsNone(self.apply(hour, 0, day=1))
+        self.assertEqual(self.sets(), sent)
+        self.assertEqual(len(self.net.lit()), 7)
+        self.sky = DUSK
+        self.assertIn("white 4100K at 25.8%", self.apply(6, 30, day=1))  # in the morning it follows again
+
+    def test_set_from_home_in_the_night_is_left_alone(self):
+        self.apply(23, 0)
+        self.fixture.apply(dict(self.fixture.state()["setting"], on=True, brightness=60), "home")
+        self.assertIn("on by hand since 00:30", self.apply(0, 30, day=1))
+        sent = self.sets()
+        self.assertIsNone(self.apply(3, 0, day=1))
+        self.assertEqual(self.sets(), sent)
+        self.assertEqual(self.shown(), (7, [60]))
+
+    def test_switched_off_by_hand_stays_off_in_the_morning(self):
+        self.apply(23, 0)
+        self.switch(True)
+        self.apply(1, 0, day=1)
+        self.switch(False)
+        self.assertEqual(self.apply(2, 0, day=1), "off by hand; left alone tonight")
+        sent = self.sets()
+        for hour, minute in ((6, 30), (7, 0), (12, 0)):
+            self.apply(hour, minute, day=1)
+        self.assertEqual(self.sets(), sent)
+        self.assertEqual(self.net.lit(), [])
+
+    def test_on_again_in_the_morning_and_following(self):
+        self.apply(23, 0)
+        sent = self.sets()
+        self.assertIsNone(self.apply(6, 29, day=1))
+        self.assertEqual(self.sets(), sent)
+        self.sky = {"sun_elevation": -5.0, "daylight": 0.04, "kelvin": 3400}
+        self.assertEqual(self.apply(6, 30, day=1), "morning: switched on at white 2800K at 5%")
+        self.assertEqual(len(self.net.lit()), 7)   # every bulb back, as the plan has them
+        self.assertEqual(self.net.bulb(MACS[0])["temp"], 2800)
+        self.sky = DUSK
+        self.assertIn("white 4100K at 25.8%", self.apply(6, 50, day=1))  # no hold: it rises with the dawn
+        self.assertEqual(self.status(), "off at 23:00, on again at 06:30")
+
+    def test_morning_on_can_be_switched_off(self):
+        cli.write_json(cli.path("follow.json"), {"morning_on": False})
+        self.assertEqual(self.apply(23, 0), "bedtime: faded out and switched off; off for the night")
+        sent = self.sets()
+        self.apply(6, 30, day=1)
+        self.apply(8, 0, day=1)
+        self.assertEqual(self.sets(), sent)
+        self.assertEqual(self.net.lit(), [])
+
+    def test_own_bedtime_and_wake(self):
+        cli.write_json(cli.path("follow.json"), {"bedtime": "21:30", "wake": "06:00", "morning_lead_minutes": 15,
+                                                 "fade_minutes": 1})
+        self.apply(21, 29, day=1)
+        self.assertEqual(self.status(), "off at 21:30, on again at 05:45")
+        self.assertEqual(len(self.net.lit()), 7)
+        self.assertIn("on at 05:45", self.apply(21, 30, day=1))
+        self.assertAlmostEqual(self.ticks, 60, delta=2)
+        self.assertIsNone(self.apply(5, 44, day=2))
+        self.assertIn("morning: switched on", self.apply(5, 45, day=2))
+
+    def test_the_rule_can_be_switched_off(self):
+        cli.write_json(cli.path("follow.json"), {"bedtime_rule": False})
+        self.assertIsNone(self.apply(23, 0))
+        self.assertEqual(self.status(), "the rule is switched off")
+        self.sky = DUSK
+        self.assertIn("white 4100K at 25.8%", self.apply(23, 5))  # still following, still on
+        self.assertEqual(len(self.net.lit()), 7)
+
+    def test_started_in_the_middle_of_the_night(self):
+        os.remove(cli.path("follow-state.json"))
+        self.assertEqual(self.apply(2, 45, day=1), "on by hand; left alone tonight")
+        self.assertEqual(self.status(), "on by hand; left alone tonight")
+        self.assertIsNone(self.apply(3, 0, day=1))
+        self.assertEqual(self.sets(), 0)
+        self.apply(9, 0, day=1)                       # day: following again
+        self.assertEqual(self.status(), "off at 23:00, on again at 06:30")
+        self.assertIn("faded out and switched off", self.apply(23, 0, day=1))  # the first bedtime it acts on
+
+    def test_a_late_start_after_bedtime_leaves_the_night_alone(self):
+        self.assertEqual(self.apply(23, 40), "on by hand; left alone tonight")  # the Mac was asleep at 23:00
+        self.assertEqual(self.sets(), 0)
+
+    def test_a_setting_made_during_the_fade_stops_it(self):
+        def meddle():
+            if self.ticks >= 120 and self.fixture.state()["by"] != "home":
+                self.fixture.apply(dict(self.fixture.state()["setting"], brightness=50), "home")
+        self.during = meddle
+        self.assertIn("on by hand since 23:0", self.apply(23, 0))
+        self.assertEqual(self.shown(), (7, [50]))
+        sent = self.sets()
+        self.assertIsNone(self.apply(23, 30))
+        self.assertEqual(self.sets(), sent)
+
+    def test_a_held_setting_is_still_switched_off_at_bedtime(self):
+        self.fixture.apply(dict(self.fixture.state()["setting"], brightness=40, kelvin=3000), "home")
+        state = self.fixture.state()
+        state["set_at"] = self.midnight + 22 * 3600 + 25 * 60  # five minutes before the next run
+        cli.write_json(cli.path("state.json"), state)
+        self.assertIn("set elsewhere", self.apply(22, 30))
+        self.assertIn("faded out and switched off", self.apply(23, 0))
+        setting = self.fixture.state()["setting"]
+        self.assertEqual((setting["on"], setting["brightness"], setting["kelvin"]), (False, 40, 3000))
+
+    def test_without_raw_white_the_fade_ends_on_one_bulb(self):
+        saved = cli.read_json(cli.path("fixture.json"), {})
+        saved["raw_calibration"] = []
+        cli.write_json(cli.path("fixture.json"), saved)
+        self.fixture = cli.Fixture()
+        counts = []
+        self.during = lambda: counts.append(len(self.net.lit()))
+        self.assertIn("faded out and switched off", self.apply(23, 0))
+        self.assertEqual((counts[0], counts[-1]), (7, 1))
+        self.assertEqual(self.net.lit(), [])
+
+    def test_no_bedtime_known(self):
+        os.remove(cli.SUNDIAL_CONFIG_FILE)
+        self.assertIsNone(self.apply(23, 0))
+        self.assertIn("no bedtime known", self.status())
+        self.assertEqual(len(self.net.lit()), 7)
+
+
 class HomeKitTest(Case):
     def setUp(self):
         super().setUp()
@@ -996,6 +1225,85 @@ class HomeKitTest(Case):
         self.write(Brightness=0, On=False)
         self.assertEqual(self.link.snapshot()["brightness"], 1)
 
+    def burst(self, writes, every=0.05):
+        """Home writing `writes` one after another, `every` seconds apart, as a drag does."""
+        saved = (homekit.pause, homekit.clock)
+        self.addCleanup(lambda: setattr(homekit, "pause", saved[0]) or setattr(homekit, "clock", saved[1]))
+        state = {"now": 0.0, "next": every, "left": list(writes[1:])}
+
+        def pause(seconds):
+            state["now"] += seconds
+            while state["left"] and state["now"] >= state["next"]:
+                self.link.apply_home(state["left"].pop(0))
+                state["next"] += every
+        homekit.pause, homekit.clock = pause, lambda: state["now"]
+        self.link.apply_home(writes[0])
+        self.link.send_burst()
+        return state["now"]
+
+    def test_a_drag_is_streamed_and_then_confirmed(self):
+        self.net.sent = []
+        took = self.burst([{"Brightness": level} for level in range(10, 60, 2)], every=0.05)
+        sent = [values["dimming"] for values in self.net.packets("setPilot", MACS[0])]
+        # 25 writes in 1.2 seconds, sent ten times a second: about every other one, in order.
+        self.assertTrue(10 <= len(sent) <= 16, sent)
+        self.assertEqual(sent, sorted(sent))
+        self.assertEqual(sent[-2:], [58, 58])                # the last one twice: streamed, then confirmed
+        self.assertEqual(self.shown(), (7, [58]))
+        self.assertAlmostEqual(took, 1.2 + homekit.BURST_QUIET_SECONDS, delta=0.25)
+        state = self.fixture.state()
+        self.assertEqual((state["setting"]["brightness"], state["by"], state["pending"]), (58, "home", []))
+        self.assertFalse(self.link.unsent)
+
+    def test_the_record_is_written_only_at_the_end_of_a_drag(self):
+        seen = []
+        stream = self.fixture.stream
+        self.fixture.stream = lambda setting, sock: (seen.append(self.fixture.state()["setting"]["brightness"]),
+                                                     stream(setting, sock))
+        self.burst([{"Brightness": level} for level in (20, 30, 40)])
+        self.assertEqual(set(seen), {5})
+        self.assertEqual(self.fixture.state()["setting"]["brightness"], 40)
+
+    def test_a_single_tap_is_sent_at_once_and_confirmed(self):
+        self.net.sent = []
+        self.burst([{"On": False}])
+        self.assertEqual(self.net.lit(), [])
+        self.assertEqual(len(self.net.packets("setPilot", MACS[0])), 2)
+        self.assertFalse(self.fixture.state()["setting"]["on"])
+
+    def test_a_drag_below_one_percent_streams_the_same_way(self):
+        saved = cli.read_json(cli.path("fixture.json"), {})
+        saved["raw_calibration"] = [{"kelvin": 2700, "percent": 1, "c": 0, "w": 42, "dimming": 10}]
+        cli.write_json(cli.path("fixture.json"), saved)
+        self.set(kelvin=2700, brightness=0.5)
+        self.link.poll()
+        self.net.sent = []
+        self.burst([{"ColorTemperature": 370}, {"Brightness": 3}, {"Brightness": 2}])
+        self.assertEqual(self.shown(), (7, [2]))
+        self.assertEqual(self.net.bulb(MACS[0])["temp"], 2700)
+
+    def test_the_poll_keeps_out_of_a_drag(self):
+        self.link.apply_home({"Brightness": 30})
+        self.net.sent = []
+        self.assertFalse(self.link.poll())
+        self.assertEqual(self.net.sent, [])  # not even a question to the bulbs
+
+    def test_a_bulb_that_misses_the_stream_is_caught_by_the_confirmed_send(self):
+        self.net.drop[self.net.address(MACS[3])] = 3
+        self.burst([{"Brightness": level} for level in (20, 30, 40)])
+        self.assertEqual(self.shown(), (7, [40]))
+        self.assertEqual(self.fixture.state()["pending"], [])
+
+    def test_streaming_can_be_switched_off(self):
+        saved = cli.read_json(cli.path("fixture.json"), {})
+        saved["stream_rate"] = 0
+        cli.write_json(cli.path("fixture.json"), saved)
+        self.fixture.settings = cli.settings()
+        self.net.sent = []
+        self.burst([{"Brightness": 30}])
+        self.assertEqual(len(self.net.packets("setPilot", MACS[0])), 1)
+        self.assertEqual(self.shown(), (7, [30]))
+
     def test_a_burst_sends_only_the_newest(self):
         sent = len(self.net.packets("setPilot"))
         for brightness in (20, 40, 60, 80):
@@ -1039,7 +1347,8 @@ class HomeKitTest(Case):
         self.assertEqual(killed, [homekit.signal.SIGTERM])
 
     def test_home_wins_over_a_poll_that_started_first(self):
-        self.link.apply_home({"Brightness": 90})
+        self.link.unsent = True  # as it is from Home's write until the send is done
+        self.link.wanted = dict(self.link.wanted, brightness=90.0)
         self.assertFalse(self.link.poll())
         self.assertEqual(self.link.snapshot()["brightness"], 90)
 

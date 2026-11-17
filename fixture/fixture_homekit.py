@@ -24,6 +24,7 @@ import signal
 import string
 import sys
 import threading
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -32,6 +33,11 @@ import fixture_cli as cli  # noqa: E402
 VERSION = "1.0.0"
 POLL_SECONDS = 5
 SEARCH_SECONDS = 30
+# A burst of writes from Home (a slider being dragged) is over when nothing
+# new has come for this long.
+BURST_QUIET_SECONDS = 0.35
+pause = time.sleep      # the sender waits with this, and
+clock = time.monotonic  # measures with this; the tests replace both
 # The HomeKit specification rejects these setup codes as too guessable.
 WEAK_CODES = {str(d) * 8 for d in range(10)} | {"12345678", "87654321"}
 
@@ -154,8 +160,12 @@ def load_or_create_pairing():
 class Link:
     """Holds the wanted setting and sends it to the bulbs from one worker thread.
 
-    Home sends a burst of writes while a slider moves. The worker always sends
-    the newest wanted setting, so a burst collapses instead of queueing up.
+    Home sends a burst of writes while a slider moves. During the burst the
+    worker streams: it sends the newest wanted setting to every bulb at a
+    steady rate and does not wait for the bulbs to answer, so the light keeps
+    up with the finger. When the burst goes quiet it sends the last setting
+    once more the careful way, waiting for every bulb and trying again for
+    any that missed it, and only then writes the record.
     """
 
     def __init__(self, fixture):
@@ -195,9 +205,33 @@ class Link:
     def run(self):
         while True:
             self.wake.wait()
-            self.wake.clear()
             if self.stopping:
                 return
+            self.send_burst()
+
+    def send_burst(self):
+        """Streams what Home writes until it goes quiet, then sends the last setting for certain."""
+        rate = self.fixture.settings["stream_rate"]
+        self.wake.clear()
+        if rate <= 0:
+            return self.send_wanted()  # no streaming: every send waits for the bulbs
+        # The lock is held for the whole burst, so the command and the sun
+        # follower wait their turn and nothing else sends in between.
+        with self.fixture.locked():
+            sock = cli.open_socket()
+            try:
+                last, changed = None, clock()
+                while not self.stopping:
+                    self.wake.clear()
+                    target = self.snapshot()
+                    if target != last:
+                        self.fixture.stream(target, sock)
+                        last, changed = target, clock()
+                    elif clock() - changed >= BURST_QUIET_SECONDS:
+                        break
+                    pause(1.0 / rate)
+            finally:
+                sock.close()
             self.send_wanted()
 
     def send_wanted(self):
@@ -222,6 +256,8 @@ class Link:
 
     def poll(self):
         """Asks the bulbs what they are doing. True if the setting changed elsewhere."""
+        if self.unsent:
+            return False  # Home is setting the fixture right now; do not add to the traffic
         try:
             state, pilots = self.fixture.reconcile()
         except cli.Failure as failure:
