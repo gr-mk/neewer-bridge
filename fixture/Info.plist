@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>local.fixture-homekit</string>
+	<key>CFBundleName</key>
+	<string>Fixture HomeKit</string>
+	<key>CFBundleDisplayName</key>
+	<string>Fixture HomeKit</string>
+	<key>CFBundleExecutable</key>
+	<string>fixture-homekit</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Fixture HomeKit controls the bulbs of your light fixture and announces them to Apple Home as one light on your home network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_hap._tcp</string>
+	</array>
+</dict>
+</plist>

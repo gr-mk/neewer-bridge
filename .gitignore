@@ -13,3 +13,8 @@ homekit-data/
 accessory.state
 pairing.json
 *pairing*.svg
+
+# The same for the fixture (~/Library/Application Support/LightFixture): its
+# settings hold the bulbs' MAC addresses.
+fixture.json
+addresses.json

@@ -1,0 +1,903 @@
+#!/usr/bin/env python3
+"""fixture: several WiZ bulbs in one light fitting, driven as one light.
+
+Every change is sent to all the bulbs at once, over the WiZ local protocol
+(JSON over UDP, port 38899). No cloud and no vendor app are involved.
+
+    fixture on | off
+    fixture white 2700 40       colour temperature in kelvin, brightness 1-100
+    fixture colour 240 100 40   hue 0-360, saturation 0-100, brightness 1-100
+    fixture brightness 3        keeps the colour
+    fixture status              asks every bulb what it is doing
+    fixture discover            lists the WiZ bulbs on the network
+    fixture follow              follow the sun: on, off, status, apply
+
+Brightness is for the whole fixture. The lowest levels switch bulbs off; see
+`levels` below.
+"""
+
+import argparse
+import colorsys
+import contextlib
+import errno
+import fcntl
+import json
+import os
+import socket
+import sys
+import threading
+import time
+
+VERSION = "1.0.0"
+PORT = 38899
+
+APP_DIR = os.environ.get("FIXTURE_DIR") or os.path.expanduser("~/Library/Application Support/LightFixture")
+SUNDIAL_STATE_FILE = os.path.expanduser("~/.local/state/sundial/state.json")
+SUNDIAL_STALE_SECONDS = 300
+
+# How hard to try. Each try sends to every bulb that has not answered yet,
+# then waits this long for answers. The bulbs save power between Wi-Fi beacons
+# and often take a second or two to answer, so the waits are long.
+WAITS = (0.5, 0.7, 1.0, 1.3)
+SEARCH_ROUNDS = 4
+SEARCH_WAIT = 0.5
+SWEEP_EVERY = 600  # seconds between searches that ask every address
+
+SETTINGS_DEFAULTS = {
+    "name": "Fixture",          # the name shown in Apple Home
+    "port": 51827,              # the Apple Home service's port
+    "bulbs": [],                # MAC addresses; the last ones are switched off first
+    "min_dimming": 10,          # the lowest dimming a bulb takes as white
+    "min_colour_dimming": 10,   # and as a colour
+    "kelvin_min": 2700,
+    "kelvin_max": 6500,
+}
+DEFAULT_SETTING = {"on": False, "mode": "white", "kelvin": 2700, "brightness": 50, "hue": 0, "saturation": 100}
+
+FOLLOW_DEFAULTS = {
+    "enabled": True,
+    "day_brightness": 100,   # brightness with the sun well up
+    "night_brightness": 5,   # brightness after dark; never below 1, so never off
+    "night_kelvin": 2700,    # colour after dark
+    "hold_minutes": 120,     # how long a setting made elsewhere is left alone
+}
+# The colour moves from sundial's colour to the night colour while the sun goes
+# from the horizon down to the end of civil twilight.
+NIGHT_COLOUR_FROM, NIGHT_COLOUR_BY = 0.0, -6.0
+
+LOCAL_NETWORK_HELP = (
+    "macOS would not send to the local network (no route to host). If the Mac is on the "
+    "network, allow this program under System Settings > Privacy & Security > Local Network")
+
+
+class Failure(Exception):
+    """Something the user should be told in one line."""
+
+
+def path(name):
+    return os.path.join(APP_DIR, name)
+
+
+def read_json(file, fallback):
+    try:
+        with open(file) as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        return fallback
+    return value if isinstance(value, type(fallback)) else fallback
+
+
+def write_json(file, value):
+    os.makedirs(os.path.dirname(file), exist_ok=True)
+    temporary = "%s.%d.tmp" % (file, os.getpid())
+    with open(temporary, "w") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, file)
+
+
+def clamp(low, value, high):
+    return max(low, min(high, value))
+
+
+def clean_mac(text):
+    mac = "".join(c for c in str(text).lower() if c in "0123456789abcdef")
+    if len(mac) != 12:
+        raise Failure("'%s' is not a MAC address" % text)
+    return mac
+
+
+def settings():
+    """fixture.json over the defaults; a value of the wrong kind is ignored."""
+    given = read_json(path("fixture.json"), {})
+    result = dict(SETTINGS_DEFAULTS)
+    for key, default in SETTINGS_DEFAULTS.items():
+        value = given.get(key, default)
+        if isinstance(value, type(default)) and not isinstance(value, bool):
+            result[key] = value
+    result["min_dimming"] = clamp(1, result["min_dimming"], 100)
+    result["min_colour_dimming"] = clamp(1, result["min_colour_dimming"], 100)
+    return result
+
+
+# ---------------------------------------------------------------- brightness
+
+def levels(brightness, count, floor):
+    """How to show a fixture brightness of 1-100: (bulbs lit, dimming of each).
+
+    A bulb cannot go below its own lowest dimming, `floor`. The fixture goes
+    lower by lighting fewer bulbs:
+
+      1 to count-1   that many bulbs, each at the floor
+      count          every bulb at the floor
+      up to 100      every bulb, rising evenly from the floor to 100
+
+    With seven bulbs and a floor of 1, the light given, in units of one bulb
+    at 1%, runs 1, 2, 3, 4, 5, 6, 7, 14, 21, ... 700. Each step down is a
+    smaller share of what is left than the step before it, until one bulb is
+    left, so the fixture never drops by more than half at once.
+    """
+    brightness = clamp(1, int(brightness), 100)
+    if count <= 1 or count >= 100:
+        return max(1, count), clamp(floor, brightness, 100)
+    if brightness < count:
+        return brightness, floor
+    dimming = floor + (brightness - count) * (100 - floor) / float(100 - count)
+    return count, int(round(dimming))
+
+
+def brightness_for(total, count, floor):
+    """The fixture brightness whose bulbs add up nearest to `total` dimming."""
+    best = 1
+    for brightness in range(1, 101):
+        lit, dimming = levels(brightness, count, floor)
+        lit_best, dimming_best = levels(best, count, floor)
+        if abs(lit * dimming - total) < abs(lit_best * dimming_best - total):
+            best = brightness
+    return best
+
+
+def hue_to_rgb(hue, saturation):
+    red, green, blue = colorsys.hsv_to_rgb((hue % 360) / 360.0, clamp(0, saturation, 100) / 100.0, 1.0)
+    return int(round(red * 255)), int(round(green * 255)), int(round(blue * 255))
+
+
+def rgb_to_hue(red, green, blue):
+    top = float(max(red, green, blue, 1))
+    hue, saturation, _ = colorsys.rgb_to_hsv(red / top, green / top, blue / top)
+    return int(round(hue * 360)) % 360, int(round(saturation * 100))
+
+
+def setting_look(setting):
+    """The part of a setting that says how the fixture looks. Power is left out."""
+    if setting["mode"] == "colour":
+        return ("colour", setting["hue"], setting["saturation"], setting["brightness"])
+    return ("white", setting["kelvin"], setting["brightness"])
+
+
+def pilot_look(pilot):
+    """The part of a bulb's answer that says how it looks."""
+    return {key: pilot[key] for key in ("sceneId", "temp", "r", "g", "b", "c", "w", "dimming") if pilot.get(key)}
+
+
+def message_for(bulb):
+    """The setPilot values that put a bulb in a recorded state."""
+    values = dict(bulb["look"])
+    if any(key in values for key in "rgb"):
+        for key in "rgb":
+            values.setdefault(key, 0)
+    values["state"] = bool(bulb["on"])
+    return values
+
+
+# ---------------------------------------------------------------- the network
+
+def open_socket():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    return sock
+
+
+def own_address():
+    """This Mac's address on the home network, or None. Nothing is sent."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))
+        return probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+
+
+def encode(method, values=None):
+    return json.dumps({"method": method, "params": values or {}}, separators=(",", ":")).encode()
+
+
+def decode(data):
+    try:
+        reply = json.loads(data)
+    except ValueError:
+        return {}
+    return reply if isinstance(reply, dict) else {}
+
+
+def exchange(method, values, absent=()):
+    """Sends `method` to several addresses at once: {address: values}.
+
+    Returns {address: result} for those that answered. All the packets of a
+    try leave together. A bulb that does not answer is sent the same thing
+    again. Addresses in `absent` are sent to but not waited for: they did not
+    answer last time, and waiting for them would hold up every change.
+    """
+    answers = {}
+    refused = 0
+    patient = [address for address in values if address not in absent] or list(values)
+    sock = open_socket()
+    try:
+        for wait in WAITS:
+            waiting = [address for address in values if address not in answers]
+            if all(address in answers for address in patient):
+                break
+            refused = 0
+            for address in waiting:
+                try:
+                    sock.sendto(encode(method, values[address]), (address, PORT))
+                except OSError as error:
+                    refused += error.errno == errno.EHOSTUNREACH
+            deadline = time.monotonic() + wait
+            while not all(address in answers for address in patient):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                sock.settimeout(left)
+                try:
+                    data, sender = sock.recvfrom(4096)
+                except OSError:
+                    break
+                reply = decode(data)
+                if (sender[0] in values and sender[0] not in answers and reply.get("method") == method
+                        and isinstance(reply.get("result"), dict)):
+                    answers[sender[0]] = reply["result"]
+    finally:
+        sock.close()
+    if values and not answers and refused == len(values):
+        raise Failure(LOCAL_NETWORK_HELP)
+    return answers
+
+
+def search(hints=(), wanted=None, sweep=True):
+    """Looks for WiZ bulbs on the network: {mac: (address, answer)}.
+
+    Each round asks by broadcast. A bulb often misses a broadcast, so there are
+    several rounds, and if bulbs are still missing every address of the local
+    network is asked directly, twice. With `wanted`, a set of MAC addresses, the
+    search stops as soon as all of them are found.
+    """
+    targets, sweeps = ["255.255.255.255"], []
+    for address in [own_address()] + list(hints):
+        if address:
+            subnet = address.rsplit(".", 1)[0]
+            if subnet + ".255" not in targets:
+                targets.append(subnet + ".255")
+                sweeps += ["%s.%d" % (subnet, host) for host in range(1, 255)]
+    found = {}
+    sock = open_socket()
+
+    def done():
+        return wanted is not None and all(mac in found for mac in wanted)
+
+    try:
+        for final in [False] * SEARCH_ROUNDS + [True, True]:
+            if final and not sweep:
+                break
+            for target in sweeps if final else targets:
+                try:
+                    sock.sendto(encode("getPilot"), (target, PORT))
+                except OSError:
+                    pass
+            # A bulb saving power can take most of a second to answer.
+            deadline = time.monotonic() + SEARCH_WAIT * (2 if final else 1)
+            while not done():
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                sock.settimeout(left)
+                try:
+                    data, sender = sock.recvfrom(4096)
+                except OSError:
+                    break
+                reply = decode(data)
+                result = reply.get("result")
+                if reply.get("method") == "getPilot" and isinstance(result, dict) and result.get("mac"):
+                    found[result["mac"]] = (sender[0], result)
+            if done():
+                break
+    finally:
+        sock.close()
+    return found
+
+
+# ---------------------------------------------------------------- the fixture
+
+class Fixture:
+    """The bulbs as one light.
+
+    state.json is the one record of what the fixture was last set to, shared
+    by this command, the sun follower and the Apple Home service:
+
+      setting   on, mode, kelvin, brightness, hue, saturation
+      bulbs     what each bulb should be showing, by MAC address
+      pending   bulbs that did not answer when that was sent
+      by        who chose the look: cli, home, follow or elsewhere
+      set_at    when
+
+    The bulbs can be asked what they are doing, so a change made elsewhere
+    (the WiZ app, a bulb's own tile in Apple Home) is noticed by `reconcile`.
+    """
+
+    def __init__(self):
+        self.settings = settings()
+        self.macs = [clean_mac(mac) for mac in self.settings["bulbs"]]
+        if not self.macs:
+            raise Failure("no bulbs are listed in %s; run: fixture discover --save" % path("fixture.json"))
+        self.addresses = read_json(path("addresses.json"), {})
+        self.search_every = 0   # seconds between searches for bulbs that stopped answering
+        self.searched = None
+        self.absent = set()     # bulbs that did not answer the last question
+        self.thread_lock = threading.RLock()
+        self.depth = 0
+        self.lock_handle = None
+
+    @contextlib.contextmanager
+    def locked(self):
+        """One program at a time talks to the bulbs and writes the record."""
+        with self.thread_lock:
+            if self.depth == 0:
+                os.makedirs(APP_DIR, exist_ok=True)
+                self.lock_handle = open(path("lock"), "w")
+                fcntl.flock(self.lock_handle, fcntl.LOCK_EX)
+            self.depth += 1
+            try:
+                yield
+            finally:
+                self.depth -= 1
+                if self.depth == 0:
+                    self.lock_handle.close()
+
+    # -- limits
+
+    def floor(self, mode):
+        return self.settings["min_colour_dimming" if mode == "colour" else "min_dimming"]
+
+    def kelvin(self, value):
+        value = int(round(float(value) / 100.0)) * 100
+        return clamp(self.settings["kelvin_min"], value, self.settings["kelvin_max"])
+
+    def levels(self, setting):
+        return levels(setting["brightness"], len(self.macs), self.floor(setting["mode"]))
+
+    def describe(self, setting):
+        if setting["mode"] == "colour":
+            text = "colour hue %d sat %d at %d%%" % (setting["hue"], setting["saturation"], setting["brightness"])
+        else:
+            text = "white %dK at %d%%" % (setting["kelvin"], setting["brightness"])
+        return text if setting["on"] else "off (%s)" % text
+
+    def describe_bulbs(self, setting):
+        lit, dimming = self.levels(setting)
+        return "%d of %d bulbs at %d%%" % (lit, len(self.macs), dimming)
+
+    # -- the record
+
+    def state(self):
+        raw = read_json(path("state.json"), {})
+        given = raw.get("setting") if isinstance(raw.get("setting"), dict) else {}
+        setting = dict(DEFAULT_SETTING)
+        for key, default in DEFAULT_SETTING.items():
+            if isinstance(given.get(key), type(default)):
+                setting[key] = given[key]
+        bulbs = raw.get("bulbs") if isinstance(raw.get("bulbs"), dict) else {}
+        return {
+            "setting": setting,
+            "bulbs": {mac: bulbs[mac] for mac in self.macs if isinstance(bulbs.get(mac), dict)},
+            "pending": [mac for mac in raw.get("pending", []) if mac in self.macs],
+            "by": raw.get("by") or "elsewhere",
+            "set_at": float(raw.get("set_at") or 0),
+        }
+
+    def plan(self, setting):
+        """What each bulb should show for a setting: {mac: {"on", "look"}}.
+
+        Bulbs that are switched off are still given the look, so they show
+        the right thing if the wall switch brings them back on.
+        """
+        lit, dimming = self.levels(setting)
+        if setting["mode"] == "colour":
+            red, green, blue = hue_to_rgb(setting["hue"], setting["saturation"])
+            look = pilot_look({"r": red, "g": green, "b": blue, "dimming": dimming})
+        else:
+            look = {"temp": setting["kelvin"], "dimming": dimming}
+        return {mac: {"on": bool(setting["on"]) and index < lit, "look": dict(look)}
+                for index, mac in enumerate(self.macs)}
+
+    # -- talking to the bulbs
+
+    def read_all(self):
+        """Asks every bulb what it is doing: {mac: answer, or None if it did not answer}.
+
+        Bulbs are known by MAC address. Their network addresses are remembered,
+        and looked for again when a bulb stops answering, since the router may
+        move them.
+        """
+        asked = {self.addresses[mac]: mac for mac in self.macs if mac in self.addresses}
+        answers = exchange("getPilot", {address: {} for address in asked}) if asked else {}
+        pilots = {}
+        for address, mac in asked.items():
+            if answers.get(address, {}).get("mac") == mac:
+                pilots[mac] = answers[address]
+            elif address in answers:
+                del self.addresses[mac]  # another bulb has this address now
+        missing = [mac for mac in self.macs if mac not in pilots]
+        now = time.monotonic()
+        if missing and (self.searched is None or now - self.searched >= self.search_every):
+            self.searched = now
+            found = search(self.addresses.values(), set(missing), self.may_sweep())
+            moved = False
+            for mac in missing:
+                if mac in found:
+                    moved = moved or self.addresses.get(mac) != found[mac][0]
+                    self.addresses[mac], pilots[mac] = found[mac]
+            if moved:
+                write_json(path("addresses.json"), self.addresses)
+        self.absent = {mac for mac in self.macs if mac not in pilots}
+        return {mac: pilots.get(mac) for mac in self.macs}
+
+    @staticmethod
+    def may_sweep():
+        """True at most once in a while, whichever program asks."""
+        try:
+            if abs(time.time() - os.stat(path("swept")).st_mtime) < SWEEP_EVERY:
+                return False
+        except OSError:
+            pass
+        os.makedirs(APP_DIR, exist_ok=True)
+        with open(path("swept"), "w"):
+            pass
+        return True
+
+    def send(self, bulbs):
+        """Sends each bulb its state: {mac: {"on", "look"}}. Returns the MACs that acknowledged."""
+        values = {self.addresses[mac]: message_for(bulb) for mac, bulb in bulbs.items() if mac in self.addresses}
+        absent = [self.addresses[mac] for mac in self.absent if mac in self.addresses]
+        answers = exchange("setPilot", values, absent) if values else {}
+        return {mac for mac in bulbs if answers.get(self.addresses.get(mac), {}).get("success") is True}
+
+    def apply(self, setting, by):
+        """Sets the whole fixture. Returns the MACs of bulbs that did not take it."""
+        with self.locked():
+            if any(mac not in self.addresses for mac in self.macs):
+                self.read_all()  # finds the bulbs
+            state = self.state()
+            bulbs = self.plan(setting)
+            taken = self.send(bulbs)
+            if not taken:
+                raise Failure("no bulb answers; is the fixture switched on at the wall?")
+            if setting_look(setting) != setting_look(state["setting"]) or not state["bulbs"]:
+                state["by"], state["set_at"] = by, time.time()
+            state.update(setting=dict(setting), bulbs=bulbs, pending=[mac for mac in self.macs if mac not in taken])
+            write_json(path("state.json"), state)
+            return state["pending"]
+
+    def claim(self, by):
+        """Marks the present look as chosen by `by`, without sending anything."""
+        with self.locked():
+            state = self.state()
+            state["by"], state["set_at"] = by, time.time()
+            write_json(path("state.json"), state)
+
+    def reconcile(self, dry=False):
+        """Compares the bulbs with the record and settles any difference.
+
+        Returns (state, answers). Unless `dry`, the record is brought up to
+        date, and bulbs that missed the last setting are sent it.
+        """
+        # The bulbs are slow to answer, so they are asked before taking the
+        # lock. If the record changed meanwhile, the answers may be from before
+        # that change, and are left for the next look.
+        record = self.state()
+        pilots = self.read_all()
+        seen = {mac: pilot for mac, pilot in pilots.items() if pilot}
+        if not seen:
+            raise Failure("no bulb answers; is the fixture switched on at the wall?")
+        with self.locked():
+            before = self.state()
+            if before != record and self.depth == 1:
+                return before, pilots
+            state = self.settle(json.loads(json.dumps(before)), seen, dry)
+            if state != before and not dry:
+                write_json(path("state.json"), state)
+            return state, pilots
+
+    def settle(self, state, seen, dry):
+        setting, bulbs = state["setting"], state["bulbs"]
+        actual = {mac: {"on": bool(pilot.get("state")), "look": pilot_look(pilot)} for mac, pilot in seen.items()}
+
+        def matches(mac):
+            # A bulb that is off has no look to compare.
+            want, have = bulbs.get(mac), actual[mac]
+            return want is not None and want["on"] == have["on"] and (not have["on"] or want["look"] == have["look"])
+
+        differing = [mac for mac in actual if not matches(mac)]
+        waiting = [mac for mac in state["pending"] if mac not in actual]
+        late = [mac for mac in differing if mac in state["pending"]]
+        if not differing:
+            state["pending"] = waiting
+            return state
+        if len(late) == len(differing):
+            # These bulbs were out of reach when the setting was sent. Send it now.
+            taken = set() if dry else self.send({mac: bulbs[mac] for mac in late})
+            state["pending"] = waiting + [mac for mac in late if mac not in taken]
+            return state
+
+        state["pending"] = waiting
+        lit = [mac for mac in actual if actual[mac]["on"]]
+        if not lit:
+            # The whole fixture was switched off elsewhere. Not a new setting.
+            setting["on"] = False
+            for mac in actual:
+                bulbs[mac] = {"on": False, "look": bulbs.get(mac, actual[mac])["look"]}
+            return state
+        planned = self.plan(dict(setting, on=True))
+        if all(actual[mac]["look"] == planned[mac]["look"] for mac in lit):
+            # Only the power differs, so this is the same setting switched on.
+            if set(lit) == {mac for mac in actual if planned[mac]["on"]}:
+                setting["on"] = True
+                state["bulbs"] = planned
+                return state
+            if len(lit) == len(actual):
+                # Every bulb is lit: the power came back at the wall. Switch
+                # off again the bulbs that a low brightness keeps off.
+                taken = set(actual) if dry else self.send({mac: planned[mac] for mac in actual})
+                setting["on"] = True
+                state["bulbs"] = planned
+                state["pending"] = waiting + [mac for mac in actual if mac not in taken]
+                return state
+        # Set elsewhere: take the bulbs as they are.
+        state["setting"] = self.infer(actual, setting)
+        bulbs.update(actual)
+        state["by"], state["set_at"] = "elsewhere", time.time()
+        return state
+
+    def infer(self, actual, old):
+        """The fixture setting that best describes bulbs set one by one."""
+        setting = dict(old, on=True)
+        looks = [bulb["look"] for bulb in actual.values() if bulb["on"]]
+        temperatures = [look["temp"] for look in looks if "temp" in look]
+        coloured = [look for look in looks if any(key in look for key in "rgb")]
+        if temperatures and len(temperatures) * 2 >= len(looks):
+            setting["mode"] = "white"
+            setting["kelvin"] = int(max(set(temperatures), key=temperatures.count))
+        elif coloured:
+            setting["mode"] = "colour"
+            setting["hue"], setting["saturation"] = rgb_to_hue(
+                coloured[0].get("r", 0), coloured[0].get("g", 0), coloured[0].get("b", 0))
+        total = sum(look.get("dimming", 100) for look in looks) * len(self.macs) / float(len(actual))
+        setting["brightness"] = brightness_for(total, len(self.macs), self.floor(setting["mode"]))
+        return setting
+
+
+# ---------------------------------------------------------------- follow the sun
+
+# `fixture follow apply` runs once a minute and sets the fixture from the sun.
+# It does not work the sun out itself. sundial, the program that does the same
+# job for the monitors, writes the sun's height and its own target to a file
+# every minute, and this reads that file.
+
+def follow_settings():
+    """follow.json over the defaults; a value of the wrong kind is ignored."""
+    given = read_json(path("follow.json"), {})
+    result = dict(FOLLOW_DEFAULTS)
+    for key, default in FOLLOW_DEFAULTS.items():
+        value = given.get(key, default)
+        if isinstance(default, bool):
+            good = isinstance(value, bool)
+        else:
+            good = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if good:
+            result[key] = value
+    result["night_brightness"] = int(clamp(1, result["night_brightness"], 100))
+    result["day_brightness"] = int(clamp(result["night_brightness"], result["day_brightness"], 100))
+    result["hold_minutes"] = max(0, result["hold_minutes"])
+    return result
+
+
+def follow_target(sun, follow, fixture):
+    """(kelvin, brightness) for the fixture, from sundial's target.
+
+    Brightness runs from the night level to the day level with sundial's
+    "daylight" share. Colour is sundial's, moving to the night colour as the
+    sun goes below the horizon, and kept inside what the bulbs can show.
+    """
+    daylight = clamp(0.0, float(sun["daylight"]), 1.0)
+    low, high = follow["night_brightness"], follow["day_brightness"]
+    brightness = int(round(low + (high - low) * daylight))
+    night = (NIGHT_COLOUR_FROM - float(sun["sun_elevation"])) / (NIGHT_COLOUR_FROM - NIGHT_COLOUR_BY)
+    night = clamp(0.0, night, 1.0)
+    colour = float(sun["kelvin"]) + (follow["night_kelvin"] - float(sun["kelvin"])) * night
+    return fixture.kelvin(colour), clamp(1, brightness, 100)
+
+
+def sundial_target(now):
+    """What sundial last worked out, or a Failure if it is missing or old."""
+    try:
+        age = now - os.stat(SUNDIAL_STATE_FILE).st_mtime
+    except OSError:
+        raise Failure("sundial has written no state file (%s)" % SUNDIAL_STATE_FILE)
+    if age > SUNDIAL_STALE_SECONDS:
+        raise Failure("sundial last ran %d minutes ago" % (age // 60))
+    sun = read_json(SUNDIAL_STATE_FILE, {}).get("target")
+    try:
+        float(sun["daylight"]), float(sun["sun_elevation"]), float(sun["kelvin"])
+    except (KeyError, TypeError, ValueError):
+        raise Failure("sundial's state file has no usable target")
+    return sun
+
+
+def follow_step(fixture, now, send=True):
+    """Decides what to do this minute and, if `send`, does it.
+
+    Returns (situation, sentence, sent).
+    """
+    follow = follow_settings()
+    if not follow["enabled"]:
+        return "off", "following is switched off", False
+    with fixture.locked():
+        state, _ = fixture.reconcile(dry=not send)
+        setting = state["setting"]
+        if not setting["on"]:
+            return "light off", "the fixture is off; leaving it alone", False
+        # Whose setting is this? Anyone's but the follower's is left alone for a while.
+        mine = state["by"] == "follow"
+        until = state["set_at"] + follow["hold_minutes"] * 60
+        if not mine and now < until:
+            at = time.strftime("%H:%M", time.localtime(until))
+            return "hold " + at, "the fixture was set elsewhere (%s); following again at %s" % (
+                fixture.describe(setting), at), False
+
+        sun = sundial_target(now)
+        kelvin, brightness = follow_target(sun, follow, fixture)
+        wanted = dict(setting, mode="white", kelvin=kelvin, brightness=brightness)
+        text = "white %dK at %d%% (%s)" % (kelvin, brightness, fixture.describe_bulbs(wanted))
+        if setting_look(setting) == setting_look(wanted) and state["bulbs"] == fixture.plan(wanted):
+            if send and not mine:
+                fixture.claim("follow")
+            return "following", "following the sun; the fixture is already at %s" % text, False
+        if not send:
+            return "following", "following the sun; about to set %s" % text, False
+        missed = fixture.apply(wanted, "follow")
+        fixture.claim("follow")
+        if missed:
+            text += "; not answering: %s" % ", ".join(missed)
+        return "following", "sun %+.1f  %s" % (float(sun["sun_elevation"]), text), True
+
+
+def follow_apply(fixture, now=None):
+    """One run of the follower. Returns the line to log, or None.
+
+    A line is logged when the fixture is set and when the situation changes,
+    so an outage or a hold is one line, not one a minute.
+    """
+    now = time.time() if now is None else now
+    memory = read_json(path("follow-state.json"), {})
+    try:
+        situation, sentence, sent = follow_step(fixture, now)
+    except Failure as failure:
+        situation, sentence, sent = "stuck", "cannot follow the sun: %s" % failure, False
+    changed = situation != memory.get("situation")
+    if changed:
+        write_json(path("follow-state.json"), {"situation": situation})
+    return sentence if sent or changed else None
+
+
+# ---------------------------------------------------------------- commands
+
+def whole(low, high, what):
+    def parse(text):
+        try:
+            value = int(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError("%s must be a whole number" % what)
+        if not low <= value <= high:
+            raise argparse.ArgumentTypeError("%s must be %d-%d" % (what, low, high))
+        return value
+    return parse
+
+
+def set_fixture(fixture, **changes):
+    with fixture.locked():
+        state, _ = fixture.reconcile()
+        setting = dict(state["setting"], **changes)
+        missed = fixture.apply(setting, "cli")
+    print("%s: %s" % (fixture.describe(setting), fixture.describe_bulbs(setting) if setting["on"] else "all bulbs off"))
+    if missed:
+        print("fixture: not answering: %s" % ", ".join(missed), file=sys.stderr)
+
+
+def cmd_on(fixture, args):
+    set_fixture(fixture, on=True)
+
+
+def cmd_off(fixture, args):
+    set_fixture(fixture, on=False)
+
+
+def cmd_white(fixture, args):
+    low, high = fixture.settings["kelvin_min"], fixture.settings["kelvin_max"]
+    if not low <= args.kelvin <= high:
+        raise Failure("these bulbs show %d-%dK" % (low, high))
+    set_fixture(fixture, on=True, mode="white", kelvin=fixture.kelvin(args.kelvin), brightness=args.brightness)
+
+
+def cmd_colour(fixture, args):
+    set_fixture(fixture, on=True, mode="colour", hue=args.hue % 360, saturation=args.saturation,
+                brightness=args.brightness)
+
+
+def cmd_brightness(fixture, args):
+    set_fixture(fixture, on=True, brightness=args.brightness)
+
+
+def cmd_status(fixture, args):
+    state, pilots = fixture.reconcile()
+    setting = state["setting"]
+    print("Fixture: %s" % fixture.describe(setting))
+    if setting["on"]:
+        print("Bulbs:   %s" % fixture.describe_bulbs(setting))
+    print("Set by:  %s, %s" % (state["by"], time.strftime("%F %T", time.localtime(state["set_at"]))))
+    for mac in fixture.macs:
+        pilot = pilots[mac]
+        if pilot is None:
+            print("  %s  not answering" % mac)
+            continue
+        look = " ".join("%s %s" % item for item in sorted(pilot_look(pilot).items()))
+        print("  %s  %-15s %-3s  %s%s" % (mac, fixture.addresses.get(mac, "?"), "on" if pilot.get("state") else "off",
+                                          look, "  (waiting for the last setting)" if mac in state["pending"] else ""))
+    if args.json:
+        print(json.dumps({"state": state, "bulbs": pilots}, indent=2, sort_keys=True))
+
+
+def cmd_discover(fixture, args):
+    """Lists the WiZ bulbs on the network, with the limits each one reports."""
+    found = search()
+    if not found:
+        raise Failure("no WiZ bulb answered")
+    addresses = {address: mac for mac, (address, _) in found.items()}
+    wanted = {address: {} for address in addresses}
+    system = exchange("getSystemConfig", wanted)
+    model = exchange("getModelConfig", wanted)
+    user = exchange("getUserConfig", wanted)
+    kelvins, floors = [], []
+    for address in sorted(addresses, key=lambda a: tuple(int(part) for part in a.split("."))):
+        cct = model.get(address, {}).get("cctRange") or []
+        floor = max(1, model.get(address, {}).get("minDimLevel") or 0, user.get(address, {}).get("minDimming") or 0)
+        if len(cct) >= 2:
+            kelvins.append((cct[0], cct[-1]))
+        if address in model:
+            floors.append(floor)
+        print("%s  %-15s %s fw %s  %s  lowest dimming %s" % (
+            addresses[address], address, system.get(address, {}).get("moduleName", "?"),
+            system.get(address, {}).get("fwVersion", "?"),
+            "%d-%dK" % (cct[0], cct[-1]) if len(cct) >= 2 else "white range unknown",
+            floor if address in model else "unknown"))
+    if not args.save:
+        return
+    saved = read_json(path("fixture.json"), {})
+    known = [clean_mac(mac) for mac in saved.get("bulbs", [])]
+    ordered = sorted(found, key=lambda mac: tuple(int(part) for part in found[mac][0].split(".")))
+    saved["bulbs"] = known + [mac for mac in ordered if mac not in known]
+    if kelvins:
+        saved["kelvin_min"] = max(low for low, _ in kelvins)
+        saved["kelvin_max"] = min(high for _, high in kelvins)
+    if floors:
+        saved["min_dimming"] = max(floors)
+    for key in ("name", "port", "min_colour_dimming"):
+        saved.setdefault(key, SETTINGS_DEFAULTS[key])
+    write_json(path("fixture.json"), saved)
+    write_json(path("addresses.json"), {mac: address for mac, (address, _) in found.items()})
+    print("saved %d bulbs to %s" % (len(saved["bulbs"]), path("fixture.json")))
+
+
+def cmd_follow(fixture, args):
+    if args.action == "apply":
+        # The minute timer runs this, so it must never fail loudly.
+        try:
+            line = follow_apply(fixture)
+        except Exception as error:  # noqa: BLE001
+            line = "unexpected error: %r" % (error,)
+        if line:
+            print("%s  %s" % (time.strftime("%F %T"), line), flush=True)
+        return
+    if args.action in ("on", "off"):
+        saved = dict(FOLLOW_DEFAULTS)
+        saved.update(read_json(path("follow.json"), {}))
+        saved["enabled"] = args.action == "on"
+        write_json(path("follow.json"), saved)
+        if args.action == "off":
+            print("following is off; the fixture stays as it is")
+            return
+        # Switching on also ends any hold: take the fixture over now.
+        fixture.claim("follow")
+        line = follow_apply(fixture)
+        print("following is on" + (": " + line if line else ""))
+        return
+    follow = follow_settings()
+    print("Following: %s (day %d%%, night %d%% at %dK, hold %g min)" % (
+        "on" if follow["enabled"] else "off", follow["day_brightness"],
+        follow["night_brightness"], fixture.kelvin(follow["night_kelvin"]), follow["hold_minutes"]))
+    now = time.time()
+    try:
+        sun = sundial_target(now)
+        print("Sun:       %+.1f degrees, daylight %d%%" % (
+            float(sun["sun_elevation"]), round(float(sun["daylight"]) * 100)))
+        print("Target:    white %dK at %d%%" % follow_target(sun, follow, fixture))
+    except Failure as failure:
+        print("Sun:       unknown (%s)" % failure)
+    try:
+        print("Fixture:   %s" % fixture.describe(fixture.reconcile(dry=True)[0]["setting"]))
+        sentence = follow_step(fixture, now, send=False)[1]
+    except Failure as failure:
+        sentence = "cannot follow the sun: %s" % failure
+    print("Now:       %s" % sentence)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="fixture", description="Drive several WiZ bulbs as one light.")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    def add(name, handler, text):
+        command = commands.add_parser(name, help=text)
+        command.set_defaults(handler=handler)
+        return command
+
+    percent = whole(1, 100, "brightness")
+    add("on", cmd_on, "switch the fixture on as it was")
+    add("off", cmd_off, "switch every bulb off")
+    white = add("white", cmd_white, "white light: fixture white 2700 40")
+    white.add_argument("kelvin", type=whole(1000, 10000, "kelvin"))
+    white.add_argument("brightness", type=percent)
+    for name in ("colour", "color"):
+        colour = add(name, cmd_colour, "a colour: fixture colour 240 100 40")
+        colour.add_argument("hue", type=whole(0, 360, "hue"))
+        colour.add_argument("saturation", type=whole(0, 100, "saturation"))
+        colour.add_argument("brightness", type=percent)
+    brightness = add("brightness", cmd_brightness, "change the brightness, keep the colour")
+    brightness.add_argument("brightness", type=percent)
+    status = add("status", cmd_status, "ask every bulb what it is doing")
+    status.add_argument("--json", action="store_true", help="also print everything as JSON")
+    discover = add("discover", cmd_discover, "list the WiZ bulbs on the network")
+    discover.add_argument("--save", action="store_true", help="make the bulbs found the fixture")
+    follow = add("follow", cmd_follow, "follow the sun through the day: fixture follow on")
+    follow.add_argument("action", nargs="?", choices=["on", "off", "status", "apply"], default="status")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        fixture = None if args.handler is cmd_discover else Fixture()
+        args.handler(fixture, args)
+    except Failure as failure:
+        if getattr(args, "action", None) == "apply":
+            # The minute timer: say it once, in the log's form.
+            print("%s  %s" % (time.strftime("%F %T"), failure), flush=True)
+            return 0
+        print("fixture: %s" % failure, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -8,6 +8,8 @@ It has three parts:
 - **The `neewer` command** (`cli/neewer`) builds the light's command frames and hands them to the bridge. The whole command format lives in this one file.
 - **The Apple Home service** (`homekit/`) is optional. It presents the light to Apple Home as one colour bulb and sends its commands through the bridge.
 
+A second light lives in the same repository: `fixture/` drives the WiZ bulbs of a ceiling fixture as one light. It has [its own section](#the-ceiling-fixture-wiz-bulbs-as-one-light) below.
+
 The split is deliberate. Rebuilding the bridge changes its code signature, and macOS then asks for Bluetooth permission again. Changing the `neewer` script never does.
 
 ## Use
@@ -139,6 +141,114 @@ The ramp is set in `homekit.json`; leave out any value to use the command's defa
 
 Restart the service after changing it: `launchctl kickstart -k gui/$(id -u)/local.neewer-homekit`. A value the command would reject is reported in `neewer-homekit.log` when the service starts, and the defaults are used. The ramp's progress goes to the same log.
 
+## The ceiling fixture (WiZ bulbs as one light)
+
+`fixture/` is a second, separate light: several WiZ bulbs in one ceiling fitting, driven as one. It shares nothing with the Neewer light except the Python environment. `./install.sh fixture` installs all of it: the `fixture` command, an Apple Home accessory named "Fixture", and a sun follower.
+
+It talks to the bulbs directly on the home network (the WiZ local protocol, JSON over UDP port 38899). No cloud and no WiZ app are involved. The bulbs can stay paired to Apple Home one by one as well; the two do not interfere.
+
+```
+fixture on
+fixture off
+fixture white 2700 40       # colour temperature in kelvin, brightness 1-100
+fixture colour 240 100 40   # hue 0-360, saturation 0-100, brightness
+fixture brightness 3        # keeps the colour
+fixture status              # asks every bulb what it is doing
+fixture discover            # lists the WiZ bulbs on the network and their limits
+fixture follow              # show whether the fixture is following the sun
+```
+
+Every change goes to all the bulbs in one burst. A bulb that does not acknowledge is sent it again, up to four times in all over 3.5 seconds, and any bulb still silent is named. It is then sent what it missed as soon as it answers again.
+
+The bulbs save power between Wi-Fi beacons, so each one acts on a change anywhere from a tenth of a second to two seconds after it is sent. They do not all change at the same instant. That is the bulbs, not this program.
+
+### Which bulbs
+
+`fixture.json` in the settings folder lists the bulbs by MAC address. `fixture discover --save` writes it from every WiZ bulb it finds, with the limits the bulbs report; the installer does this the first time. Edit the list if some of the bulbs belong elsewhere.
+
+Bulbs are known by MAC address, never by network address. Their addresses are remembered in `addresses.json` and looked for again whenever a bulb stops answering, so the router may move them.
+
+```
+{
+  "name": "Fixture",
+  "port": 51827,
+  "bulbs": ["a1b2c3d4e5f6", "..."],
+  "min_dimming": 1,
+  "min_colour_dimming": 10,
+  "kelvin_min": 2200,
+  "kelvin_max": 6500
+}
+```
+
+These are the values for the ESP25_SHRGB_01 bulbs (firmware 1.33.39), checked on the bulbs themselves: white takes 2200-6500K and dimming 1-100, and a colour is never dimmer than 10 whatever is asked. Dimming 1 was accepted and read back; nobody has yet judged by eye how much dimmer it is than 10.
+
+### Brightness
+
+Brightness is 1-100 for the whole fixture. A bulb cannot go below its own lowest dimming, so the fixture goes lower by lighting fewer bulbs. With seven bulbs:
+
+| Fixture brightness | Bulbs lit | Each bulb's dimming |
+|---|---|---|
+| 1 to 6 | that many | the lowest (1 for white, 10 for a colour) |
+| 7 | all seven | the lowest |
+| 8 to 100 | all seven | rising evenly from the lowest to 100 |
+
+So for white the light given, counted in bulbs at 1%, runs 1, 2, 3, 4, 5, 6, 7, 14, 21, and on up to 700. Going down, each step takes away a smaller share until one bulb is left, and no step more than halves the light.
+
+Two things follow from this:
+
+- From 8 up, the fixture's number is a little above each bulb's own: fixture 50 is every bulb at 47, fixture 10 is every bulb at 4. They meet at 100.
+- The bulbs at the end of the list in `fixture.json` are the ones switched off first. Reorder the list to choose which stay lit.
+
+Bulbs that are kept off are still given the colour and dimming, so if the wall switch brings every bulb back on, they all look right. The fixture then switches the extra ones off again.
+
+### Changes made elsewhere
+
+The bulbs can be asked what they are doing, and they are: by `fixture status`, by the Apple Home service every 5 seconds, and by the sun follower every minute. `state.json` in the settings folder records what the fixture was last set to and by whom. When the bulbs differ from it, something else set them (the WiZ app, a bulb's own tile in Apple Home), and the record is changed to match the bulbs. Nothing is sent to undo it.
+
+Switching the whole fixture off and on is not a new setting, wherever it is done.
+
+### Apple Home
+
+The accessory is its own program with its own port (51827), pairing keys and setup code. It is not part of the Neewer accessory and does not touch it. It runs under its own launcher app (`FixtureHomeKit.app`) so macOS has one named program to attach the local-network permission to. The sun follower runs through the same app, so one permission covers both.
+
+**The first time, macOS asks whether Fixture HomeKit may find devices on your local network. Choose Allow.** Until then nothing can reach the bulbs or Apple Home, and both logs say so. The service restarts itself once it is allowed. If the question was missed, it is under System Settings > Privacy & Security > Local Network.
+
+To pair, open the Home app, choose Add Accessory, and scan the QR code or enter the setup code:
+
+```
+"$HOME/Library/Application Support/NeewerBridge/venv/bin/python" \
+  "$HOME/Library/Application Support/LightFixture/homekit/fixture_homekit.py" --pairing
+```
+
+Add `--qr code.svg` in place of `--pairing` to write the QR code to a file.
+
+- Home shows one light: on/off, brightness, colour and colour temperature (2200-6500K).
+- A change made any other way shows up in Home within about 5 seconds.
+- If no bulb answers (the wall switch is off), Home shows "No Response". One bulb answering is enough.
+- The pairing keys are in `homekit-data/` in the settings folder, readable only by you. Deleting that folder unpairs the fixture; remove it from the Home app first.
+- `name` and `port` are in `fixture.json`. Restart after changing them: `launchctl kickstart -k gui/$(id -u)/local.fixture-homekit`.
+
+### Following the sun
+
+The fixture follows the sun the same way the Neewer light does, from the same sundial file, and it is on from the start. Once a minute it sets brightness and colour temperature: full and cool white by day, dimming and warming through sunset, then low and warm all night.
+
+```
+fixture follow            # show what it is doing and why
+fixture follow off        # pause it; the fixture stays as it is
+fixture follow on         # start again, and take the fixture over now
+```
+
+The rules are the Neewer light's:
+
+- **It never switches the fixture on or off.** While the fixture is off it does nothing. (At low levels it does switch single bulbs off and on; that is how the fixture dims.)
+- **A setting made elsewhere wins.** After a change from Apple Home, the `fixture` command, the WiZ app or a single bulb's tile, it leaves the fixture alone for two hours, then follows again. `fixture follow on` ends the wait early.
+- **It only sends when the target changes**, and writes one line to the log each time.
+- If no bulb answers, or sundial has stopped, it tries again each minute and writes one line, not one a minute.
+
+`follow.json` in the fixture's settings folder has the same five settings as the Neewer light's: `enabled`, `day_brightness` (100), `night_brightness` (5), `night_kelvin` (2700) and `hold_minutes` (120). Colour is kept within the bulbs' 2200-6500K. With the brightness table above, a night level of 5 is five bulbs at their lowest.
+
+`python3 tests/test_fixture.py` checks all of this against seven pretend bulbs, without touching real ones.
+
 ## Things to know
 
 - **The light must be in Infinity mode.** If its display shows `CH` and a number in the top-left, it is in 2.4G mode and Bluetooth is off. Hold the button marked `2.4G` for two seconds to switch.
@@ -155,6 +265,11 @@ Restart the service after changing it: `launchctl kickstart -k gui/$(id -u)/loca
 | Command | `~/.local/bin/neewer` |
 | Settings, last state, Python environment, pairing keys | `~/Library/Application Support/NeewerBridge/` |
 | Logs | `~/Library/Logs/neewer-bridge.log`, `neewer-homekit.log`, `neewer-follow.log` |
+| Fixture launcher app | `~/Applications/FixtureHomeKit.app` |
+| Fixture agents | `~/Library/LaunchAgents/local.fixture-homekit.plist`, `local.fixture-follow.plist` |
+| Fixture command | `~/.local/bin/fixture` |
+| Fixture settings, last state, bulb addresses, pairing keys | `~/Library/Application Support/LightFixture/` |
+| Fixture logs | `~/Library/Logs/fixture-homekit.log`, `fixture-follow.log` |
 
 `bridge.json` in the settings folder takes `port`, `namePrefixes`, `name`, `peripheralID`, `probeSeconds` and `logWrites`. Restart the bridge after changing it:
 
@@ -169,6 +284,7 @@ launchctl kickstart -k gui/$(id -u)/local.neewer-bridge
 ./install.sh cli      # reinstall just the command
 ./install.sh homekit  # install or update the Apple Home service
 ./install.sh follow   # make the light follow the sun
+./install.sh fixture  # the WiZ ceiling fixture: command, Apple Home service, sun follower
 ./uninstall.sh        # add --purge to remove settings, pairing keys and logs too
 ```
 

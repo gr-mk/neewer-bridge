@@ -7,6 +7,8 @@
 #   ./install.sh cli       reinstall only the `neewer` command
 #   ./install.sh homekit   install or update the Apple Home service
 #   ./install.sh follow    make the light follow the sun, once a minute
+#   ./install.sh fixture   install the `fixture` command, its Apple Home
+#                          service and its sun follower (WiZ bulbs as one light)
 #
 # Rebuilding the bridge changes its code signature, and macOS then asks for
 # Bluetooth permission again. That is why the build is skipped when the bridge
@@ -182,13 +184,100 @@ EOF
 	exit 1
 }
 
+# The fixture: several WiZ bulbs driven as one light. It shares nothing with
+# the Neewer light but the Python environment.
+install_fixture() {
+	local support="$HOME/Library/Application Support/LightFixture"
+	local app="$HOME/Applications/FixtureHomeKit.app" venv="$SUPPORT/venv" uv
+	local label=local.fixture-follow log="$HOME/Library/Logs/fixture-follow.log"
+	local agent="$HOME/Library/LaunchAgents/local.fixture-follow.plist"
+	if [ ! -x "$venv/bin/python" ]; then
+		uv="$(command -v uv || true)"
+		[ -n "$uv" ] || uv=/opt/homebrew/bin/uv
+		if [ ! -x "$uv" ]; then
+			echo "uv is needed to create the Python environment (brew install uv)" >&2
+			exit 1
+		fi
+		"$uv" venv --python 3.13 "$venv"
+		"$uv" pip install --quiet --python "$venv/bin/python" "HAP-python[QRCode]==$HAP_VERSION"
+	fi
+	mkdir -p "$CLI_DIR" "$support/homekit" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+	install -m 755 "$HERE/fixture/fixture" "$CLI_DIR/fixture"
+	echo "installed $CLI_DIR/fixture"
+	install -m 644 "$HERE/fixture/fixture_homekit.py" "$support/homekit/fixture_homekit.py"
+	# The service and the follower run the command's own code, so all three agree.
+	install -m 644 "$HERE/fixture/fixture" "$support/homekit/fixture_cli.py"
+	if [ ! -f "$support/fixture.json" ]; then
+		echo "looking for WiZ bulbs; every one found becomes part of the fixture"
+		"$CLI_DIR/fixture" discover --save ||
+			echo "none found; switch the fixture on and run: fixture discover --save" >&2
+	fi
+	if [ ! -f "$support/follow.json" ]; then
+		printf '{\n  "enabled": true,\n  "day_brightness": 100,\n  "night_brightness": 5,\n  "night_kelvin": 2700,\n  "hold_minutes": 120\n}\n' >"$support/follow.json"
+		echo "wrote default $support/follow.json"
+	fi
+	if [ ! -f "$HOME/.local/state/sundial/state.json" ]; then
+		echo "note: sundial has written no state file yet; the fixture is left alone until it does" >&2
+	fi
+	build_app "$app" fixture-homekit local.fixture-homekit "$HERE/fixture" launcher.swift
+	load_agent local.fixture-homekit "$app/Contents/MacOS/fixture-homekit" "$HOME/Library/Logs/fixture-homekit.log"
+	# The follower is a timer. It runs through the launcher app too, so its
+	# packets to the bulbs fall under the same local-network permission.
+	cat >"$agent" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$label</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$app/Contents/MacOS/fixture-homekit</string>
+		<string>follow</string>
+		<string>apply</string>
+	</array>
+	<key>AssociatedBundleIdentifiers</key>
+	<string>local.fixture-homekit</string>
+	<key>StartInterval</key>
+	<integer>60</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>StandardOutPath</key>
+	<string>$log</string>
+	<key>StandardErrorPath</key>
+	<string>$log</string>
+</dict>
+</plist>
+EOF
+	launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
+	local attempt loaded=no
+	for attempt in 1 2 3 4 5; do
+		if launchctl bootstrap "$DOMAIN" "$agent" 2>/dev/null; then
+			loaded=yes
+			break
+		fi
+		sleep 1
+	done
+	if [ "$loaded" = no ]; then
+		echo "could not load the agent; try: launchctl bootstrap $DOMAIN \"$agent\"" >&2
+		exit 1
+	fi
+	echo "agent $label loaded; log at $log"
+	echo "If macOS asks whether Fixture HomeKit may find devices on your local network, choose Allow."
+	echo "Setup code: \"$venv/bin/python\" \"$support/homekit/fixture_homekit.py\" --pairing"
+	echo "Pause the sun follower with: fixture follow off"
+}
+
 case "${1:-}" in
 "") install_bridge ;;
 cli) install_cli ;;
 homekit) install_homekit ;;
 follow) install_follow ;;
+fixture) install_fixture ;;
 *)
-	echo "usage: $0 [cli|homekit|follow]" >&2
+	echo "usage: $0 [cli|homekit|follow|fixture]" >&2
 	exit 2
 	;;
 esac
