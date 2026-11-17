@@ -8,13 +8,15 @@ Every change is sent to all the bulbs at once, over the WiZ local protocol
     fixture white 2700 40       colour temperature in kelvin, brightness up to 100
     fixture colour 240 100 40   hue 0-360, saturation 0-100, brightness
     fixture brightness 12.5     keeps the colour; fractions are allowed
+    fixture sweep 1.2 0.8       move slowly from one brightness to another
+    fixture compare ...         set one bulb by hand, to match it against the rest by eye
     fixture status              asks every bulb what it is doing
     fixture discover            lists the WiZ bulbs on the network
     fixture follow              follow the sun: on, off, status, apply
 
 Brightness is the average dimming of the bulbs. A whole number is every bulb
-at that dimming. Fractions, and anything below the bulbs' lowest dimming,
-single some bulbs out; see `split` and `PATTERNS` below.
+at that dimming. Fractions single some bulbs out, and white below 1% drives
+the bulbs' white LEDs directly; see `split`, `PATTERNS` and `Fixture.raw`.
 """
 
 import argparse
@@ -56,7 +58,19 @@ SETTINGS_DEFAULTS = {
     "min_colour_dimming": 10,   # and as a colour
     "kelvin_min": 2700,
     "kelvin_max": 6500,
+    # How white is made. "hybrid": the bulbs' own white from 1% up, and their
+    # white LEDs driven directly ("raw") below 1%. "raw": driven directly at
+    # every brightness.
+    "white_mode": "hybrid",
+    # Raw settings matched by eye against the bulbs' own white, one per line:
+    #   {"kelvin": 2700, "percent": 1, "c": 0, "w": 42, "dimming": 10}
+    # means: cold LED 0 and warm LED 42 at dimming 10 looks the same as white
+    # 2700K at 1%. Empty means the bulbs are never driven directly.
+    "raw_calibration": [],
 }
+RAW_DIMMING = 10        # the dimming sent with raw LED levels; the bulbs take no less
+RAW_WARM_KELVIN = 2700  # the warm white LED alone
+RAW_COLD_KELVIN = 6500  # the cold white LED alone
 DEFAULT_SETTING = {"on": False, "mode": "white", "kelvin": 2700, "brightness": 50.0, "hue": 0, "saturation": 100}
 
 FOLLOW_DEFAULTS = {
@@ -122,6 +136,19 @@ def settings():
             result[key] = value
     result["min_dimming"] = clamp(1, result["min_dimming"], 100)
     result["min_colour_dimming"] = clamp(1, result["min_colour_dimming"], 100)
+    if result["white_mode"] not in ("hybrid", "raw"):
+        result["white_mode"] = "hybrid"
+    points = []
+    for point in result["raw_calibration"]:
+        try:
+            point = {"kelvin": int(point["kelvin"]), "percent": float(point["percent"]), "c": int(point.get("c", 0)),
+                     "w": int(point.get("w", 0)), "dimming": int(point.get("dimming", RAW_DIMMING))}
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue  # not a point
+        if (point["percent"] > 0 and 0 <= point["c"] <= 255 and 0 <= point["w"] <= 255 and point["c"] + point["w"] > 0
+                and RAW_DIMMING <= point["dimming"] <= 100):
+            points.append(point)
+    result["raw_calibration"] = points
     return result
 
 
@@ -164,8 +191,13 @@ def split(brightness, count, floor):
 
 
 def percent(brightness):
-    """12.5 as "12.5%", 3.0 as "3%"."""
-    return ("%.1f" % brightness).rstrip("0").rstrip(".") + "%"
+    """12.5 as "12.5%", 3.0 as "3%", 0.03 as "0.03%"."""
+    text = "%.1f" % brightness if brightness >= 1 else "%.3f" % brightness
+    return text.rstrip("0").rstrip(".") + "%"
+
+
+def tidy(brightness):
+    return clamp(0.001, round(float(brightness), 3), 100.0)
 
 
 def hue_to_rgb(hue, saturation):
@@ -190,6 +222,9 @@ def message_for(bulb):
     if any(key in values for key in "rgb"):
         for key in "rgb":
             values.setdefault(key, 0)
+    elif any(key in values for key in "cw"):
+        for key in "cw":
+            values.setdefault(key, 0)  # raw white: say both, so neither is left over
     values["state"] = bool(bulb["on"])
     return values
 
@@ -378,15 +413,123 @@ class Fixture:
         value = int(round(float(value) / 100.0)) * 100
         return clamp(self.settings["kelvin_min"], value, self.settings["kelvin_max"])
 
+    # -- white from the raw LED levels
+    #
+    # Ordinary white stops at dimming 1. The bulbs' cold and warm white LEDs
+    # can also be driven directly, at a dimming of 10 or more, and that goes far
+    # lower. What raw setting looks like what white is known only where someone
+    # compared the two by eye: the points in raw_calibration. Everything else
+    # is worked out from those points, and `covered` says when it is a guess.
+
+    def anchor(self):
+        """(raw level, kelvin) that matches white at 1%, or None if there is no such point."""
+        points = [point for point in self.settings["raw_calibration"]
+                  if point["percent"] == 1 and point["dimming"] == RAW_DIMMING]
+        if not points or self.floor("white") != 1:
+            return None
+        point = min(points, key=lambda point: abs(point["kelvin"] - RAW_WARM_KELVIN))
+        return point["c"] + point["w"], point["kelvin"]
+
+    def has_raw(self):
+        # Without a matched level, or on bulbs whose dimming stops above 1,
+        # white below the floor lights fewer bulbs instead, as a colour does.
+        return self.anchor() is not None
+
+    def cold_share(self, kelvin):
+        """The cold LED's share of the raw level for a colour temperature.
+
+        A measured point at this colour temperature decides it. Otherwise it
+        is a guess: even steps in mireds from 2700K (all warm) to 6500K (all
+        cold), and all warm below 2700K.
+        """
+        points = [point for point in self.settings["raw_calibration"] if point["kelvin"] == kelvin]
+        if points:
+            return points[0]["c"] / float(points[0]["c"] + points[0]["w"])
+        warm, cold = 1e6 / RAW_WARM_KELVIN, 1e6 / RAW_COLD_KELVIN
+        return clamp(0.0, (warm - 1e6 / kelvin) / (warm - cold), 1.0)
+
+    def calibrated(self, kelvin, brightness):
+        """(raw level, dimming, covered) for white at 1% or more, from raw_calibration.
+
+        The light a raw setting gives is taken as level x dimming. Between two
+        measured points of the nearest colour temperature, that and the dimming
+        move evenly. Outside them it is a guess, in proportion to the nearest
+        point; with only the 1% point that makes level 255 at dimming 100
+        about 61%, which is probably too low, so expect to measure more points.
+        `covered` is False for a guess.
+        """
+        table = self.settings["raw_calibration"]
+        nearest = min((point["kelvin"] for point in table), key=lambda value: abs(value - kelvin))
+        points = sorted((point["percent"], (point["c"] + point["w"]) * point["dimming"], point["dimming"])
+                        for point in table if point["kelvin"] == nearest)
+        low = max([point for point in points if point[0] <= brightness] or points[:1])
+        high = min([point for point in points if point[0] >= brightness] or points[-1:])
+        if low[0] < brightness < high[0]:
+            along = (brightness - low[0]) / (high[0] - low[0])
+            light, dimming = low[1] + (high[1] - low[1]) * along, low[2] + (high[2] - low[2]) * along
+        else:
+            near = low if brightness >= low[0] else high
+            light, dimming = near[1] * brightness / near[0], near[2]
+        # A level stops at 255; past that only more dimming gives more light.
+        dimming = int(clamp(RAW_DIMMING, max(round(dimming), -(-light // 255)), 100))
+        covered = nearest == kelvin and points[0][0] <= brightness <= points[-1][0]
+        return min(255.0, light / dimming), dimming, covered
+
+    def raw(self, setting):
+        """How to show a white setting with the raw LED levels, or None for ordinary white.
+
+        Returns units (the level wanted, in steps of one bulb: level x bulbs),
+        dimming, share (the cold LED's part) and covered (False for a guess).
+
+        Below 1% the level is the 1% point's level times the brightness, at
+        dimming 10. At 1% and above ordinary white is used, unless white_mode
+        is "raw", and then the level and dimming come from `calibrated`.
+        """
+        anchor = self.anchor()
+        if setting["mode"] != "white" or anchor is None:
+            return None
+        always, count = self.settings["white_mode"] == "raw", len(self.macs)
+        kelvin, brightness = setting["kelvin"], setting["brightness"]
+        if brightness < 1:
+            units, dimming = clamp(1, int(round(brightness * anchor[0] * count)), anchor[0] * count), RAW_DIMMING
+            if units == anchor[0] * count and not always:
+                return None  # the top step is 1% itself
+            covered = kelvin == anchor[1]
+        elif not always:
+            return None
+        else:
+            level, dimming, covered = self.calibrated(kelvin, brightness)
+            units = clamp(count, int(round(level * count)), 255 * count)
+        return {"units": units, "dimming": dimming, "share": self.cold_share(kelvin), "covered": covered}
+
+    @staticmethod
+    def raw_look(level, raw):
+        """One bulb's raw LED levels: the level shared between the cold and warm LEDs."""
+        cool = int(round(level * raw["share"]))
+        return pilot_look({"c": cool, "w": level - cool, "dimming": raw["dimming"]})
+
     def split(self, setting):
-        return split(setting["brightness"], len(self.macs), self.floor(setting["mode"]))
+        """(bulbs singled out, their level, the others' level); 0 is off.
+
+        The levels are raw LED levels when `raw` says so, dimming otherwise.
+        """
+        raw, count = self.raw(setting), len(self.macs)
+        if raw is None:
+            brightness = setting["brightness"]
+            if self.has_raw() and setting["mode"] == "white":
+                brightness = max(1, brightness)  # the top raw step is 1% itself
+            return split(brightness, count, self.floor(setting["mode"]))
+        if raw["units"] < count:
+            return raw["units"], 1, 0  # below every bulb at level 1: fewer bulbs
+        return raw["units"] % count, raw["units"] // count + 1, raw["units"] // count
 
     def look(self, setting):
         """The part of a setting that says how the fixture looks. Power is left out."""
         units = int(round(setting["brightness"] * len(self.macs)))
         if setting["mode"] == "colour":
             return ("colour", setting["hue"], setting["saturation"], units)
-        return ("white", setting["kelvin"], units)
+        raw = self.raw(setting)
+        return ("white", setting["kelvin"], units, raw and (raw["units"], raw["dimming"]))
 
     def layout(self):
         """(centre, ring) from fixture.json, read afresh so an edit takes effect.
@@ -420,18 +563,29 @@ class Fixture:
             text = "colour hue %d sat %d at %s" % (setting["hue"], setting["saturation"], percent(setting["brightness"]))
         else:
             text = "white %dK at %s" % (setting["kelvin"], percent(setting["brightness"]))
+        notes = []
+        raw = self.raw(setting)
+        if raw is not None:
+            level = max(1.0, raw["units"] / float(len(self.macs)))
+            notes.append("raw %s %s%s" % ("warm" if raw["share"] == 0 else "white",
+                                          ("%.1f" % level).rstrip("0").rstrip("."),
+                                          " at dimming %d" % raw["dimming"] if raw["dimming"] != RAW_DIMMING else ""))
         if self.lit(setting) < len(self.macs):
-            text += " (%d of %d bulbs lit)" % (self.lit(setting), len(self.macs))
+            notes.append("%d of %d bulbs lit" % (self.lit(setting), len(self.macs)))
+        if notes:
+            text += " (%s)" % ", ".join(notes)
         return text if setting["on"] else "off (%s)" % text
 
     def describe_bulbs(self, setting):
-        number, dimming, others = self.split(setting)
+        number, level, others = self.split(setting)
+        form = "raw %d" if self.raw(setting) is not None else "%d%%"
         if not others:
-            return "%d of %d bulbs at %d%%, the rest off" % (number, len(self.macs), dimming) \
-                if number < len(self.macs) else "all %d bulbs at %d%%" % (number, dimming)
+            return ("%d of %d bulbs at " + form + ", the rest off") % (number, len(self.macs), level) \
+                if number < len(self.macs) else ("all %d bulbs at " + form) % (number, level)
         if not number:
-            return "all %d bulbs at %d%%" % (len(self.macs), others)
-        return "%d bulbs at %d%%, %d at %d%%" % (number, dimming, len(self.macs) - number, others)
+            return ("all %d bulbs at " + form) % (len(self.macs), others)
+        return ("%d bulb%s at " + form + ", %d at " + form) % (
+            number, "" if number == 1 else "s", level, len(self.macs) - number, others)
 
     # -- the record
 
@@ -443,7 +597,7 @@ class Fixture:
             if type(given.get(key)) is type(default):
                 setting[key] = given[key]
         if isinstance(given.get("brightness"), (int, float)) and not isinstance(given.get("brightness"), bool):
-            setting["brightness"] = clamp(0.01, round(float(given["brightness"]), 2), 100.0)
+            setting["brightness"] = tidy(given["brightness"])
         bulbs = raw.get("bulbs") if isinstance(raw.get("bulbs"), dict) else {}
         return {
             "setting": setting,
@@ -459,8 +613,17 @@ class Fixture:
         Bulbs that are switched off are still given the look, so they show
         the right thing if the wall switch brings them back on.
         """
+        # fixture.json is read afresh, so a new calibration point or white_mode
+        # takes effect without starting anything again.
+        self.settings = settings()
         number, dimming, others = self.split(setting)
         singled = self.singled(number)
+        raw = self.raw(setting)
+        if raw is not None:
+            return {mac: {"on": bool(setting["on"]) and (mac in singled or others > 0),
+                          # A bulb kept off is at level 1, ready to be lit.
+                          "look": self.raw_look((dimming if mac in singled else others) or 1, raw)}
+                    for mac in self.macs}
         if setting["mode"] == "colour":
             red, green, blue = hue_to_rgb(setting["hue"], setting["saturation"])
             look = pilot_look({"r": red, "g": green, "b": blue})
@@ -536,7 +699,7 @@ class Fixture:
             taken = self.send(bulbs)
             if not taken:
                 raise Failure("no bulb answers; is the fixture switched on at the wall?")
-            setting = dict(setting, brightness=clamp(0.01, round(float(setting["brightness"]), 2), 100.0))
+            setting = dict(setting, brightness=tidy(setting["brightness"]))
             if self.look(setting) != self.look(state["setting"]) or not state["bulbs"]:
                 state["by"], state["set_at"] = by, time.time()
             state.update(setting=dict(setting), bulbs=bulbs, pending=[mac for mac in self.macs if mac not in taken])
@@ -637,8 +800,16 @@ class Fixture:
             setting["hue"], setting["saturation"] = rgb_to_hue(
                 coloured[0].get("r", 0), coloured[0].get("g", 0), coloured[0].get("b", 0))
         # Brightness is the average over every bulb seen; one that is off counts as 0.
-        average = sum(look.get("dimming", 100) for look in looks) / float(len(actual))
-        setting["brightness"] = clamp(0.01, round(average, 2), 100.0)
+        # A bulb on its raw white LEDs counts by the level that matches 1%.
+        top = float((self.anchor() or (0, 0))[0])
+
+        def share(look):
+            if top and "temp" not in look and not any(key in look for key in "rgb") and ("c" in look or "w" in look):
+                return (look.get("c", 0) + look.get("w", 0)) / top * look.get("dimming", 100) / RAW_DIMMING
+            return look.get("dimming", 100)
+        setting["brightness"] = tidy(sum(share(look) for look in looks) / float(len(actual)))
+        if setting["mode"] != "colour" and not temperatures:
+            setting["mode"] = "white"  # raw white, set elsewhere; the colour temperature is not known
         return setting
 
 
@@ -661,7 +832,7 @@ def follow_settings():
             good = isinstance(value, (int, float)) and not isinstance(value, bool)
         if good:
             result[key] = value
-    result["night_brightness"] = clamp(0.01, float(result["night_brightness"]), 100.0)
+    result["night_brightness"] = clamp(0.001, float(result["night_brightness"]), 100.0)
     result["day_brightness"] = clamp(result["night_brightness"], float(result["day_brightness"]), 100.0)
     result["hold_minutes"] = max(0, result["hold_minutes"])
     return result
@@ -677,11 +848,11 @@ def follow_target(sun, follow, fixture):
     """
     daylight = clamp(0.0, float(sun["daylight"]), 1.0)
     low, high = follow["night_brightness"], follow["day_brightness"]
-    brightness = round(low + (high - low) * daylight, 2)
+    brightness = round(low + (high - low) * daylight, 3)
     night = (NIGHT_COLOUR_FROM - float(sun["sun_elevation"])) / (NIGHT_COLOUR_FROM - NIGHT_COLOUR_BY)
     night = clamp(0.0, night, 1.0)
     colour = float(sun["kelvin"]) + (follow["night_kelvin"] - float(sun["kelvin"])) * night
-    return fixture.kelvin(colour), clamp(0.01, brightness, 100.0)
+    return fixture.kelvin(colour), clamp(0.001, brightness, 100.0)
 
 
 def sundial_target(now):
@@ -807,6 +978,87 @@ def cmd_brightness(fixture, args):
     set_fixture(fixture, on=True, brightness=args.brightness)
 
 
+def cmd_sweep(fixture, args):
+    """Moves the brightness evenly from one value to another, for judging by eye."""
+    state, _ = fixture.reconcile()
+    base = dict(state["setting"], on=True)
+    if args.kelvin:
+        base.update(mode="white", kelvin=fixture.kelvin(args.kelvin))
+    started, last = time.monotonic(), None
+    while True:
+        progress = min(1.0, (time.monotonic() - started) / args.seconds) if args.seconds > 0 else 1.0
+        setting = dict(base, brightness=tidy(args.start + (args.end - args.start) * progress))
+        bulbs = fixture.plan(setting)
+        if bulbs != last:
+            # Only when a bulb changes: most moments ask for nothing new.
+            missed = fixture.apply(setting, "cli")
+            print("%5.1fs  %s: %s%s" % (time.monotonic() - started, fixture.describe(setting),
+                                        fixture.describe_bulbs(setting),
+                                        "; not answering: " + ", ".join(missed) if missed else ""), flush=True)
+            last = bulbs
+        if progress >= 1.0:
+            return
+        time.sleep(0.2)
+
+
+def named_bulb(fixture, name):
+    """A bulb by its place: centre, a ring name from ring_names, "ring 3" or "3", or a MAC address."""
+    centre, ring = fixture.layout()
+    name = name.strip().lower()
+    names = [str(label).lower() for label in settings()["ring_names"]]
+    if name in ("centre", "center"):
+        return centre
+    if name in names and names.index(name) < len(ring):
+        return ring[names.index(name)]
+    place = name[4:].strip() if name.startswith("ring") else name
+    if place.isdigit() and int(place) < len(ring):
+        return ring[int(place)]
+    try:
+        if clean_mac(name) in fixture.macs:
+            return clean_mac(name)
+    except Failure:
+        pass
+    raise Failure("no bulb is called '%s'; try centre, %s, or ring 0-%d" % (
+        name, ", ".join(names) or "a MAC address", len(ring) - 1))
+
+
+def cmd_compare(fixture, args):
+    """Sets one bulb by hand, leaving the rest, to match raw levels against white by eye.
+
+    The fixture as it was is kept in compare.json. `--restore` puts every
+    bulb back to it, with whoever had set it, so no hold is left behind.
+    """
+    saved = read_json(path("compare.json"), {})
+    if args.restore:
+        if not saved:
+            raise Failure("nothing to restore")
+        with fixture.locked():
+            missed = fixture.apply(saved["setting"], saved["by"])
+            state = fixture.state()
+            state["by"], state["set_at"] = saved["by"], saved["set_at"]
+            write_json(path("state.json"), state)
+        os.remove(path("compare.json"))
+        print("restored: %s" % fixture.describe(saved["setting"]))
+        if missed:
+            print("fixture: not answering: %s" % ", ".join(missed), file=sys.stderr)
+        return
+    if not args.bulb:
+        raise Failure("say which bulb: fixture compare --bulb centre --raw-w 42")
+    mac = named_bulb(fixture, args.bulb)
+    if args.raw_c + args.raw_w == 0:
+        raise Failure("--raw-c and --raw-w cannot both be 0")
+    with fixture.locked():
+        state, _ = fixture.reconcile()
+        if not saved:
+            write_json(path("compare.json"), {key: state[key] for key in ("setting", "by", "set_at")})
+        look = pilot_look({"c": args.raw_c, "w": args.raw_w, "dimming": args.raw_dimming})
+        if not fixture.send({mac: {"on": True, "look": look}}):
+            raise Failure("%s is not answering" % mac)
+    print("%s (%s): cold %d, warm %d at dimming %d; the others are untouched" % (
+        args.bulb, mac, args.raw_c, args.raw_w, args.raw_dimming))
+    print("put it back with: fixture compare --restore")
+
+
 def cmd_status(fixture, args):
     state, pilots = fixture.reconcile()
     setting = state["setting"]
@@ -814,6 +1066,11 @@ def cmd_status(fixture, args):
     if setting["on"]:
         print("Bulbs:   %s" % fixture.describe_bulbs(setting))
     print("Set by:  %s, %s" % (state["by"], time.strftime("%F %T", time.localtime(state["set_at"]))))
+    raw = fixture.raw(setting)
+    if raw is not None and not raw["covered"]:
+        print("Note:    this white is outside the measured points in raw_calibration; its brightness and colour are a guess")
+    if os.path.exists(path("compare.json")):
+        print("Note:    a bulb is set by hand for comparing; put it back with: fixture compare --restore")
     centre, ring = fixture.layout()
     names = settings()["ring_names"]
     if len(fixture.macs) == 7 and not settings()["layout_mapped"]:
@@ -867,7 +1124,7 @@ def cmd_discover(fixture, args):
         saved["kelvin_max"] = min(high for _, high in kelvins)
     if floors:
         saved["min_dimming"] = max(floors)
-    for key in ("name", "port", "min_colour_dimming"):
+    for key in ("name", "port", "min_colour_dimming", "white_mode", "raw_calibration"):
         saved.setdefault(key, SETTINGS_DEFAULTS[key])
     if len(saved["bulbs"]) == 7 and not saved.get("layout_mapped"):
         # A stand-in until someone looks at the fixture: the list order.
@@ -951,6 +1208,18 @@ def build_parser():
         colour.add_argument("brightness", type=level)
     brightness = add("brightness", cmd_brightness, "change the brightness, keep the colour")
     brightness.add_argument("brightness", type=level)
+    sweep = add("sweep", cmd_sweep, "move slowly between two brightnesses: fixture sweep 1.2 0.8 --seconds 60")
+    sweep.add_argument("start", type=level)
+    sweep.add_argument("end", type=level)
+    sweep.add_argument("--seconds", type=float, default=30.0, help="how long to take (default 30)")
+    sweep.add_argument("--kelvin", type=whole(1000, 10000, "kelvin"), help="white at this colour temperature")
+    compare = add("compare", cmd_compare, "set one bulb by hand: fixture compare --bulb centre --raw-w 42")
+    compare.add_argument("--bulb", help="centre, a ring name such as north, ring 0-5, or a MAC address")
+    compare.add_argument("--raw-w", type=whole(0, 255, "warm level"), default=1, help="warm white LED, 0-255 (default 1)")
+    compare.add_argument("--raw-c", type=whole(0, 255, "cold level"), default=0, help="cold white LED, 0-255 (default 0)")
+    compare.add_argument("--raw-dimming", type=whole(RAW_DIMMING, 100, "dimming"), default=RAW_DIMMING,
+                         help="dimming, 10-100 (default 10)")
+    compare.add_argument("--restore", action="store_true", help="put the fixture back as it was")
     status = add("status", cmd_status, "ask every bulb what it is doing")
     status.add_argument("--json", action="store_true", help="also print everything as JSON")
     discover = add("discover", cmd_discover, "list the WiZ bulbs on the network")

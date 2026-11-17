@@ -153,7 +153,9 @@ fixture off
 fixture white 2700 40       # colour temperature in kelvin, brightness up to 100
 fixture colour 240 100 40   # hue 0-360, saturation 0-100, brightness
 fixture brightness 12.5     # keeps the colour; fractions are allowed
-fixture brightness 0.4      # below 1%: only some of the bulbs are lit
+fixture brightness 0.4      # below 1%: every bulb still lit, on its raw white LEDs
+fixture sweep 1.2 0.8 --seconds 60   # move slowly between two brightnesses
+fixture compare --bulb centre --raw-w 42   # set one bulb by hand; --restore puts it back
 fixture status              # asks every bulb what it is doing
 fixture discover            # lists the WiZ bulbs on the network and their limits
 fixture follow              # show whether the fixture is following the sun
@@ -181,7 +183,11 @@ Bulbs are known by MAC address, never by network address. Their addresses are re
   "min_dimming": 1,
   "min_colour_dimming": 10,
   "kelvin_min": 2200,
-  "kelvin_max": 6500
+  "kelvin_max": 6500,
+  "white_mode": "hybrid",
+  "raw_calibration": [
+    {"kelvin": 2700, "percent": 1, "c": 0, "w": 42, "dimming": 10}
+  ]
 }
 ```
 
@@ -199,11 +205,11 @@ Brightness is the average dimming of the seven bulbs.
 
 - **A whole number is every bulb at that dimming.** Fixture 1% is all seven at 1, fixture 37% is all seven at 37, and 100% is all seven at 100. Apple Home only sends whole numbers, so from Home every bulb is always lit and they are all alike.
 - **A fraction puts some bulbs one step higher.** Brightness moves in steps of one seventh of a percent: one bulb, one step. Fixture 12.5% is 88 sevenths, so three bulbs are at 12 and four at 13.
-- **Below 1% only some bulbs are lit**, each at 1, and the rest are off. Fixture 0.4% is three bulbs. The least is one bulb at 1, which is about 0.14%.
+- **Below 1% every bulb stays lit, on its raw white LEDs.** See the next section. Only below about 0.024% are bulbs switched off.
 
-The command, `follow.json` and the sun follower take fractions. They are printed to one decimal place ("0.4%", "37.6%"), with the number of bulbs lit when that is not all of them.
+The command, `follow.json` and the sun follower take fractions. They are printed to one decimal place from 1% up ("37.6%") and to three below ("0.4%", "0.03%"), with the raw level when that is in use and the number of bulbs lit when that is not all of them: `white 2700K at 0.4% (raw warm 16.9)`.
 
-The bulbs that are singled out, to be lit below 1% or to take the extra step, are chosen so the fixture stays symmetric. With the ring places numbered 0 to 5:
+The bulbs that are singled out, to take the extra step or to be the only ones lit, are chosen so the fixture stays symmetric. With the ring places numbered 0 to 5:
 
 | Bulbs singled out | Which |
 |---|---|
@@ -214,11 +220,60 @@ The bulbs that are singled out, to be lit below 1% or to take the extra step, ar
 | 5 | the centre and ring 0, 1, 3 and 4, two opposite pairs |
 | 6 | the whole ring, centre left out |
 
-A colour cannot be dimmed below 10 on these bulbs. From 10% up a colour works exactly as white does. Below 10% only some bulbs are lit, each at 10, as many as come nearest to the light asked for (fixture 5% is four bulbs at 10), chosen by the same table.
+### Below 1%: the raw white LEDs
+
+White at dimming 1 is as low as the bulbs' ordinary control goes, and they cut fractions off (1.5 is taken as 1). But the cold and warm white LEDs can also be set directly, as `c` and `w` from 0 to 255 at a dimming of 10, and that goes much lower. This is called raw here.
+
+One raw setting has been matched by eye against ordinary white, on one bulb beside the others: **warm 42 at dimming 10 looks the same as white 2700K at dimming 1**, in brightness and in colour. 43 looked a touch brighter; 32 and 25 dimmer. That is the one line in `raw_calibration`.
+
+So below 1%, white brightness B is every bulb at warm level 42 x B, at dimming 10:
+
+- It moves in sevenths of a level, the same way as above 1%: every bulb at the whole level, and the left-over sevenths go one each to the singled-out bulbs. Fixture 0.4% is level 16.9: six bulbs at 17 and one at 16.
+- Below every bulb at level 1 (about 0.024%) there is nothing lower to send, so fewer bulbs are lit, each at level 1, by the same table. The least is one bulb at level 1, about 0.003%.
+- At 1% and above nothing is raw: it is ordinary white, as described above.
+
+**Only 2700K is matched.** At other colour temperatures below 1% the same total is shared between the cold and warm LEDs, evenly in mireds from 2700K (all warm) to 6500K (all cold), and warmer than 2700K is all warm. That is a guess at both the colour and the brightness. The sun follower's night colour is 2700K, so the matched case is the one it uses. `fixture status` says when the present setting is a guess.
+
+Not yet known: whether a bulb shows a blip when it changes between ordinary white (at 1%) and raw (just below). `fixture sweep 1.2 0.8 --seconds 60` crosses it slowly for watching.
+
+Without a 1% line in `raw_calibration`, or on bulbs whose lowest dimming is above 1, there is no raw white: below the lowest dimming fewer bulbs are lit, as for a colour.
+
+### Raw white at every brightness
+
+`"white_mode": "raw"` in `fixture.json` drives the white LEDs directly at every brightness, so a bulb never changes between the two ways. The default, `"hybrid"`, is raw below 1% only. It takes effect at the next change; restart the Apple Home service to be sure it has it (`launchctl kickstart -k gui/$(id -u)/local.fixture-homekit`).
+
+**Do not switch to it yet.** It needs more measured points. `raw_calibration` holds them, one line each:
+
+```
+{"kelvin": 2700, "percent": 50, "c": 0, "w": 200, "dimming": 60}
+```
+
+That would say: cold 0 and warm 200 at dimming 60 looks the same as ordinary white 2700K at 50%. (The numbers are made up.) How the points are used:
+
+- The light of a raw setting is taken as level x dimming, where the level is `c` + `w`.
+- Between two points of the same colour temperature, the light and the dimming move evenly from one to the other.
+- Outside the points it is a guess, in proportion to the nearest one. With only the 1% point, warm 255 at dimming 100 comes out as 61%, and everything above that is the same. That is very likely wrong, which is why more points are needed.
+- A point also fixes the cold and warm mix at its colour temperature. Other colour temperatures use the points of the nearest one, with the mireds guess for the mix.
+- A line that is not a whole, sensible point is ignored.
+
+To measure a point, set the fixture to an ordinary white, then set one bulb by hand and change it until it matches its neighbours:
+
+```
+fixture white 2700 50
+fixture compare --bulb centre --raw-w 200 --raw-dimming 60
+fixture compare --bulb centre --raw-w 210 --raw-dimming 60
+fixture compare --restore
+```
+
+`--bulb` takes `centre`, a name from `ring_names` such as `north`, `ring 0` to `ring 5`, or a MAC address. `--raw-c` is the cold LED. Left out, the levels are warm 1, cold 0, dimming 10, so a bulb is never made bright by accident. The other bulbs are not touched. While a bulb is set by hand the sun follower leaves the fixture alone; `--restore` puts every bulb back as it was and hands the fixture back to whoever had set it, so no two-hour wait is left behind.
+
+### Colours
+
+A colour cannot be dimmed below 10 on these bulbs. From 10% up a colour works exactly as white does. Below 10% only some bulbs are lit, each at 10, as many as come nearest to the light asked for (fixture 5% is four bulbs at 10), chosen by the same table. There is no raw mode for colours.
 
 A fixture of some other number of bulbs works the same way, but has no hexagon: the bulbs singled out are simply the first ones in the list.
 
-Bulbs that are kept off are still given the colour and the lowest dimming, so if the wall switch brings every bulb back on, they all look right. The fixture then switches the extra ones off again.
+Bulbs that are kept off are still given the colour and the lowest level, so if the wall switch brings every bulb back on, they all look right. The fixture then switches the extra ones off again.
 
 ### Changes made elsewhere
 
@@ -260,12 +315,12 @@ fixture follow on         # start again, and take the fixture over now
 
 The rules are the Neewer light's:
 
-- **It never switches the fixture on or off.** While the fixture is off it does nothing. (Below 1% it does switch single bulbs off and on; that is how the fixture dims there.)
+- **It never switches the fixture on or off.** While the fixture is off it does nothing.
 - **A setting made elsewhere wins.** After a change from Apple Home, the `fixture` command, the WiZ app or a single bulb's tile, it leaves the fixture alone for two hours, then follows again. `fixture follow on` ends the wait early.
 - **It only sends when what a bulb should show changes**, and writes one line to the log each time. It does not round brightness to a whole number, so through dusk and dawn the fixture moves one bulb at a time, in sevenths of a percent.
 - If no bulb answers, or sundial has stopped, it tries again each minute and writes one line, not one a minute.
 
-`follow.json` in the fixture's settings folder has the same five settings as the Neewer light's: `enabled`, `day_brightness` (100), `night_brightness` (1), `night_kelvin` (2700) and `hold_minutes` (120). Colour is kept within the bulbs' 2200-6500K. The night level of 1 is every bulb at its lowest. It may be a fraction: 0.4 is three bulbs.
+`follow.json` in the fixture's settings folder has the same five settings as the Neewer light's: `enabled`, `day_brightness` (100), `night_brightness` (1), `night_kelvin` (2700) and `hold_minutes` (120). Colour is kept within the bulbs' 2200-6500K. The night level of 1 is every bulb at dimming 1. It may be lower: 0.4 is every bulb on its raw warm LED at about level 17, and the ramp down to it at dusk is then smooth all the way.
 
 `python3 tests/test_fixture.py` checks all of this against seven pretend bulbs, without touching real ones.
 
