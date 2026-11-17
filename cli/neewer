@@ -630,6 +630,7 @@ FOLLOW_DEFAULTS = {
     "night_brightness": 5,   # brightness after dark; never below 1, so never off
     "night_kelvin": 2700,    # colour after dark
     "hold_minutes": 120,     # how long a setting made elsewhere is left alone
+    "fresh_start": True,     # a light switched on after being off goes straight to the sun's setting
     "bedtime_rule": True,    # fade out and switch off at bedtime
     "morning_on": True,      # and switch on again before waking, if the rule switched it off
     "fade_minutes": 5,       # how long the fade at bedtime takes
@@ -834,6 +835,7 @@ def bedtime_step(light, memory, settings, now, send, sunrise_running):
         memory.pop("manual", None)
         memory["stamp"], memory["sent"] = state_stamp(), follow_look(light.state)
         memory["night"] = dict(night, state="done")
+        memory["fresh"] = False
         return "following", "morning: switched on at white %dK at %d%%" % (kelvin_now, brightness), True
 
     if night is None:
@@ -850,6 +852,7 @@ def bedtime_step(light, memory, settings, now, send, sunrise_running):
             finished, ended = fade_out(light, memory, settings["fade_minutes"] * 60.0, now)
             if finished:
                 memory["night"] = night = {"start": start, "state": "off", "at": ended}
+                memory["fresh"] = True  # off now: the next switching on by day starts afresh
                 sentence = night_sentence(night, False, morning, settings)
                 return night_situation(sentence), "bedtime: faded out and switched off; " + sentence, True
             # Set by someone during the fade: theirs now.
@@ -869,6 +872,58 @@ def bedtime_step(light, memory, settings, now, send, sunrise_running):
             memory["night"] = night
     sentence = night_sentence(night, on, morning, settings)
     return night_situation(sentence), sentence, False
+
+
+def in_night(settings, now):
+    """True between bedtime and the morning, when the bedtime rule is in force."""
+    times = sleep_times(settings) if settings["bedtime_rule"] else None
+    if times is None:
+        return False
+    return now < night_window(now, times[0], times[1], settings["morning_lead_minutes"])[1]
+
+
+# A fresh start: a light that was off and is switched on again by day goes
+# straight to the sun's setting and is followed. Without this it comes back as
+# it was left (last night's warm white, say), and any touch of the brightness
+# then holds that for two hours.
+#
+# memory["fresh"] says one is due. It is set whenever the follower sees the
+# light off, and when a new day begins.
+
+def fresh_bookkeeping(memory, settings, on, now):
+    if not on:
+        memory["fresh"] = True
+    times = sleep_times(settings) if settings["bedtime_rule"] else None
+    if times is not None:
+        morning = night_window(now, times[0], times[1], settings["morning_lead_minutes"])[1]
+        if now >= morning and memory.get("day") != morning:
+            memory["day"], memory["fresh"] = morning, True
+
+
+def fresh_start_look(now=None):
+    """(kelvin, brightness) a light switched on right now should get, or None.
+
+    None when fresh starts or following are switched off, at night, or when
+    sundial cannot be read. The Apple Home service asks this as Home switches
+    the light on, so there is no minute of the old setting first.
+    """
+    now = time.time() if now is None else now
+    settings = follow_settings()
+    if not settings["enabled"] or not settings["fresh_start"] or in_night(settings, now):
+        return None
+    try:
+        return follow_target(sundial_target(now), settings)
+    except Failure:
+        return None
+
+
+def fresh_start_done(now=None):
+    """Records that the light as it is now is the follower's own, freshly set."""
+    memory = read_json(FOLLOW_MEMORY_FILE, {})
+    memory.pop("manual", None)
+    memory.update(stamp=state_stamp(), sent=follow_look(read_json(STATE_FILE, {})), fresh=False,
+                  fresh_at=time.time() if now is None else now)
+    write_json(FOLLOW_MEMORY_FILE, memory)
 
 
 def night_situation(sentence):
@@ -971,6 +1026,8 @@ def follow_step(light, memory, now, send=True, sunrise_running=sunrise_is_runnin
     settings = follow_settings()
     if not settings["enabled"]:
         return "off", "following is switched off", False
+    if send:
+        fresh_bookkeeping(memory, settings, light.state.get("on") is True, now)
     verdict = bedtime_step(light, memory, settings, now, send, sunrise_running)
     if verdict is not None:
         return verdict
@@ -994,6 +1051,9 @@ def follow_step(light, memory, now, send=True, sunrise_running=sunrise_is_runnin
         return "light off", "the light is off; leaving it alone", False
     if sunrise_running():
         return "sunrise", "a sunrise is running; leaving it alone", False
+    fresh = settings["fresh_start"] and memory.get("fresh")
+    if fresh:
+        until = None  # a fresh start is not held up by a setting made as the light came on
     if until is not None and now < until:
         at = time.strftime("%H:%M", time.localtime(until))
         return "hold " + at, "the light was set elsewhere (%s); following again at %s" % (describe(state), at), False
@@ -1006,16 +1066,34 @@ def follow_step(light, memory, now, send=True, sunrise_running=sunrise_is_runnin
         if send:
             memory.pop("manual", None)
             memory["stamp"], memory["sent"] = stamp, look
+            memory["fresh"] = False
         return "following", "following the sun; the light is already at %s" % wanted_text, False
     if not send:
-        return "following", "following the sun; about to set %s" % wanted_text, False
+        return "following", "%s; about to set %s" % (
+            "fresh start" if fresh else "following the sun", wanted_text), False
     if state_stamp() != stamp:
         # Something else set the light a moment ago. Look again next minute.
         return memory.get("situation", "following"), None, False
     light.white(kelvin_now, brightness, 0, "linear", no_power=True)
     memory.pop("manual", None)
     memory["stamp"], memory["sent"] = state_stamp(), follow_look(light.state)
+    if fresh:
+        memory["fresh"], memory["fresh_at"] = False, now
+        return "following", "fresh start: switched on, so set to the sun's %s" % wanted_text, True
     return "following", "sun %+.1f  %s" % (float(sun["sun_elevation"]), wanted_text), True
+
+
+def fresh_outlook(settings, memory, on, now):
+    """What `follow` says about fresh starts."""
+    if not settings["fresh_start"]:
+        return "switched off"
+    if memory.get("fresh"):
+        if in_night(settings, now):
+            return "due in the morning, if the light is on then"
+        return "due now" if on else "due: when the light is switched on it goes straight to the sun's setting"
+    if memory.get("fresh_at") and now - memory["fresh_at"] < 12 * 3600:
+        return "made at %s" % hhmm(memory["fresh_at"])
+    return "none due"
 
 
 def follow_apply(light, now=None, sunrise_running=sunrise_is_running):
@@ -1079,6 +1157,7 @@ def cmd_follow(light, args):
         print("Sun:       unknown (%s)" % failure)
     print("Light:     %s" % describe(light.state))
     print("Bedtime:   %s" % bedtime_outlook(light, settings, read_json(FOLLOW_MEMORY_FILE, {}), now))
+    print("Fresh:     %s" % fresh_outlook(settings, read_json(FOLLOW_MEMORY_FILE, {}), light.state.get("on") is True, now))
     try:
         sentence = follow_step(light, read_json(FOLLOW_MEMORY_FILE, {}), now, send=False)[1]
     except Failure as failure:

@@ -178,6 +178,7 @@ class Link:
         self.unsent = False  # Home wrote something the worker has not sent yet
         self.trouble = None
         self.refused = False  # macOS has not allowed the local network yet
+        self.owner = "home"   # who the setting being sent belongs to: "follow" for a fresh start
         self.wanted = fixture.state()["setting"]
         self.thread = threading.Thread(target=self.run, name="fixture-sender", daemon=True)
 
@@ -198,7 +199,14 @@ class Link:
 
     def apply_home(self, values):
         with self.lock:
-            self.wanted = apply_home_values(self.wanted, values, self.fixture)
+            # A fresh start: switched on by day, the fixture goes straight to
+            # the sun's setting, not back to how it was left, and is the
+            # follower's from then on.
+            fresh = cli.fresh_start_setting(self.fixture) if values.get("On") and not self.wanted["on"] else None
+            if fresh is not None:
+                self.wanted, self.owner = fresh, "follow"
+            else:
+                self.wanted, self.owner = apply_home_values(self.wanted, values, self.fixture), "home"
             self.unsent = True
         self.wake.set()
 
@@ -236,9 +244,13 @@ class Link:
 
     def send_wanted(self):
         with self.lock:
-            target = dict(self.wanted)
+            target, owner = dict(self.wanted), self.owner
         try:
-            missed = self.fixture.apply(target, "home")
+            missed = self.fixture.apply(target, owner)
+            if owner == "follow":
+                self.fixture.claim("follow")
+                self.fixture.fresh_done()
+                log.info("fresh start: switched on at %s", self.fixture.describe(target))
         except cli.Failure as failure:
             self.note_trouble(str(failure))
             return

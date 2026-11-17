@@ -1161,6 +1161,115 @@ class BedtimeTest(Case):
         self.assertEqual(len(self.net.lit()), 7)
 
 
+class FreshStartTest(BedtimeTest):
+    """A fixture switched on by day after being off goes straight to the sun's setting."""
+
+    def outlook(self):
+        return cli.fresh_outlook(cli.follow_settings(), self.fixture.state(),
+                                 cli.read_json(cli.path("follow-state.json"), {}), self.when)
+
+    def by_hand(self, hour, minute, day=0, **changes):
+        """A setting made by hand at that time, as Apple Home's own tiles or the WiZ app make it."""
+        for bulb in self.net.bulbs.values():
+            bulb.update(changes)
+        self.when = self.midnight + day * 86400 + hour * 3600 + minute * 60
+        self.fixture.reconcile()  # the Home service notices within seconds
+        state = self.fixture.state()
+        state["set_at"] = self.when
+        cli.write_json(cli.path("state.json"), state)
+
+    def off_overnight(self):
+        """He switches the fixture off by hand at 03:20, in last night's warm white."""
+        self.apply(23, 0)                 # the follower fades it out
+        self.switch(True)                 # he switches it back on
+        self.apply(1, 0, day=1)
+        self.switch(False)                # and off again, himself
+        self.apply(3, 20, day=1)
+        for hour in (6, 7, 9):
+            self.apply(hour, 30, day=1)
+        self.net.sent = []
+
+    def test_switched_on_in_the_morning_goes_to_the_sun(self):
+        self.off_overnight()
+        self.assertIn("when the fixture is switched on", self.outlook())
+        self.sky = DAY
+        self.switch(True)
+        self.by_hand(10, 58, day=1, dimming=40)   # on, and the brightness touched, before the follower's next look
+        line = self.apply(10, 58, day=1)
+        self.assertEqual(line, "fresh start: switched on, so set to the sun's white 6500K at 100%")
+        self.assertEqual(self.shown(), (7, [100]))
+        self.assertEqual(self.net.bulb(MACS[0])["temp"], 6500)
+        self.assertEqual(self.outlook(), "made at 10:58")
+        self.assertIsNone(self.apply(10, 59, day=1))  # followed, not held
+        self.assertEqual(self.fixture.state()["by"], "follow")
+
+    def test_after_the_fresh_start_the_hold_is_as_ever(self):
+        self.off_overnight()
+        self.sky = DAY
+        self.switch(True)
+        self.apply(10, 58, day=1)
+        self.by_hand(12, 0, day=1, dimming=50)
+        self.assertIn("set elsewhere", self.apply(12, 1, day=1))
+        self.assertEqual(self.shown(), (7, [50]))
+
+    def test_switched_on_in_the_night_is_left_alone(self):
+        self.apply(23, 0)
+        self.switch(True)
+        self.assertIn("left alone tonight", self.apply(2, 0, day=1))
+        sent = self.sets()
+        self.apply(4, 0, day=1)
+        self.assertEqual(self.sets(), sent)
+        self.assertEqual(self.outlook(), "due in the morning, if the fixture is on then")
+        self.assertIsNone(cli.fresh_start_setting(self.fixture, self.when))  # nor from Apple Home at this hour
+        self.sky = DUSK
+        self.assertIn("fresh start", self.apply(6, 30, day=1))  # still on when the day begins
+
+    def test_a_fixture_never_switched_off_is_held_as_ever(self):
+        self.sky = DAY
+        self.apply(9, 0, day=1)
+        self.by_hand(15, 0, day=1, dimming=40)
+        self.assertIn("set elsewhere", self.apply(15, 1, day=1))
+        self.assertIsNone(self.apply(16, 0, day=1))
+        self.assertEqual(self.shown(), (7, [40]))
+        self.assertFalse(self.fixture.state()["fresh"])
+
+    def test_power_back_at_the_wall_in_the_morning(self):
+        self.apply(23, 0)                       # faded out and off
+        self.net.down = set(self.net.bulbs)     # then the wall switch: no bulb answers all night
+        self.assertIn("cannot follow the sun", self.apply(2, 0, day=1))
+        self.apply(7, 0, day=1)
+        self.net.down = set()
+        self.switch(True)                       # power back: every bulb comes on as it was left
+        for bulb in self.net.bulbs.values():
+            self.assertEqual((bulb["temp"], bulb["dimming"]), (2700, 1))
+        self.sky = DAY
+        self.assertIn("white 6500K at 100%", self.apply(10, 58, day=1))
+        self.assertEqual(self.shown(), (7, [100]))
+        self.assertIsNone(self.apply(10, 59, day=1))
+
+    def test_power_back_at_the_wall_after_a_hold(self):
+        self.sky = DAY
+        self.apply(9, 0, day=1)
+        self.by_hand(9, 30, day=1, temp=2700, dimming=40)   # set by hand, held
+        self.assertIn("set elsewhere", self.apply(9, 31, day=1))
+        self.net.down = set(self.net.bulbs)                 # off at the wall
+        self.apply(10, 0, day=1)
+        self.net.down = set()
+        self.assertIn("fresh start", self.apply(10, 30, day=1))
+        self.assertEqual(self.net.bulb(MACS[0])["temp"], 6500)
+
+    def test_it_can_be_switched_off(self):
+        cli.write_json(cli.path("follow.json"), {"fresh_start": False})
+        self.off_overnight()
+        self.assertEqual(self.outlook(), "switched off")
+        self.sky = DAY
+        self.switch(True)
+        self.by_hand(10, 58, day=1, dimming=40)
+        self.assertIn("set elsewhere", self.apply(10, 58, day=1))  # as it was: the old colour, held
+        self.assertEqual(self.net.bulb(MACS[0])["temp"], 2700)
+        self.assertIsNone(cli.fresh_start_setting(self.fixture, self.when))
+
+
 class HomeKitTest(Case):
     def setUp(self):
         super().setUp()
@@ -1215,11 +1324,28 @@ class HomeKitTest(Case):
         self.assertFalse(self.link.poll())  # the bulbs agree; nothing to tell Home
 
     def test_off_and_on_from_home(self):
+        cli.write_json(cli.path("follow.json"), {"fresh_start": False})
         self.write(On=False)
         self.assertEqual(self.net.lit(), [])
         self.write(On=True)
         self.assertEqual(self.shown(), (7, [5]))
         self.assertEqual(self.fixture.state()["by"], "cli")  # power is not a new setting
+
+    def test_on_from_home_by_day_is_a_fresh_start(self):
+        self.write(On=False)
+        self.assertTrue(self.fixture.state()["fresh"])
+        self.net.sent = []
+        self.write(On=True, Brightness=5)   # Home often repeats the brightness it was showing
+        self.assertEqual(self.shown(), (7, [100]))
+        self.assertEqual(self.net.bulb(MACS[0])["temp"], 6500)
+        # Straight there: no bulb was ever sent the old setting.
+        self.assertEqual({values.get("temp") for values in self.net.packets("setPilot")}, {6500})
+        state = self.fixture.state()
+        self.assertEqual((state["by"], state["fresh"]), ("follow", False))
+        self.assertIsNone(cli.follow_apply(self.fixture, self.sun(DAY)) and None)
+        self.write(Brightness=40)            # a change after that is his, and held
+        self.assertEqual(self.fixture.state()["by"], "home")
+        self.assertEqual(self.net.bulb(MACS[0])["temp"], 6500)
 
     def test_brightness_zero_is_never_sent(self):
         self.write(Brightness=0, On=False)

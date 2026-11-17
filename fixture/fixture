@@ -83,6 +83,7 @@ FOLLOW_DEFAULTS = {
     "night_brightness": 1,   # brightness after dark; above 0, so never off
     "night_kelvin": 2700,    # colour after dark
     "hold_minutes": 120,     # how long a setting made elsewhere is left alone
+    "fresh_start": True,     # a fixture switched on after being off goes straight to the sun's setting
     "bedtime_rule": True,    # fade out and switch off at bedtime
     "morning_on": True,      # and switch on again before waking, if the rule switched it off
     "fade_minutes": 5,       # how long the fade at bedtime takes
@@ -623,6 +624,8 @@ class Fixture:
             "pending": [mac for mac in raw.get("pending", []) if mac in self.macs],
             "by": raw.get("by") or "elsewhere",
             "set_at": float(raw.get("set_at") or 0),
+            "fresh": bool(raw.get("fresh")),            # a fresh start is due (see the follower)
+            "fresh_at": float(raw.get("fresh_at") or 0),  # when the last one was made
         }
 
     def plan(self, setting):
@@ -740,8 +743,19 @@ class Fixture:
             if self.look(setting) != self.look(state["setting"]) or not state["bulbs"]:
                 state["by"], state["set_at"] = by, time.time()
             state.update(setting=dict(setting), bulbs=bulbs, pending=[mac for mac in self.macs if mac not in taken])
+            if not setting["on"]:
+                state["fresh"] = True   # switched off: the next switching on by day starts afresh
+            elif by == "follow":
+                state["fresh"] = False  # the follower's own setting is as fresh as it gets
             write_json(path("state.json"), state)
             return state["pending"]
+
+    def fresh_done(self, now=None):
+        """Records that a fresh start has just been made."""
+        with self.locked():
+            state = self.state()
+            state.update(fresh=False, fresh_at=time.time() if now is None else now)
+            write_json(path("state.json"), state)
 
     def claim(self, by):
         """Marks the present look as chosen by `by`, without sending anything."""
@@ -799,6 +813,7 @@ class Fixture:
         if not lit:
             # The whole fixture was switched off elsewhere. Not a new setting.
             setting["on"] = False
+            state["fresh"] = True
             for mac in actual:
                 bulbs[mac] = {"on": False, "look": bulbs.get(mac, actual[mac])["look"]}
             return state
@@ -990,6 +1005,56 @@ def night_situation(sentence):
     return "night: " + sentence.split(";")[0]
 
 
+def in_night(settings, now):
+    """True between bedtime and the morning, when the bedtime rule is in force."""
+    times = sleep_times(settings) if settings["bedtime_rule"] else None
+    if times is None:
+        return False
+    return now < night_window(now, times[0], times[1], settings["morning_lead_minutes"])[1]
+
+
+# A fresh start: a fixture that was off and is switched on again by day goes
+# straight to the sun's setting and is followed. Without this it comes back as
+# it was left (last night's warm white, say), and any touch of the brightness
+# then holds that for two hours.
+#
+# state.json's "fresh" says one is due. It is set whenever the fixture is
+# switched off or found off, by whichever program sees it. The follower's
+# memory["fresh"] says the same for what the record cannot show: a new day
+# beginning, and bulbs that did not answer (off at the wall).
+
+def fresh_start_setting(fixture, now=None):
+    """The setting a fixture switched on right now should get, or None.
+
+    None when fresh starts or following are switched off, at night, or when
+    sundial cannot be read. The Apple Home service asks this as Home switches
+    the fixture on, so there is not a minute of the old setting first.
+    """
+    now = time.time() if now is None else now
+    follow = follow_settings()
+    if not follow["enabled"] or not follow["fresh_start"] or in_night(follow, now):
+        return None
+    try:
+        kelvin, brightness = follow_target(sundial_target(now), follow, fixture)
+    except Failure:
+        return None
+    return dict(fixture.state()["setting"], on=True, mode="white", kelvin=kelvin, brightness=brightness)
+
+
+def fresh_outlook(follow, state, memory, now):
+    """What `fixture follow` says about fresh starts."""
+    if not follow["fresh_start"]:
+        return "switched off"
+    if state["fresh"] or memory.get("fresh"):
+        if in_night(follow, now):
+            return "due in the morning, if the fixture is on then"
+        return "due now" if state["setting"]["on"] else \
+            "due: when the fixture is switched on it goes straight to the sun's setting"
+    if state["fresh_at"] and now - state["fresh_at"] < 12 * 3600:
+        return "made at %s" % hhmm(state["fresh_at"])
+    return "none due"
+
+
 def bedtime_step(fixture, memory, follow, state, now, send):
     """The bedtime rule's part of one run. None means: carry on following.
 
@@ -1021,6 +1086,7 @@ def bedtime_step(fixture, memory, follow, state, now, send):
         missed = fixture.apply(wanted, "follow")
         fixture.claim("follow")
         memory["night"] = dict(night, state="done")
+        memory["fresh"] = False
         return "following", "morning: switched on at %s%s" % (
             fixture.describe(wanted), "; not answering: %s" % ", ".join(missed) if missed else ""), True
 
@@ -1138,24 +1204,37 @@ def follow_step(fixture, now, send=True, memory=None):
     if not follow["enabled"]:
         return "off", "following is switched off", False
     with fixture.locked():
-        state, _ = fixture.reconcile(dry=not send)
+        try:
+            state, _ = fixture.reconcile(dry=not send)
+        except Failure:
+            if send:
+                memory["fresh"] = True  # no bulb answers: off at the wall, most likely
+            raise
+        if send:
+            times = sleep_times(follow) if follow["bedtime_rule"] else None
+            if times is not None:
+                morning = night_window(now, times[0], times[1], follow["morning_lead_minutes"])[1]
+                if now >= morning and memory.get("day") != morning:
+                    memory["day"], memory["fresh"] = morning, True  # a new day begins afresh
         verdict = bedtime_step(fixture, memory, follow, state, now, send)
         if verdict is None:
-            return follow_sun(fixture, follow, state, now, send)
+            return follow_sun(fixture, follow, state, now, send, memory)
         if verdict != "fade":
             return verdict
     return bedtime_fade(fixture, memory, follow, now)
 
 
-def follow_sun(fixture, follow, state, now, send):
+def follow_sun(fixture, follow, state, now, send, memory):
     """The ordinary minute: set the fixture from the sun, unless it is off or held."""
     setting = state["setting"]
     if not setting["on"]:
         return "light off", "the fixture is off; leaving it alone", False
+    # A fresh start is not held up by a setting made as the fixture came on.
+    fresh = follow["fresh_start"] and (state["fresh"] or memory.get("fresh"))
     # Whose setting is this? Anyone's but the follower's is left alone for a while.
     mine = state["by"] == "follow"
     until = state["set_at"] + follow["hold_minutes"] * 60
-    if not mine and now < until:
+    if not mine and now < until and not fresh:
         at = time.strftime("%H:%M", time.localtime(until))
         return "hold " + at, "the fixture was set elsewhere (%s); following again at %s" % (
             fixture.describe(setting), at), False
@@ -1169,13 +1248,20 @@ def follow_sun(fixture, follow, state, now, send):
     if state["bulbs"] == fixture.plan(wanted):
         if send and not mine:
             fixture.claim("follow")
+        if send and fresh:
+            fixture.fresh_done(now)
+            memory["fresh"] = False
         return "following", "following the sun; the fixture is already at %s" % text, False
     if not send:
-        return "following", "following the sun; about to set %s" % text, False
+        return "following", "%s; about to set %s" % ("fresh start" if fresh else "following the sun", text), False
     missed = fixture.apply(wanted, "follow")
     fixture.claim("follow")
     if missed:
         text += "; not answering: %s" % ", ".join(missed)
+    if fresh:
+        fixture.fresh_done(now)
+        memory["fresh"] = False
+        return "following", "fresh start: switched on, so set to the sun's %s" % text, True
     return "following", "sun %+.1f  %s" % (float(sun["sun_elevation"]), text), True
 
 
@@ -1484,6 +1570,7 @@ def cmd_follow(fixture, args):
         setting = fixture.reconcile(dry=True)[0]["setting"]
         print("Fixture:   %s" % fixture.describe(setting))
         print("Bedtime:   %s" % bedtime_outlook(fixture, follow, memory, setting["on"], now))
+        print("Fresh:     %s" % fresh_outlook(follow, fixture.reconcile(dry=True)[0], memory, now))
         sentence = follow_step(fixture, now, send=False, memory=dict(memory))[1]
     except Failure as failure:
         sentence = "cannot follow the sun: %s" % failure

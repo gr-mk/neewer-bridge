@@ -80,7 +80,8 @@ neewer follow on         # start again, and take the light over now
 The rules:
 
 - **It switches the light off and on only at bedtime and in the morning** (below). Otherwise it never does, and while the light is off it does nothing.
-- **A setting made elsewhere wins.** If you set the light from Apple Home or with another `neewer` command, it leaves the light alone for two hours from that change, then follows again. `neewer follow on` ends the wait early. Switching the light off and on is not a new setting.
+- **A setting made elsewhere wins.** If you set the light from Apple Home or with another `neewer` command, it leaves the light alone for two hours from that change, then follows again. `neewer follow on` ends the wait early.
+- **Switched on by day, it starts afresh** (below): it goes to the sun's setting, not back to how it was left.
 - **It keeps out of a sunrise.** Nothing is sent while `neewer sunrise` runs. What the sunrise leaves is then held for two hours like any other setting.
 - **It only sends when the target changes.** That is about once a minute around sunrise and sunset, and not at all at midday or at night.
 - If the bridge or the light cannot be reached, it tries again each minute and writes one line to the log, not one a minute.
@@ -94,6 +95,7 @@ The settings are in `follow.json` in the settings folder, and are read each minu
   "night_brightness": 5,
   "night_kelvin": 2700,
   "hold_minutes": 120,
+  "fresh_start": true,
   "bedtime_rule": true,
   "morning_on": true,
   "fade_minutes": 5,
@@ -107,6 +109,17 @@ The settings are in `follow.json` in the settings folder, and are read each minu
 - Colour is sundial's colour, kept within the light's 2500-7500K. While the sun goes from the horizon to 6 degrees below, it moves to `night_kelvin`.
 - `night_brightness` cannot go below 1, because 0 would switch the light off.
 - `hold_minutes` is how long a setting made elsewhere is left alone.
+
+### A fresh start
+
+A light that was off and is switched on again by day goes straight to the sun's setting and is followed from there. Without this it would come back as it was left, last night's warm white in the middle of the morning, and the first touch of the brightness would hold that for two hours.
+
+- It applies whenever the follower has seen the light off, however it was switched off and however it is switched on.
+- A new day begins afresh too. A light that is on when the morning time comes (half an hour before waking) is set from the sun then, even if it was set by hand during the night.
+- A brightness changed in the same minute as the switching on is not kept: the fresh start comes first. After it, a setting made by hand is held for two hours as ever.
+- **How quickly.** Switched on from Apple Home, the light comes on at the sun's setting at once: the Home service asks for it as it switches the light on. Switched on any other way (`neewer on`, the light's own button), it shows the old setting until the follower's next look, up to a minute.
+- **Not at night.** Between bedtime and the morning a light switched on by hand is left exactly as it comes on, as the bedtime rule says.
+- `"fresh_start": false` in `follow.json` goes back to the old way. `neewer follow` has a line for it: `due: when the light is switched on it goes straight to the sun's setting`, `made at 10:58`.
 
 ### Bedtime
 
@@ -347,6 +360,7 @@ The rules are the Neewer light's:
 
 - **It switches the fixture off and on only at bedtime and in the morning**, by the same rule as the Neewer light (see Bedtime above), with the same settings in its own `follow.json`. Otherwise it never does, and while the fixture is off it does nothing.
 - **A setting made elsewhere wins.** After a change from Apple Home, the `fixture` command, the WiZ app or a single bulb's tile, it leaves the fixture alone for two hours, then follows again. `fixture follow on` ends the wait early.
+- **Switched on by day, it starts afresh**, as the Neewer light does (see A fresh start above), with `"fresh_start"` in its own `follow.json`. From Apple Home's Sun tile it is immediate: no bulb is sent the old setting first. From anywhere else (`fixture on`, the WiZ app, a bulb's own tile, the wall switch) the old setting shows until the follower's next look, up to a minute. Bulbs that did not answer, as when the wall switch is off, count as having been off.
 - **It only sends when what a bulb should show changes**, and writes one line to the log each time. It does not round brightness to a whole number, so through dusk and dawn the fixture moves one bulb at a time, in sevenths of a percent.
 - If no bulb answers, or sundial has stopped, it tries again each minute and writes one line, not one a minute.
 

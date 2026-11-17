@@ -529,5 +529,130 @@ class BedtimeTest(Scaffold):
         self.assertIs(self.state()["on"], True)
 
 
+class FreshStartTest(BedtimeTest):
+    """A light switched on by day after being off goes straight to the sun's setting."""
+
+    def outlook(self):
+        light = cli.Light(argparse.Namespace(bridge=None, mac=None, quiet=True))
+        return cli.fresh_outlook(cli.follow_settings(), cli.read_json(cli.FOLLOW_MEMORY_FILE, {}),
+                                 light.state.get("on") is True, self.now)
+
+    def off_overnight(self):
+        """He switches the light off by hand at 03:20, in last night's warm white."""
+        self.at(23, 0)
+        self.apply()                      # the follower fades it out
+        self.at(1, 0, day=1)
+        self.by_hand(on=True)             # he switches it back on
+        self.apply()
+        self.at(3, 20, day=1)
+        self.by_hand(on=False)            # and off again, himself
+        self.apply()
+        for hour in (6, 7, 9):
+            self.at(hour, 30, day=1)
+            self.apply()
+        FakeBridge.sent = []
+
+    def test_switched_on_in_the_morning_goes_to_the_sun(self):
+        self.off_overnight()
+        self.assertIn("when the light is switched on", self.outlook())
+        self.sun(DAY)
+        self.at(10, 58, day=1)
+        self.by_hand(on=True, brightness=40)  # on, and the brightness touched, before the follower's next look
+        self.assertEqual(self.outlook(), "due now")
+        self.assertEqual(self.apply(), "fresh start: switched on, so set to the sun's white 6500K at 100%")
+        self.assertEqual(FakeBridge.sent, [self.white(6500, 100)])
+        self.assertEqual((self.state()["kelvin"], self.state()["brightness"]), (6500, 100))
+        self.assertEqual(self.outlook(), "made at 10:58")
+        self.at(10, 59, day=1)
+        self.assertIsNone(self.apply())       # followed, not held
+
+    def test_after_the_fresh_start_the_hold_is_as_ever(self):
+        self.off_overnight()
+        self.sun(DAY)
+        self.at(10, 58, day=1)
+        self.by_hand(on=True)
+        self.apply()
+        self.at(12, 0, day=1)
+        self.by_hand(brightness=50)
+        self.assertIn("set elsewhere", self.apply())
+        self.at(13, 0, day=1)
+        self.assertIsNone(self.apply())
+        self.assertEqual(self.state()["brightness"], 50)
+
+    def test_switched_on_in_the_night_is_left_alone(self):
+        self.at(23, 0)
+        self.apply()
+        FakeBridge.sent = []
+        self.at(2, 0, day=1)
+        self.by_hand(on=True, brightness=40)
+        self.assertIn("left alone tonight", self.apply())
+        self.assertEqual(self.outlook(), "due in the morning, if the light is on then")
+        self.at(4, 0, day=1)
+        self.apply()
+        self.assertEqual(FakeBridge.sent, [])
+        self.assertEqual(self.state()["brightness"], 40)
+        self.assertIsNone(cli.fresh_start_look(self.now))  # nor from Apple Home at this hour
+        # Still on when the day begins: the day begins afresh.
+        self.sun(DUSK)
+        self.at(6, 30, day=1)
+        self.assertIn("fresh start", self.apply())
+        self.assertEqual(self.state()["brightness"], 29)
+
+    def test_a_light_never_switched_off_is_held_as_ever(self):
+        self.sun(DAY)
+        self.at(9, 0)
+        self.apply()
+        self.at(15, 0)
+        self.by_hand(brightness=40)
+        self.assertIn("set elsewhere", self.apply())
+        self.at(16, 0)
+        self.assertIsNone(self.apply())
+        self.assertEqual(self.state()["brightness"], 40)
+        self.at(17, 1)
+        self.assertIn("white 6500K at 100%", self.apply())
+
+    def test_off_and_on_by_day(self):
+        self.sun(DAY)
+        self.at(9, 0)
+        self.apply()
+        self.at(14, 0)
+        self.by_hand(brightness=40)          # a setting by hand, held
+        self.apply()
+        self.at(14, 10)
+        self.by_hand(on=False)
+        self.apply()
+        self.at(15, 0)
+        self.by_hand(on=True)
+        self.assertIn("fresh start", self.apply())  # not back to the held 40%
+        self.assertEqual(self.state()["brightness"], 100)
+
+    def test_it_can_be_switched_off(self):
+        cli.write_json(cli.FOLLOW_FILE, {"fresh_start": False})
+        self.off_overnight()
+        self.assertEqual(self.outlook(), "switched off")
+        self.sun(DAY)
+        self.at(10, 58, day=1)
+        self.by_hand(on=True, brightness=40)
+        self.assertIn("set elsewhere", self.apply())  # as it was: the old colour, held
+        self.assertEqual((self.state()["kelvin"], self.state()["brightness"]), (2700, 40))
+        self.assertIsNone(cli.fresh_start_look(self.now))
+
+    def test_apple_home_gets_the_suns_setting_as_it_switches_on(self):
+        self.off_overnight()
+        self.sun(DAY)
+        self.at(10, 58, day=1)
+        self.assertEqual(cli.fresh_start_look(self.now), (6500, 100))
+        # The Home service sends that and records it as the follower's own.
+        self.by_hand(on=True, kelvin=6500, brightness=100)
+        cli.fresh_start_done(self.now)
+        self.assertEqual(self.outlook(), "made at 10:58")
+        self.at(10, 59, day=1)
+        self.assertIn("already at white 6500K at 100%", self.apply())  # nothing to send, and no hold
+        self.assertEqual(FakeBridge.sent, [])
+        self.sun(DUSK)
+        self.at(11, 0, day=1)
+        self.assertIn("white 4100K at 29%", self.apply())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -130,6 +130,7 @@ class LightLink:
         self.sent_frame = None
         self.state_stamp = self.stamp()
         self.sunrise = None  # a Sunrise, stopped whenever Home sets the light
+        self.fresh = False   # the setting being sent is a fresh start, to be recorded as the follower's
         self.thread = threading.Thread(target=self.run, name="light-sender", daemon=True)
 
     @property
@@ -173,6 +174,13 @@ class LightLink:
     def apply_home(self, values):
         with self.lock:
             wanted = self.wanted
+            # A fresh start: switched on by day, the light goes straight to
+            # the sun's setting, not back to how it was left.
+            fresh = cli.fresh_start_look() if values.get("On") and not wanted["on"] else None
+            if fresh is not None:
+                wanted.update(on=True, mode="white", kelvin=fresh[0], brightness=fresh[1], tint=0, curve="linear")
+                self.fresh = True
+                values = {}
             # Home may send a temperature together with a matching hue and
             # saturation; the temperature is the one the user chose.
             if "ColorTemperature" in values:
@@ -234,6 +242,10 @@ class LightLink:
                 self.sent_frame = frame
         cli.write_json(cli.STATE_FILE, target)
         self.state_stamp = self.stamp()
+        if self.fresh:
+            self.fresh = False
+            cli.fresh_start_done()
+            log.info("fresh start: switched on at white %dK at %d%%", target["kelvin"], target["brightness"])
 
     # -- housekeeping, called on a timer
 
