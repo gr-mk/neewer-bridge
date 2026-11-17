@@ -356,6 +356,76 @@ The fixture's fade at bedtime goes down through the raw levels below 1%, to a si
 
 `python3 tests/test_fixture.py` checks all of this against seven pretend bulbs, without touching real ones.
 
+## The desk (monitors and keyboard)
+
+`desk/` puts two more things in Apple Home: the external monitors as one light, and the Wooting keyboard's lighting as another. They are one Apple Home bridge, "Desk", so there is one code to pair and two tiles. `./install.sh desk` installs it; the fixture has to be installed first.
+
+Neither is set by this program itself. Each already has one program that sets it, and that stays so:
+
+- **The monitors are sundial's.** `~/bin/sundial` runs every minute and makes the displays follow the sun (brightness through `m1ddc`, colour through Night Shift). The desk service only asks sundial.
+- **The keyboard's LEDs are wooting-workspaces'.** That helper (in `~/.config/aerospace`) shows AeroSpace's workspaces on the keys. The desk service only writes a small file the helper reads.
+
+The service runs under the fixture's launcher app, through `fixture host`, so it comes under the local-network permission that app already has. macOS asks nothing new.
+
+```
+"$HOME/Library/Application Support/NeewerBridge/venv/bin/python" \
+  "$HOME/Library/Application Support/Desk/homekit/desk_homekit.py" --pairing   # the setup code
+```
+
+`--qr code.svg` writes the QR code, and `--status` says what the monitors and the keyboard are doing and why.
+
+### Monitors
+
+- **Brightness** 0-100 is the brightness of every external display.
+- **Colour temperature** is 2700-6500K: what Night Shift can do. 2700K is the warmest macOS allows and 6000K the coolest tint; anything cooler means no tint, shown as 6500K. There is no colour wheel.
+- **Off is brightness 0**, the backlight at its lowest, not asleep. The brightness held before is remembered, and "on" brings it back (or hands brightness back to the sun if none was held). `"off_means": "sleep"` in `desk.json` makes off sleep the displays and on wake them; that has not been tried on the real displays.
+- **A change from Home is held for two hours** (`hold_minutes`), then the monitors follow the sun again. Brightness and colour are held separately: change only the brightness and the colour keeps following the sun.
+- **Home is shown what sundial last applied**, so it moves through the day with the sun, and goes back to the sun's values when a hold runs out.
+- With no external display connected, Home shows "No Response".
+
+sundial has a mode for this, added for it: `sundial manual [MIN] [brightness=N|sun] [kelvin=K|sun]`. `sundial resume` ends it, as it ends pause and movie mode, and `sundial status` shows it. The three modes replace each other: a change from Home ends a pause or a movie mode, and `sundial pause` or `sundial movie` ends a hold from Home. During a pause Home shows the brightness sundial last set and 6500K.
+
+**The lights do not follow a held monitor setting.** sundial's state file has the sun's own values under `target` and what the displays were sent under `applied`. A hold changes only `applied`. The two light followers and the keyboard read `target`.
+
+`~/bin` is not under version control, so the sundial that goes with this is kept in `monitors/sundial` for reference. `install.sh` does not install it. sundial also takes a lock now while it changes anything, so the minute timer and a command cannot overwrite each other.
+
+### Keyboard
+
+Left alone, the keyboard follows the sun as the lights do: 25% and warm at night, rising with sundial's daylight to 100% and no tint by day. Home has On, Brightness and Colour temperature (2700-6500K, which sets how warm the tint is). A change from Home is held for two hours. Off is every key dark.
+
+The desk service writes `~/.local/state/wooting-workspaces/control`, and the helper re-reads it every second:
+
+```
+on 1
+brightness 0.250
+tint 1.000 0.656 0.350
+base ffffff
+```
+
+The helper scales every colour it shows by `brightness` and, per channel, by `tint`. A workspace key that is lit stays lit however dim.
+
+One thing to know. The keys the helper does not colour normally show the Wootility profile, which the keyboard draws itself and which cannot be dimmed from outside. So while the keyboard is dimmed or tinted, those keys are overridden with `base_colour` (white, so a warm white at night) and the profile is not seen. Only at 100% with no tint are they handed back to the profile. `"keep_profile_at_full": false` keeps the base colour then too.
+
+The keyboard is not switched off at bedtime. It cannot be asked what it is showing, so Home shows what the control file says.
+
+The change to the helper is in `keyboard/wooting-workspaces.patch` for reference; the helper itself lives in its own repository. Without the control file the helper behaves exactly as before, and `./uninstall.sh` deletes the file.
+
+### Settings
+
+`desk.json` in `~/Library/Application Support/Desk/`; leave out anything to use these:
+
+```
+{
+  "name": "Desk",
+  "port": 51828,
+  "monitors": {"name": "Monitors", "hold_minutes": 120, "off_means": "dim"},
+  "keyboard": {"name": "Keyboard", "hold_minutes": 120, "day_brightness": 100, "night_brightness": 25,
+               "base_colour": "ffffff", "keep_profile_at_full": true}
+}
+```
+
+Restart after changing a name or the port: `launchctl kickstart -k gui/$(id -u)/local.desk-homekit`. The rest is read as it is used. `python3 tests/test_desk.py` checks all of this, and sundial's manual mode, without displays or a keyboard.
+
 ## Things to know
 
 - **The light must be in Infinity mode.** If its display shows `CH` and a number in the top-left, it is in 2.4G mode and Bluetooth is off. Hold the button marked `2.4G` for two seconds to switch.
@@ -377,6 +447,10 @@ The fixture's fade at bedtime goes down through the raw levels below 1%, to a si
 | Fixture command | `~/.local/bin/fixture` |
 | Fixture settings, last state, bulb addresses, pairing keys | `~/Library/Application Support/LightFixture/` |
 | Fixture logs | `~/Library/Logs/fixture-homekit.log`, `fixture-follow.log` |
+| Desk agent | `~/Library/LaunchAgents/local.desk-homekit.plist` |
+| Desk settings, pairing keys | `~/Library/Application Support/Desk/` |
+| Desk log | `~/Library/Logs/desk-homekit.log` |
+| Keyboard control file | `~/.local/state/wooting-workspaces/control` |
 
 `bridge.json` in the settings folder takes `port`, `namePrefixes`, `name`, `peripheralID`, `probeSeconds` and `logWrites`. Restart the bridge after changing it:
 
@@ -392,6 +466,7 @@ launchctl kickstart -k gui/$(id -u)/local.neewer-bridge
 ./install.sh homekit  # install or update the Apple Home service
 ./install.sh follow   # make the light follow the sun
 ./install.sh fixture  # the WiZ ceiling fixture: command, Apple Home service, sun follower
+./install.sh desk     # the monitors and the keyboard in Apple Home
 ./uninstall.sh        # add --purge to remove settings, pairing keys and logs too
 ```
 

@@ -1,0 +1,144 @@
+--- /Users/grayson/Library/Application Support/Desk/backup-wooting-2026-11-17/wooting-workspaces.c	2026-10-30 23:55:42
++++ /Users/grayson/.config/aerospace/wooting-workspaces.c	2026-11-17 03:14:47
+@@ -16,6 +16,9 @@
+ //
+ // Driven by `aerospace subscribe`, so aerospace.toml needs no hook.
+ //
++// Dimming: an optional control file, written by another program, dims and
++// tints everything shown here and can switch the board off (see read_control).
++//
+ // Build: ~/.config/aerospace/build-wooting-workspaces.sh
+ // Usage: wooting-workspaces          run as daemon (launchd)
+ //        wooting-workspaces test     show the number row, then the alt layer
+@@ -107,6 +110,53 @@
+ static pid_t sub_pid;
+ 
+ static void on_signal(int sig) { (void)sig; stop = 1; }
++
++// The control file: ~/.local/state/wooting-workspaces/control, re-read every
++// CONTROL_SECS. Another program writes it (the desk's Apple Home service, to
++// make the keyboard follow the sun); this stays the only writer of the LEDs.
++//   on 1                 0 = every key dark
++//   brightness 0.35      0-1, scales every colour
++//   tint 1.0 0.66 0.35   0-1 for red, green, blue: a warmer white
++//   base ffffff          colour of the keys not coloured here, or "profile"
++// No file, or a line left out, means on, full brightness, no tint, profile:
++// exactly as without it. The firmware draws the profile and can't be dimmed
++// from here, so any base but "profile" overrides those keys too.
++#define CONTROL_SECS 1
++static char control_path[1024];
++static struct { int on, base; double brightness, tint[3]; } ctl = {1, PROFILE, 1, {1, 1, 1}};
++
++static double unit(double x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
++
++static void read_control(void) {
++  FILE *f = *control_path ? fopen(control_path, "r") : NULL;
++  char line[128];
++  ctl.on = 1;
++  ctl.base = PROFILE;
++  ctl.brightness = ctl.tint[0] = ctl.tint[1] = ctl.tint[2] = 1;
++  while (f && fgets(line, sizeof line, f)) {
++    double a, b, c;
++    unsigned hex;
++    if (sscanf(line, "on %lf", &a) == 1) ctl.on = a != 0;
++    else if (sscanf(line, "brightness %lf", &a) == 1) ctl.brightness = unit(a);
++    else if (sscanf(line, "tint %lf %lf %lf", &a, &b, &c) == 3)
++      ctl.tint[0] = unit(a), ctl.tint[1] = unit(b), ctl.tint[2] = unit(c);
++    else if (sscanf(line, "base %x", &hex) == 1) ctl.base = hex & 0xffffff; // "profile" isn't hex: stays PROFILE
++  }
++  if (f) fclose(f);
++}
++
++// A colour dimmed and tinted as the control file says. A lit channel stays
++// lit, so a dim workspace key never goes out.
++static int controlled(int colour) {
++  int out = 0;
++  for (int i = 0; i < 3; i++) {
++    int shift = 16 - 8 * i, v = (colour >> shift) & 0xff;
++    int s = (int)(v * ctl.brightness * ctl.tint[i] + 0.5);
++    if (v && !s && ctl.brightness > 0 && ctl.tint[i] > 0) s = 1;
++    out |= s << shift;
++  }
++  return out;
++}
+ 
+ static double now_ms(void) {
+   struct timespec t;
+@@ -480,8 +530,17 @@
+ // a failed attempt enumerates every HID device. direct_set_key dereferences
+ // the device meta before connecting, so always come through here first.
+ static int keyboard(double now) {
++  static int was = -1;
+   if (now < kbd_retry_at) return 0;
+-  if (wooting_rgb_kbd_connected()) return 1;
++  int ok = wooting_rgb_kbd_connected();
++  if (ok != was && live) { // one line each time it comes or goes
++    char when[32];
++    time_t t = time(NULL);
++    strftime(when, sizeof when, "%F %T", localtime(&t));
++    fprintf(stderr, "%s: keyboard %s\n", when, ok ? "connected" : "not found");
++    was = ok;
++  }
++  if (ok) return 1;
+   kbd_retry_at = now + 2000;
+   return 0;
+ }
+@@ -521,7 +580,7 @@
+ 
+ // What every key should show: a binding layer on a dark board, or the profile
+ // with the workspace keys on top.
+-static void render(int want[ROWS][COLS]) {
++static void render_full(int want[ROWS][COLS]) {
+   for (int r = 0; r < ROWS; r++)
+     for (int c = 0; c < COLS; c++) want[r][c] = overlay_on && on_board(r, c) ? 0 : PROFILE;
+   if (overlay_on) {
+@@ -543,6 +602,17 @@
+   }
+ }
+ 
++// render_full as the control file wants it: dimmed, tinted, or all dark.
++static void render(int want[ROWS][COLS]) {
++  render_full(want);
++  for (int r = 0; r < ROWS; r++)
++    for (int c = 0; c < COLS; c++) {
++      if (!on_board(r, c)) continue;
++      int w = want[r][c] == PROFILE ? ctl.base : want[r][c];
++      want[r][c] = !ctl.on ? 0 : w == PROFILE ? PROFILE : controlled(w);
++    }
++}
++
+ // Sends the keys that changed, lit ones first so a layer's bindings show
+ // before the rest of the board goes dark. Each key takes about a millisecond,
+ // so a whole layer ~70 ms: if the modifiers change mid-way the rest is stale,
+@@ -706,6 +776,9 @@
+   hid_darwin_set_open_exclusive(0);
+   forget_keyboard();
+   wooting_rgb_set_disconnected_cb(forget_keyboard);
++  if (getenv("HOME"))
++    snprintf(control_path, sizeof control_path, "%s/.local/state/wooting-workspaces/control", getenv("HOME"));
++  read_control();
+   if (argc > 1 && strcmp(argv[1], "test") == 0) return run_test();
+   if (argc > 1 && strcmp(argv[1], "layers") == 0) return print_layers();
+   if (argc > 1 && strcmp(argv[1], "stress") == 0) return run_stress();
+@@ -719,8 +792,9 @@
+     int fd = start_subscribe();
+     if (fd < 0) { sleep(2); continue; }
+     load_bindings(); // AeroSpace may have restarted with a new config
++    read_control();  // here too, so the control file still counts while AeroSpace is down
+     ws_dirty = 1;
+-    double refreshed = now_ms();
++    double refreshed = now_ms(), control_read = refreshed;
+     update(refreshed, 1);
+     char buf[8192];
+     size_t len = 0;
+@@ -750,6 +824,10 @@
+         held = m;
+         held_since = now;
+       }
++      if (now - control_read >= CONTROL_SECS * 1000) { // a change repaints through the push below
++        control_read = now;
++        read_control();
++      }
+       int force = now - refreshed >= REFRESH_SECS * 1000;
+       if (force) {
+         refreshed = now;

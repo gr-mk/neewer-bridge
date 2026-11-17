@@ -9,6 +9,8 @@
 #   ./install.sh follow    make the light follow the sun, once a minute
 #   ./install.sh fixture   install the `fixture` command, its Apple Home
 #                          service and its sun follower (WiZ bulbs as one light)
+#   ./install.sh desk      install the desk's Apple Home service (the monitors
+#                          and the keyboard); needs `fixture` installed first
 #
 # Rebuilding the bridge changes its code signature, and macOS then asks for
 # Bluetooth permission again. That is why the build is skipped when the bridge
@@ -270,14 +272,83 @@ EOF
 	echo "Pause the sun follower with: fixture follow off"
 }
 
+# The desk: the monitors and the keyboard in Apple Home. It runs under the
+# fixture's launcher app, through `fixture host`, so it comes under the
+# local-network permission that app already has and macOS asks nothing new.
+install_desk() {
+	local support="$HOME/Library/Application Support/Desk"
+	local launcher="$HOME/Applications/FixtureHomeKit.app/Contents/MacOS/fixture-homekit"
+	local label=local.desk-homekit log="$HOME/Library/Logs/desk-homekit.log"
+	local agent="$HOME/Library/LaunchAgents/local.desk-homekit.plist"
+	if [ ! -x "$launcher" ] || [ ! -x "$SUPPORT/venv/bin/python" ]; then
+		echo "the fixture's launcher app is needed first: ./install.sh fixture" >&2
+		exit 1
+	fi
+	if ! grep -q "def cmd_manual" "$HOME/bin/sundial" 2>/dev/null; then
+		echo "note: ~/bin/sundial has no \`manual\` command; Home cannot set the monitors until it has (see monitors/sundial)" >&2
+	fi
+	mkdir -p "$support/homekit" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+	install -m 644 "$HERE/desk/desk_homekit.py" "$support/homekit/desk_homekit.py"
+	# `fixture host` must be in the copy the launcher runs.
+	install -m 644 "$HERE/fixture/fixture" "$HOME/Library/Application Support/LightFixture/homekit/fixture_cli.py"
+	cat >"$agent" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>$label</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>$launcher</string>
+		<string>host</string>
+		<string>$support/homekit/desk_homekit.py</string>
+	</array>
+	<key>AssociatedBundleIdentifiers</key>
+	<string>local.fixture-homekit</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>15</integer>
+	<key>LimitLoadToSessionType</key>
+	<string>Aqua</string>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardOutPath</key>
+	<string>$log</string>
+	<key>StandardErrorPath</key>
+	<string>$log</string>
+</dict>
+</plist>
+EOF
+	launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
+	local attempt loaded=no
+	for attempt in 1 2 3 4 5; do
+		if launchctl bootstrap "$DOMAIN" "$agent" 2>/dev/null; then
+			loaded=yes
+			break
+		fi
+		sleep 1
+	done
+	if [ "$loaded" = no ]; then
+		echo "could not load the agent; try: launchctl bootstrap $DOMAIN \"$agent\"" >&2
+		exit 1
+	fi
+	echo "agent $label loaded; log at $log"
+	echo "Setup code: \"$SUPPORT/venv/bin/python\" \"$support/homekit/desk_homekit.py\" --pairing"
+}
+
 case "${1:-}" in
 "") install_bridge ;;
 cli) install_cli ;;
 homekit) install_homekit ;;
 follow) install_follow ;;
 fixture) install_fixture ;;
+desk) install_desk ;;
 *)
-	echo "usage: $0 [cli|homekit|follow|fixture]" >&2
+	echo "usage: $0 [cli|homekit|follow|fixture|desk]" >&2
 	exit 2
 	;;
 esac

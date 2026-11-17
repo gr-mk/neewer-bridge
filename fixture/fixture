@@ -1248,6 +1248,18 @@ def cmd_brightness(fixture, args):
     set_fixture(fixture, on=True, brightness=args.brightness)
 
 
+def cmd_host(fixture, args):
+    """Runs another Python program of this project in this process.
+
+    The launcher app starts this command, so a program run this way is the
+    app's child too and comes under the local-network permission the app
+    already has. The desk's Apple Home service is started like this.
+    """
+    import runpy
+    sys.argv = [args.script] + args.arguments
+    runpy.run_path(args.script, run_name="__main__")
+
+
 def cmd_fade(fixture, args):
     """Shows, or tries to set, how long the bulbs themselves take to change.
 
@@ -1508,6 +1520,9 @@ def build_parser():
         colour.add_argument("brightness", type=level)
     brightness = add("brightness", cmd_brightness, "change the brightness, keep the colour")
     brightness.add_argument("brightness", type=level)
+    host = add("host", cmd_host, "run another program of this project under the launcher app")
+    host.add_argument("script")
+    host.add_argument("arguments", nargs=argparse.REMAINDER)
     fade = add("fade", cmd_fade, "show the bulbs' own fade time, or try to set it: fixture fade 100")
     fade.add_argument("milliseconds", nargs="?", type=whole(0, 10000, "milliseconds"))
     sweep = add("sweep", cmd_sweep, "move slowly between two brightnesses: fixture sweep 1.2 0.8 --seconds 60")
@@ -1534,7 +1549,7 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
-        fixture = None if args.handler is cmd_discover else Fixture()
+        fixture = None if args.handler in (cmd_discover, cmd_host) else Fixture()
         args.handler(fixture, args)
     except Failure as failure:
         if getattr(args, "action", None) == "apply":

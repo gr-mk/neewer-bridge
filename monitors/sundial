@@ -1,0 +1,326 @@
+#!/usr/bin/python3
+"""sundial: make external displays follow the sun.
+
+Brightness tracks the sun's elevation (with a floor); colour temperature warms
+at sunset and again before bedtime, like f.lux.
+
+  sundial                  apply the values for right now (what launchd runs every minute)
+  sundial status [--json]  show sun position, target and applied values
+  sundial day [YYYY-MM-DD] print the whole day's curve in 30-minute steps
+  sundial pause [MIN|sunrise]  stop adjusting and remove the tint (default 60 minutes)
+  sundial movie [MIN]      keep colour no warmer than movie_kelvin (default 150 minutes)
+  sundial manual [MIN] [brightness=N|sun] [kelvin=K|sun]
+                           hold a brightness and/or colour set by hand (default 120 minutes);
+                           values not given keep following the sun, or an earlier manual value
+  sundial resume           cancel pause / movie / manual mode
+
+Config:  ~/.config/sundial/config.ini
+State:   ~/.local/state/sundial/state.json  (rewritten every run; readable by other systems)
+"""
+import configparser
+import fcntl
+import json
+import math
+import os
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+
+HOME = os.path.expanduser("~")
+CONFIG = os.environ.get("SUNDIAL_CONFIG", HOME + "/.config/sundial/config.ini")
+STATE = os.environ.get("SUNDIAL_STATE", HOME + "/.local/state/sundial/state.json")
+M1DDC = "/opt/homebrew/bin/m1ddc"
+NIGHTSHIFT = HOME + "/bin/sundial-nightshift"
+NIGHTSHIFT_MAX_K = 6000   # coolest tint Night Shift can produce; above this it is switched off
+REFRESH_MINUTES = 10      # re-send values this often even if unchanged (displays forget, get power-cycled)
+
+DEFAULTS = {
+    "location": {"latitude": "40.71", "longitude": "-74.01"},
+    "brightness": {"enabled": "true", "floor": "20", "max": "100", "dark_below": "-6", "full_above": "20"},
+    "color": {"day": "6500", "sunset": "3400", "bedtime": "2700",
+              "warm_from": "10", "warm_until": "-4", "movie_kelvin": "5000"},
+    "sleep": {"wake": "07:00", "bedtime": "23:00", "wind_down_minutes": "90"},
+}
+
+
+def load_config():
+    cp = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    cp.read_dict(DEFAULTS)
+    cp.read(CONFIG)
+    return cp
+
+
+def clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+def smooth(x):
+    x = clamp(x)
+    return x * x * (3 - 2 * x)
+
+
+def sun_elevation(when, lat, lon):
+    """Solar elevation in degrees (low-precision almanac formula, good to ~0.01 deg)."""
+    n = when.timestamp() / 86400.0 + 2440587.5 - 2451545.0
+    g = math.radians((357.528 + 0.9856003 * n) % 360)
+    lam = math.radians((280.460 + 0.9856474 * n) % 360 + 1.915 * math.sin(g) + 0.020 * math.sin(2 * g))
+    eps = math.radians(23.439 - 0.0000004 * n)
+    ra = math.atan2(math.cos(eps) * math.sin(lam), math.cos(lam))
+    dec = math.asin(math.sin(eps) * math.sin(lam))
+    gmst_hours = (18.697374558 + 24.06570982441908 * n) % 24
+    ha = math.radians(gmst_hours * 15 + lon) - ra
+    la = math.radians(lat)
+    return math.degrees(math.asin(math.sin(la) * math.sin(dec) + math.cos(la) * math.cos(dec) * math.cos(ha)))
+
+
+def hhmm(s):
+    h, m = s.strip().split(":")
+    return int(h) * 60 + int(m)
+
+
+def bedtime_factor(when, cfg):
+    """0 during the day, ramps to 1 over the wind-down before bedtime, back to 0 after waking."""
+    bed, wake = hhmm(cfg["sleep"]["bedtime"]), hhmm(cfg["sleep"]["wake"])
+    wind = max(1, cfg["sleep"].getint("wind_down_minutes"))
+    wake_ramp = 30
+    now = when.hour * 60 + when.minute + when.second / 60.0
+    x = (now - (bed - wind)) % 1440
+    night = (wake - bed) % 1440
+    if x < wind:
+        return smooth(x / wind)
+    if x < wind + night:
+        return 1.0
+    if x < wind + night + wake_ramp:
+        return 1.0 - smooth((x - wind - night) / wake_ramp)
+    return 0.0
+
+
+def target(when, cfg):
+    """Everything sundial wants at local time `when` (ignoring pause / movie)."""
+    b, c = cfg["brightness"], cfg["color"]
+    elev = sun_elevation(when, cfg["location"].getfloat("latitude"), cfg["location"].getfloat("longitude"))
+    lo, hi = math.radians(b.getfloat("dark_below")), math.radians(b.getfloat("full_above"))
+    daylight = clamp((math.sin(math.radians(elev)) - math.sin(lo)) / (math.sin(hi) - math.sin(lo)))
+    brightness = round(b.getfloat("floor") + (b.getfloat("max") - b.getfloat("floor")) * daylight)
+
+    w0, w1 = c.getfloat("warm_from"), c.getfloat("warm_until")
+    sun_k = c.getfloat("day") + (c.getfloat("sunset") - c.getfloat("day")) * smooth((w0 - elev) / (w0 - w1))
+    bed = bedtime_factor(when, cfg)
+    kelvin = min(sun_k, sun_k + (c.getfloat("bedtime") - sun_k) * bed)
+    return {
+        "sun_elevation": round(elev, 2),
+        "daylight": round(daylight, 3),
+        "bedtime": round(bed, 3),
+        "brightness": int(brightness),
+        "kelvin": int(round(kelvin / 10.0) * 10),
+    }
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, STATE)
+
+
+def active_override(state, now):
+    ov = state.get("override")
+    if ov and datetime.fromisoformat(ov["until"]) > now:
+        return ov
+    state.pop("override", None)
+    return None
+
+
+def display_count():
+    try:
+        out = subprocess.run([M1DDC, "display", "list"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    return sum(1 for line in out.splitlines() if line.startswith("["))
+
+
+def set_brightness(n):
+    count = display_count()
+    for i in range(1, count + 1):
+        subprocess.run([M1DDC, "display", str(i), "set", "luminance", str(n)],
+                       capture_output=True, timeout=20)
+    return count
+
+
+def set_kelvin(k):
+    args = ["off"] if k > NIGHTSHIFT_MAX_K else ["kelvin", str(k)]
+    return subprocess.run([NIGHTSHIFT] + args, capture_output=True, timeout=20).returncode == 0
+
+
+def apply(cfg, force=False):
+    now = datetime.now().astimezone()
+    state = load_state()
+    want = target(now, cfg)
+    ov = active_override(state, now)
+    brightness, kelvin = want["brightness"], want["kelvin"]
+    if not cfg["brightness"].getboolean("enabled"):
+        brightness = None                        # colour only (e.g. a laptop's built-in display)
+    if ov and ov["mode"] == "pause":
+        brightness, kelvin = None, 6500          # leave brightness alone, no tint
+    elif ov and ov["mode"] == "movie":
+        kelvin = max(kelvin, cfg["color"].getint("movie_kelvin"))
+    elif ov and ov["mode"] == "manual":          # "target" stays the sun's; only what is applied changes
+        brightness, kelvin = ov.get("brightness", brightness), ov.get("kelvin", kelvin)
+
+    applied = state.get("applied", {})
+    last = applied.get("at")
+    stale = force or not last or now - datetime.fromisoformat(last) >= timedelta(minutes=REFRESH_MINUTES)
+    new_b = brightness is not None and applied.get("brightness") != brightness
+    new_k = applied.get("kelvin") != kelvin
+    changed = []                                  # only real changes are logged, not refreshes
+    if brightness is not None and (stale or new_b):
+        if set_brightness(brightness):
+            applied["brightness"] = brightness
+            if new_b:
+                changed.append("brightness %d" % brightness)
+    if stale or new_k:
+        if set_kelvin(kelvin):
+            applied["kelvin"] = kelvin
+            if new_k:
+                changed.append("kelvin %d" % kelvin)
+    if stale:
+        applied["at"] = now.isoformat(timespec="seconds")
+
+    state.update({"updated": now.isoformat(timespec="seconds"), "target": want, "applied": applied})
+    save_state(state)
+    if changed:
+        print("%s  sun %+.1f  %s" % (now.strftime("%F %T"), want["sun_elevation"], ", ".join(changed)), flush=True)
+
+
+def next_sunrise(cfg, now):
+    lat, lon = cfg["location"].getfloat("latitude"), cfg["location"].getfloat("longitude")
+    t, was_down = now, sun_elevation(now, lat, lon) < -0.833
+    for _ in range(1500):
+        t += timedelta(minutes=1)
+        up = sun_elevation(t, lat, lon) >= -0.833
+        if up and was_down:
+            return t
+        was_down = not up
+    return now + timedelta(hours=12)
+
+
+def cmd_override(cfg, mode, arg):
+    now = datetime.now().astimezone()
+    if arg == "sunrise":
+        until = next_sunrise(cfg, now)
+    else:
+        until = now + timedelta(minutes=float(arg))
+    state = load_state()
+    state["override"] = {"mode": mode, "until": until.isoformat(timespec="seconds")}
+    save_state(state)
+    apply(cfg, force=True)
+    print("%s until %s" % (mode, until.strftime("%H:%M")))
+
+
+def cmd_manual(cfg, args):
+    """Hold values set by hand, e.g. from Apple Home. `sun` hands a value back to the sun."""
+    now = datetime.now().astimezone()
+    state = load_state()
+    ov = active_override(state, now)
+    new = {key: ov[key] for key in ("brightness", "kelvin") if ov and ov["mode"] == "manual" and key in ov}
+    minutes = 120.0
+    for arg in args:
+        key, eq, value = arg.partition("=")
+        if not eq:
+            minutes = float(arg)
+        elif key in ("brightness", "kelvin") and value == "sun":
+            new.pop(key, None)
+        elif key == "brightness":
+            new[key] = int(clamp(float(value), 0, 100))
+        elif key == "kelvin":
+            new[key] = int(clamp(float(value), 1000, 6500))
+        else:
+            raise SystemExit("sundial manual: unknown setting %r" % arg)
+    until = now + timedelta(minutes=minutes)
+    state["override"] = dict(new, mode="manual", until=until.isoformat(timespec="seconds"))
+    save_state(state)
+    apply(cfg, force=True)
+    print("manual %s until %s" % (" ".join("%s=%s" % kv for kv in sorted(new.items())) or "(nothing held)",
+                                  until.strftime("%H:%M")))
+
+
+def cmd_status(cfg, as_json):
+    now = datetime.now().astimezone()
+    state = load_state()
+    info = {"time": now.isoformat(timespec="seconds"), "target": target(now, cfg),
+            "applied": state.get("applied", {}), "override": active_override(state, now)}
+    if as_json:
+        print(json.dumps(info, indent=2))
+        return
+    t, a = info["target"], info["applied"]
+    print("sun elevation  %+.1f deg   daylight %.0f%%   bedtime %.0f%%" %
+          (t["sun_elevation"], t["daylight"] * 100, t["bedtime"] * 100))
+    print("target         brightness %d, %d K" % (t["brightness"], t["kelvin"]))
+    print("applied        brightness %s, %s K  (last full refresh %s)" %
+          (a.get("brightness", "?"), a.get("kelvin", "?"), a.get("at", "never")))
+    if info["override"]:
+        held = ["%s=%s" % (k, info["override"][k]) for k in ("brightness", "kelvin") if k in info["override"]]
+        print("override       %s until %s" % (" ".join([info["override"]["mode"]] + held), info["override"]["until"]))
+
+
+def cmd_day(cfg, date):
+    start = datetime.strptime(date, "%Y-%m-%d").astimezone() if date else \
+        datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    lat, lon = cfg["location"].getfloat("latitude"), cfg["location"].getfloat("longitude")
+    prev = sun_elevation(start, lat, lon)
+    for m in range(1, 1441):
+        e = sun_elevation(start + timedelta(minutes=m), lat, lon)
+        if (prev < -0.833) != (e < -0.833):
+            print("%s  %s" % ("sunrise" if e > prev else "sunset ", (start + timedelta(minutes=m)).strftime("%H:%M")))
+        prev = e
+    print("\ntime    sun     brightness  kelvin")
+    for m in range(0, 1440, 30):
+        t = target(start + timedelta(minutes=m), cfg)
+        print("%s  %+6.1f  %4d %-6s %5d" % ((start + timedelta(minutes=m)).strftime("%H:%M"),
+              t["sun_elevation"], t["brightness"], "#" * (t["brightness"] // 10), t["kelvin"]))
+
+
+def main(argv):
+    cfg = load_config()
+    cmd = argv[0] if argv else "apply"
+    if cmd in ("apply", "pause", "movie", "manual", "resume"):
+        # One run at a time changes the state file and the displays, so the
+        # minute timer and a command cannot overwrite each other's override.
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        lock = open(STATE + ".lock", "w")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    if cmd == "apply":
+        apply(cfg, force="--force" in argv)
+    elif cmd == "status":
+        cmd_status(cfg, "--json" in argv)
+    elif cmd == "day":
+        cmd_day(cfg, argv[1] if len(argv) > 1 else None)
+    elif cmd == "pause":
+        cmd_override(cfg, "pause", argv[1] if len(argv) > 1 else "60")
+    elif cmd == "movie":
+        cmd_override(cfg, "movie", argv[1] if len(argv) > 1 else "150")
+    elif cmd == "manual":
+        cmd_manual(cfg, argv[1:])
+    elif cmd == "resume":
+        state = load_state()
+        state.pop("override", None)
+        save_state(state)
+        apply(cfg, force=True)
+    else:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
