@@ -213,7 +213,7 @@ install_fixture() {
 			echo "none found; switch the fixture on and run: fixture discover --save" >&2
 	fi
 	if [ ! -f "$support/follow.json" ]; then
-		printf '{\n  "enabled": true,\n  "day_brightness": 100,\n  "night_brightness": 5,\n  "night_kelvin": 2700,\n  "hold_minutes": 120\n}\n' >"$support/follow.json"
+		printf '{\n  "enabled": true,\n  "day_brightness": 100,\n  "night_brightness": 1,\n  "night_kelvin": 2700,\n  "hold_minutes": 120\n}\n' >"$support/follow.json"
 		echo "wrote default $support/follow.json"
 	fi
 	if [ ! -f "$HOME/.local/state/sundial/state.json" ]; then

@@ -86,7 +86,9 @@ def home_values(setting, settings):
         hue, saturation = kelvin_to_hue_saturation(setting["kelvin"])
     return {
         "On": bool(setting["on"]),
-        "Brightness": setting["brightness"],
+        # Home's brightness is a whole number. A fraction is shown rounded,
+        # and anything lit shows as at least 1.
+        "Brightness": cli.clamp(1, int(round(setting["brightness"])), 100),
         "Hue": hue,
         "Saturation": saturation,
         "ColorTemperature": kelvin_to_mired(setting["kelvin"], settings),
@@ -109,7 +111,11 @@ def apply_home_values(setting, values, fixture):
             setting["saturation"] = cli.clamp(0, int(round(values["Saturation"])), 100)
     if "Brightness" in values:
         # Home sends 0 only together with "off"; the bulbs have no 0.
-        setting["brightness"] = cli.clamp(1, int(values["Brightness"]), 100)
+        # A whole number from Home is every bulb at that dimming. Home also
+        # writes back the number it was shown; that is not a change, and must
+        # not round a fraction away.
+        if int(values["Brightness"]) != cli.clamp(1, int(round(setting["brightness"])), 100):
+            setting["brightness"] = float(cli.clamp(1, int(values["Brightness"]), 100))
     if "On" in values:
         setting["on"] = bool(values["On"])
     return setting

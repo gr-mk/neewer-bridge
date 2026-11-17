@@ -162,42 +162,99 @@ class Case(unittest.TestCase):
         return len(lit), sorted({bulb["dimming"] for bulb in lit})
 
 
-class LevelsTest(unittest.TestCase):
-    def test_low_levels_light_fewer_bulbs(self):
-        for brightness in range(1, 7):
-            self.assertEqual(cli.levels(brightness, 7, 1), (brightness, 1))
-        self.assertEqual(cli.levels(7, 7, 1), (7, 1))
-        self.assertEqual(cli.levels(8, 7, 1), (7, 2))
-        self.assertEqual(cli.levels(100, 7, 1), (7, 100))
+RING = MACS[1:]  # the stand-in layout: the first bulb is the centre
 
-    def test_a_higher_floor(self):
-        self.assertEqual(cli.levels(1, 7, 10), (1, 10))
-        self.assertEqual(cli.levels(6, 7, 10), (6, 10))
-        self.assertEqual(cli.levels(7, 7, 10), (7, 10))
-        self.assertEqual(cli.levels(100, 7, 10), (7, 100))
 
-    def test_light_never_falls_as_brightness_rises(self):
-        for floor in (1, 5, 10, 25):
-            light = [lit * dimming for lit, dimming in (cli.levels(b, 7, floor) for b in range(1, 101))]
-            self.assertEqual(light, sorted(light))
-            self.assertEqual(light[0], floor)
-            self.assertEqual(light[-1], 700)
-            for lit, dimming in (cli.levels(b, 7, floor) for b in range(1, 101)):
-                self.assertTrue(floor <= dimming <= 100 and 1 <= lit <= 7)
-
-    def test_no_step_more_than_doubles_the_light(self):
-        light = [lit * dimming for lit, dimming in (cli.levels(b, 7, 1) for b in range(1, 101))]
-        for lower, higher in zip(light, light[1:]):
-            self.assertLessEqual(higher, 2 * lower)
-
-    def test_brightness_is_read_back_from_the_bulbs(self):
+class SplitTest(unittest.TestCase):
+    def test_a_whole_number_is_every_bulb_at_that_dimming(self):
         for brightness in range(1, 101):
-            lit, dimming = cli.levels(brightness, 7, 1)
-            self.assertEqual(cli.brightness_for(lit * dimming, 7, 1), brightness)
+            singled, _, others = cli.split(brightness, 7, 1)
+            self.assertEqual((singled, others), (0, brightness))
 
-    def test_one_bulb_is_just_dimmed(self):
-        self.assertEqual(cli.levels(3, 1, 10), (1, 10))
-        self.assertEqual(cli.levels(40, 1, 10), (1, 40))
+    def test_below_one_percent_lights_fewer_bulbs(self):
+        for bulbs in range(1, 7):
+            self.assertEqual(cli.split(bulbs / 7.0, 7, 1), (bulbs, 1, 0))
+        self.assertEqual(cli.split(0.4, 7, 1), (3, 1, 0))
+        self.assertEqual(cli.split(0.001, 7, 1), (1, 1, 0))  # never none
+
+    def test_a_fraction_puts_some_bulbs_one_step_higher(self):
+        self.assertEqual(cli.split(12.5, 7, 1), (4, 13, 12))
+        self.assertEqual(cli.split(1.5, 7, 1), (3, 2, 1))
+        self.assertEqual(cli.split(99.9, 7, 1), (6, 100, 99))
+
+    def test_the_light_rises_one_step_at_a_time(self):
+        light = []
+        for units in range(1, 701):
+            singled, dimming, others = cli.split(units / 7.0, 7, 1)
+            light.append(singled * dimming + (7 - singled) * others)
+            self.assertTrue(dimming <= 100 or singled == 0)
+        self.assertEqual(light, list(range(1, 701)))
+
+    def test_a_colour_cannot_go_below_ten(self):
+        self.assertEqual(cli.split(10, 7, 10), (0, 11, 10))
+        self.assertEqual(cli.split(10.5, 7, 10), (4, 11, 10))
+        self.assertEqual(cli.split(5, 7, 10), (4, 10, 0))   # 35 units: nearest to four bulbs at 10
+        self.assertEqual(cli.split(1, 7, 10), (1, 10, 0))
+        self.assertEqual(cli.split(9.9, 7, 10), (7, 10, 0))
+
+    def test_percent(self):
+        self.assertEqual([cli.percent(b) for b in (0.43, 1.0, 12.5, 37.57, 100)],
+                         ["0.4%", "1%", "12.5%", "37.6%", "100%"])
+
+
+class PatternTest(Case):
+    def layout(self, centre, ring, **more):
+        saved = cli.read_json(cli.path("fixture.json"), {})
+        saved.update(centre=centre, ring=ring, **more)
+        cli.write_json(cli.path("fixture.json"), saved)
+
+    def test_the_patterns_are_symmetric(self):
+        centre, ring = MACS[3], [MACS[6], MACS[0], MACS[5], MACS[1], MACS[4], MACS[2]]
+        self.layout(centre, ring, layout_mapped=True)
+        expected = {
+            0: [],
+            1: [centre],
+            2: [ring[0], ring[3]],
+            3: [ring[0], ring[2], ring[4]],
+            4: [centre, ring[0], ring[2], ring[4]],
+            5: [centre, ring[0], ring[1], ring[3], ring[4]],
+            6: ring,
+            7: [centre] + ring,
+        }
+        for number, bulbs in expected.items():
+            self.assertEqual(sorted(self.fixture.singled(number)), sorted(bulbs), number)
+
+    def test_the_list_order_stands_in_until_the_layout_is_mapped(self):
+        self.assertEqual(self.fixture.layout(), (MACS[0], RING))
+        self.assertEqual(self.fixture.singled(2), [RING[0], RING[3]])
+        self.layout(MACS[0], RING[:4])  # not a whole layout
+        self.assertEqual(self.fixture.layout(), (MACS[0], RING))
+        self.layout("zz", RING)
+        self.assertEqual(self.fixture.layout(), (MACS[0], RING))
+
+    def test_a_new_layout_is_used_without_starting_again(self):
+        self.set(brightness=1 / 7.0)
+        self.assertEqual(self.net.lit(), [MACS[0]])
+        self.layout(MACS[2], [MACS[0], MACS[1], MACS[3], MACS[4], MACS[5], MACS[6]], layout_mapped=True)
+        self.set(brightness=1 / 7.0)
+        self.assertEqual(self.net.lit(), [MACS[2]])
+
+    def test_below_one_percent_on_the_bulbs(self):
+        for number, bulbs in ((1, [MACS[0]]), (2, [RING[0], RING[3]]), (3, [RING[0], RING[2], RING[4]]),
+                              (4, [MACS[0], RING[0], RING[2], RING[4]]), (6, RING)):
+            self.set(brightness=number / 7.0)
+            self.assertEqual(sorted(self.net.lit()), sorted(bulbs))
+            self.assertEqual(self.shown(), (number, [1]))
+
+    def test_the_extra_step_goes_to_the_pattern_too(self):
+        self.set(brightness=12 + 5 / 7.0)
+        higher = sorted(bulb["mac"] for bulb in self.net.bulbs.values() if bulb["dimming"] == 13)
+        self.assertEqual(higher, sorted([MACS[0], RING[0], RING[1], RING[3], RING[4]]))
+        self.assertEqual(self.shown(), (7, [12, 13]))
+
+    def test_other_numbers_of_bulbs_use_the_list_order(self):
+        cli.write_json(cli.path("fixture.json"), {"bulbs": MACS[:4], "min_dimming": 1})
+        self.assertEqual(cli.Fixture().singled(2), MACS[:2])
 
 
 class FanOutTest(Case):
@@ -205,7 +262,7 @@ class FanOutTest(Case):
         missed = self.set(kelvin=3000, brightness=50)
         self.assertEqual(missed, [])
         for bulb in self.net.bulbs.values():
-            self.assertEqual((bulb["state"], bulb["temp"], bulb["dimming"]), (True, 3000, 47))
+            self.assertEqual((bulb["state"], bulb["temp"], bulb["dimming"]), (True, 3000, 50))
         self.assertEqual(len(self.net.packets("setPilot")), 7)
 
     def test_the_packets_leave_together(self):
@@ -260,8 +317,8 @@ class FanOutTest(Case):
         self.net.bulbs[first], self.net.bulbs[last] = self.net.bulbs[last], self.net.bulbs[first]
         self.net.bulbs["10.0.0.99"] = self.net.bulbs.pop(self.net.address(MACS[1]))
         self.fixture.reconcile()  # the command and the service look before they set
-        self.assertEqual(self.set(kelvin=3500, brightness=3), [])
-        self.assertEqual(sorted(self.net.lit()), MACS[:3])
+        self.assertEqual(self.set(kelvin=3500, brightness=3 / 7.0), [])
+        self.assertEqual(sorted(self.net.lit()), [RING[0], RING[2], RING[4]])
         self.assertEqual(self.fixture.addresses[MACS[1]], "10.0.0.99")
         self.assertEqual(self.fixture.addresses[MACS[0]], last)
 
@@ -290,36 +347,56 @@ class FanOutTest(Case):
 
 
 class BrightnessTest(Case):
-    def test_low_white_switches_bulbs_off(self):
-        self.set(brightness=3)
-        self.assertEqual(sorted(self.net.lit()), MACS[:3])
+    def test_whole_numbers_light_every_bulb_alike(self):
+        for brightness in (1, 2, 37, 100):
+            self.set(brightness=brightness)
+            self.assertEqual(self.shown(), (7, [brightness]))
+
+    def test_below_one_percent_switches_bulbs_off(self):
+        self.set(brightness=0.4)
         self.assertEqual(self.shown(), (3, [1]))
-        self.set(brightness=7)
-        self.assertEqual(self.shown(), (7, [1]))
         self.set(brightness=1)
-        self.assertEqual(self.net.lit(), MACS[:1])
+        self.assertEqual(self.shown(), (7, [1]))
+
+    def test_between_whole_numbers(self):
+        self.set(brightness=12.5)
+        self.assertEqual(self.shown(), (7, [12, 13]))
+        self.assertEqual(sum(bulb["dimming"] for bulb in self.net.bulbs.values()), 88)
+        self.assertEqual(self.setting()["brightness"], 12.5)  # the bulbs agree; nothing is re-read
 
     def test_bulbs_kept_off_still_get_the_look(self):
-        self.set(kelvin=3000, brightness=2)
+        self.set(kelvin=3000, brightness=0.3)
         for bulb in self.net.bulbs.values():
             self.assertEqual((bulb["temp"], bulb["dimming"]), (3000, 1))
 
     def test_colour_has_a_higher_floor(self):
-        self.set(mode="colour", hue=0, saturation=100, brightness=4)
+        self.set(mode="colour", hue=0, saturation=100, brightness=5)
         self.assertEqual(self.shown(), (4, [10]))
         self.assertEqual(self.net.bulb(MACS[0])["r"], 255)
-        self.assertEqual(self.setting()["brightness"], 4)
+        self.assertEqual(self.setting()["brightness"], 5)
+        self.set(mode="colour", hue=0, saturation=100, brightness=10)
+        self.assertEqual(self.shown(), (7, [10]))
 
     def test_off_switches_every_bulb_off_and_on_brings_the_setting_back(self):
-        self.set(brightness=3)
+        self.set(brightness=0.4)
         self.fixture.apply(dict(self.setting(), on=False), "cli")
         self.assertEqual(self.net.lit(), [])
         self.fixture.apply(dict(self.setting(), on=True), "cli")
         self.assertEqual(self.shown(), (3, [1]))
 
+    def test_how_it_is_described(self):
+        setting = dict(cli.DEFAULT_SETTING, on=True, kelvin=2700)
+        self.assertEqual(self.fixture.describe(dict(setting, brightness=0.43)), "white 2700K at 0.4% (3 of 7 bulbs lit)")
+        self.assertEqual(self.fixture.describe(dict(setting, brightness=37.57)), "white 2700K at 37.6%")
+        self.assertEqual(self.fixture.describe_bulbs(dict(setting, brightness=0.43)), "3 of 7 bulbs at 1%, the rest off")
+        self.assertEqual(self.fixture.describe_bulbs(dict(setting, brightness=12.5)), "4 bulbs at 13%, 3 at 12%")
+        self.assertEqual(self.fixture.describe_bulbs(dict(setting, brightness=12)), "all 7 bulbs at 12%")
+
     def test_the_command_line(self):
-        self.assertEqual(cli.main(["white", "3000", "5"]), 0)
+        self.assertEqual(cli.main(["white", "3000", "0.7"]), 0)
         self.assertEqual(self.shown(), (5, [1]))
+        self.assertEqual(cli.main(["brightness", "12.5"]), 0)
+        self.assertEqual(self.shown(), (7, [12, 13]))
         self.assertEqual(cli.main(["brightness", "100"]), 0)
         self.assertEqual(self.shown(), (7, [100]))
         self.assertEqual(cli.main(["off"]), 0)
@@ -371,18 +448,38 @@ class ElsewhereTest(Case):
         self.assertTrue(state["setting"]["on"])
         self.assertEqual((state["by"], state["set_at"]), (before["by"], before["set_at"]))
 
+    def test_mixed_levels_are_not_taken_for_a_change(self):
+        self.set(brightness=12.5)
+        before = self.fixture.state()
+        state, _ = self.fixture.reconcile()
+        self.assertEqual(state, before)
+        self.net.bulb(MACS[2])["dimming"] = 40
+        state, _ = self.fixture.reconcile()
+        self.assertEqual(state["by"], "elsewhere")
+        self.assertEqual(state["setting"]["brightness"], round((88 - 12 + 40) / 7.0, 2))
+
+    def test_power_back_at_the_wall_with_mixed_levels(self):
+        self.set(brightness=12.5)
+        for bulb in self.net.bulbs.values():
+            bulb["state"] = False
+        self.assertFalse(self.setting()["on"])
+        for bulb in self.net.bulbs.values():
+            bulb["state"] = True
+        state, _ = self.fixture.reconcile()
+        self.assertEqual((state["setting"]["on"], state["setting"]["brightness"], state["by"]), (True, 12.5, "cli"))
+
     def test_power_back_at_the_wall_keeps_the_low_level(self):
-        self.set(brightness=3)
+        self.set(brightness=0.43)
         before = self.fixture.state()
         for bulb in self.net.bulbs.values():
             bulb["state"] = True  # a bulb comes back on when its power returns
         state, _ = self.fixture.reconcile()
-        self.assertEqual(sorted(self.net.lit()), MACS[:3])
-        self.assertEqual(state["setting"]["brightness"], 3)
+        self.assertEqual(sorted(self.net.lit()), [RING[0], RING[2], RING[4]])
+        self.assertEqual(state["setting"]["brightness"], 0.43)
         self.assertEqual(state["by"], before["by"])
 
     def test_a_dry_look_changes_nothing(self):
-        self.set(brightness=3)
+        self.set(brightness=0.43)
         for bulb in self.net.bulbs.values():
             bulb["state"] = True
         sent = len(self.net.packets("setPilot"))
@@ -413,11 +510,11 @@ class FollowTest(Case):
     def test_day_night_and_between(self):
         follow = cli.follow_settings()
         self.assertEqual(cli.follow_target(DAY, follow, self.fixture), (6500, 100))
-        self.assertEqual(cli.follow_target(NIGHT, follow, self.fixture), (2700, 5))
+        self.assertEqual(cli.follow_target(NIGHT, follow, self.fixture), (2700, 1))
         kelvin, brightness = cli.follow_target(DUSK, follow, self.fixture)
-        self.assertEqual((kelvin, brightness), (4100, 29))
+        self.assertEqual((kelvin, brightness), (4100, 25.75))  # not rounded to a whole number
         halfway = {"sun_elevation": -3.0, "daylight": 0.0, "kelvin": 3400}
-        self.assertEqual(cli.follow_target(halfway, follow, self.fixture), (3000, 5))  # 3050 rounds to even
+        self.assertEqual(cli.follow_target(halfway, follow, self.fixture), (3000, 1))  # 3050 rounds to even
 
     def test_colour_stays_inside_the_bulbs_range(self):
         follow = dict(cli.follow_settings(), night_kelvin=1800)
@@ -433,15 +530,34 @@ class FollowTest(Case):
         self.assertIsNone(self.apply(1))  # nothing changed, nothing said
         self.assertEqual(len(self.net.packets("setPilot")), 14)
 
-    def test_night_is_five_bulbs_at_their_lowest(self):
+    def test_night_is_every_bulb_at_its_lowest(self):
         line = self.apply(target=NIGHT)
-        self.assertIn("white 2700K at 5% (5 of 7 bulbs at 1%)", line)
-        self.assertEqual(self.shown(), (5, [1]))
+        self.assertTrue(line.endswith("white 2700K at 1%"), line)
+        self.assertEqual(self.shown(), (7, [1]))
+
+    def test_a_night_level_below_one_percent(self):
+        cli.write_json(cli.path("follow.json"), {"night_brightness": 0.4})
+        line = self.apply(target=NIGHT)
+        self.assertIn("white 2700K at 0.4% (3 of 7 bulbs lit)", line)
+        self.assertEqual(self.shown(), (3, [1]))
+
+    def test_dusk_moves_one_bulb_at_a_time(self):
+        self.apply()
+        sun = dict(DUSK)
+        self.assertIn("white 4100K at 25.8%", self.apply(1, sun))  # 25.75: 180 units
+        self.assertEqual(sum(bulb["dimming"] for bulb in self.net.bulbs.values()), 180)
+        sent = len(self.net.packets("setPilot"))
+        sun["daylight"] = 0.2501  # less than one bulb's step: nothing to send
+        self.assertIsNone(self.apply(2, sun))
+        self.assertEqual(len(self.net.packets("setPilot")), sent)
+        sun["daylight"] = 0.2485  # one bulb's step down
+        self.assertIn("white 4100K at 25.6%", self.apply(3, sun))
+        self.assertEqual(sum(bulb["dimming"] for bulb in self.net.bulbs.values()), 179)
 
     def test_it_follows_through_dusk(self):
         self.apply()
-        self.assertIn("white 4100K at 29%", self.apply(1, DUSK))
-        self.assertIn("white 2700K at 5%", self.apply(2, NIGHT))
+        self.assertIn("white 4100K at 25.8%", self.apply(1, DUSK))
+        self.assertIn("white 2700K at 1%", self.apply(2, NIGHT))
         self.assertIsNone(self.apply(3, NIGHT))
 
     def test_a_recent_setting_made_elsewhere_is_held(self):
@@ -477,7 +593,7 @@ class FollowTest(Case):
         self.assertEqual(self.net.lit(), [])
         # Switching it on is not a new setting, so it follows straight away.
         cli.main(["on"])
-        self.assertIn("white 2700K at 5%", self.apply(3, NIGHT))
+        self.assertIn("white 2700K at 1%", self.apply(3, NIGHT))
 
     def test_off_at_the_bulbs_is_seen_too(self):
         self.apply()
@@ -492,11 +608,13 @@ class FollowTest(Case):
         self.assertTrue(self.fixture.state()["setting"]["on"])
 
     def test_power_back_at_the_wall_is_not_a_hold(self):
+        cli.write_json(cli.path("follow.json"), {"night_brightness": 0.7})
         self.apply(target=NIGHT)
         for bulb in self.net.bulbs.values():
             bulb["state"] = True
         self.assertIsNone(self.apply(1, NIGHT))
         self.assertEqual(self.shown(), (5, [1]))
+        self.assertEqual(self.fixture.state()["by"], "follow")
 
     def test_an_outage_is_one_line(self):
         self.apply()
@@ -505,7 +623,7 @@ class FollowTest(Case):
         self.assertIsNone(self.apply(2, NIGHT))
         self.assertIsNone(self.apply(3, NIGHT))
         self.net.down = set()
-        self.assertIn("white 2700K at 5%", self.apply(4, NIGHT))
+        self.assertIn("white 2700K at 1%", self.apply(4, NIGHT))
 
     def test_stale_sundial_leaves_the_fixture_alone(self):
         self.apply()
@@ -537,8 +655,9 @@ class FollowTest(Case):
         follow = cli.follow_settings()
         self.assertEqual((follow["night_brightness"], follow["night_kelvin"], follow["day_brightness"]), (2, 2200, 100))
         self.apply(target=NIGHT)
-        self.assertEqual(self.shown(), (2, [1]))
+        self.assertEqual(self.shown(), (7, [2]))
         self.assertEqual(self.net.bulb(MACS[0])["temp"], 2200)
+        self.assertEqual(cli.FOLLOW_DEFAULTS["night_brightness"], 1)
 
 
 class HomeKitTest(Case):
@@ -565,11 +684,21 @@ class HomeKitTest(Case):
         self.assertEqual(self.fixture.kelvin(1e6 / 454), 2200)
 
     def test_brightness_from_home(self):
-        self.write(Brightness=50)
-        self.assertEqual(self.shown(), (7, [47]))
-        self.write(Brightness=2)
-        self.assertEqual(self.shown(), (2, [1]))
+        for brightness in (50, 2, 1):
+            self.write(Brightness=brightness)
+            self.assertEqual(self.shown(), (7, [brightness]))  # every bulb lit, all alike
         self.assertEqual(self.fixture.state()["by"], "home")
+
+    def test_a_fraction_is_shown_rounded_and_survives_home_writing_it_back(self):
+        for brightness, shown in ((0.43, 1), (12.5, 12), (37.57, 38)):
+            self.set(brightness=brightness)
+            self.assertTrue(self.link.poll())
+            values = homekit.home_values(self.link.snapshot(), self.fixture.settings)
+            self.assertEqual(values["Brightness"], shown)
+            self.write(On=True, Brightness=shown)  # Home repeating what it was shown
+            self.assertEqual(self.link.snapshot()["brightness"], brightness)
+        self.write(Brightness=39)
+        self.assertEqual(self.shown(), (7, [39]))
 
     def test_temperature_from_home_wins_over_the_hue_sent_with_it(self):
         self.write(ColorTemperature=250, Hue=30, Saturation=20)
@@ -588,7 +717,7 @@ class HomeKitTest(Case):
         self.write(On=False)
         self.assertEqual(self.net.lit(), [])
         self.write(On=True)
-        self.assertEqual(self.shown(), (5, [1]))
+        self.assertEqual(self.shown(), (7, [5]))
         self.assertEqual(self.fixture.state()["by"], "cli")  # power is not a new setting
 
     def test_brightness_zero_is_never_sent(self):

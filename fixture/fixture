@@ -5,15 +5,16 @@ Every change is sent to all the bulbs at once, over the WiZ local protocol
 (JSON over UDP, port 38899). No cloud and no vendor app are involved.
 
     fixture on | off
-    fixture white 2700 40       colour temperature in kelvin, brightness 1-100
-    fixture colour 240 100 40   hue 0-360, saturation 0-100, brightness 1-100
-    fixture brightness 3        keeps the colour
+    fixture white 2700 40       colour temperature in kelvin, brightness up to 100
+    fixture colour 240 100 40   hue 0-360, saturation 0-100, brightness
+    fixture brightness 12.5     keeps the colour; fractions are allowed
     fixture status              asks every bulb what it is doing
     fixture discover            lists the WiZ bulbs on the network
     fixture follow              follow the sun: on, off, status, apply
 
-Brightness is for the whole fixture. The lowest levels switch bulbs off; see
-`levels` below.
+Brightness is the average dimming of the bulbs. A whole number is every bulb
+at that dimming. Fractions, and anything below the bulbs' lowest dimming,
+single some bulbs out; see `split` and `PATTERNS` below.
 """
 
 import argparse
@@ -46,18 +47,22 @@ SWEEP_EVERY = 600  # seconds between searches that ask every address
 SETTINGS_DEFAULTS = {
     "name": "Fixture",          # the name shown in Apple Home
     "port": 51827,              # the Apple Home service's port
-    "bulbs": [],                # MAC addresses; the last ones are switched off first
+    "bulbs": [],                # MAC addresses
+    "centre": "",               # the bulb in the middle of the fixture
+    "ring": [],                 # the six around it, in order round the hexagon
+    "ring_names": [],           # optional labels for the six ring places, e.g. "north"
+    "layout_mapped": False,     # true once centre and ring are the real positions
     "min_dimming": 10,          # the lowest dimming a bulb takes as white
     "min_colour_dimming": 10,   # and as a colour
     "kelvin_min": 2700,
     "kelvin_max": 6500,
 }
-DEFAULT_SETTING = {"on": False, "mode": "white", "kelvin": 2700, "brightness": 50, "hue": 0, "saturation": 100}
+DEFAULT_SETTING = {"on": False, "mode": "white", "kelvin": 2700, "brightness": 50.0, "hue": 0, "saturation": 100}
 
 FOLLOW_DEFAULTS = {
     "enabled": True,
     "day_brightness": 100,   # brightness with the sun well up
-    "night_brightness": 5,   # brightness after dark; never below 1, so never off
+    "night_brightness": 1,   # brightness after dark; above 0, so never off
     "night_kelvin": 2700,    # colour after dark
     "hold_minutes": 120,     # how long a setting made elsewhere is left alone
 }
@@ -113,7 +118,7 @@ def settings():
     result = dict(SETTINGS_DEFAULTS)
     for key, default in SETTINGS_DEFAULTS.items():
         value = given.get(key, default)
-        if isinstance(value, type(default)) and not isinstance(value, bool):
+        if type(value) is type(default):
             result[key] = value
     result["min_dimming"] = clamp(1, result["min_dimming"], 100)
     result["min_colour_dimming"] = clamp(1, result["min_colour_dimming"], 100)
@@ -122,39 +127,45 @@ def settings():
 
 # ---------------------------------------------------------------- brightness
 
-def levels(brightness, count, floor):
-    """How to show a fixture brightness of 1-100: (bulbs lit, dimming of each).
+# Which bulbs are singled out when only some of them are. The fixture is one
+# bulb in the centre with six in a hexagon round it; "C" is the centre and the
+# numbers are places round the ring. Each pattern is symmetric.
+PATTERNS = {
+    0: [],
+    1: ["C"],
+    2: [0, 3],              # an opposite pair
+    3: [0, 2, 4],           # every other one: a triangle
+    4: ["C", 0, 2, 4],
+    5: ["C", 0, 1, 3, 4],   # two opposite pairs
+    6: [0, 1, 2, 3, 4, 5],  # the whole ring, centre left out
+    7: ["C", 0, 1, 2, 3, 4, 5],
+}
 
-    A bulb cannot go below its own lowest dimming, `floor`. The fixture goes
-    lower by lighting fewer bulbs:
 
-      1 to count-1   that many bulbs, each at the floor
-      count          every bulb at the floor
-      up to 100      every bulb, rising evenly from the floor to 100
+def split(brightness, count, floor):
+    """How to show a fixture brightness: (bulbs singled out, their dimming, the others' dimming).
 
-    With seven bulbs and a floor of 1, the light given, in units of one bulb
-    at 1%, runs 1, 2, 3, 4, 5, 6, 7, 14, 21, ... 700. Each step down is a
-    smaller share of what is left than the step before it, until one bulb is
-    left, so the fixture never drops by more than half at once.
+    Brightness is the average dimming of the bulbs, and may be a fraction.
+    It is taken in steps of one bulb at 1%: units = brightness x count.
+
+      from the floor up   every bulb at the whole part, units // count, and
+                          the left-over units go one each to the singled-out
+                          bulbs, which are one step higher. A whole brightness
+                          has none left over: every bulb is the same.
+      below the floor     a bulb cannot go lower, so only the singled-out bulbs
+                          are lit, each at the floor, and the others are off
+                          (given here as dimming 0). As many are lit as come
+                          nearest to the light asked for, and never none.
     """
-    brightness = clamp(1, int(brightness), 100)
-    if count <= 1 or count >= 100:
-        return max(1, count), clamp(floor, brightness, 100)
-    if brightness < count:
-        return brightness, floor
-    dimming = floor + (brightness - count) * (100 - floor) / float(100 - count)
-    return count, int(round(dimming))
+    units = clamp(1, int(round(float(brightness) * count)), 100 * count)
+    if units < floor * count:
+        return clamp(1, int(units / float(floor) + 0.5), count), floor, 0
+    return units % count, units // count + 1, units // count
 
 
-def brightness_for(total, count, floor):
-    """The fixture brightness whose bulbs add up nearest to `total` dimming."""
-    best = 1
-    for brightness in range(1, 101):
-        lit, dimming = levels(brightness, count, floor)
-        lit_best, dimming_best = levels(best, count, floor)
-        if abs(lit * dimming - total) < abs(lit_best * dimming_best - total):
-            best = brightness
-    return best
+def percent(brightness):
+    """12.5 as "12.5%", 3.0 as "3%"."""
+    return ("%.1f" % brightness).rstrip("0").rstrip(".") + "%"
 
 
 def hue_to_rgb(hue, saturation):
@@ -166,13 +177,6 @@ def rgb_to_hue(red, green, blue):
     top = float(max(red, green, blue, 1))
     hue, saturation, _ = colorsys.rgb_to_hsv(red / top, green / top, blue / top)
     return int(round(hue * 360)) % 360, int(round(saturation * 100))
-
-
-def setting_look(setting):
-    """The part of a setting that says how the fixture looks. Power is left out."""
-    if setting["mode"] == "colour":
-        return ("colour", setting["hue"], setting["saturation"], setting["brightness"])
-    return ("white", setting["kelvin"], setting["brightness"])
 
 
 def pilot_look(pilot):
@@ -374,19 +378,60 @@ class Fixture:
         value = int(round(float(value) / 100.0)) * 100
         return clamp(self.settings["kelvin_min"], value, self.settings["kelvin_max"])
 
-    def levels(self, setting):
-        return levels(setting["brightness"], len(self.macs), self.floor(setting["mode"]))
+    def split(self, setting):
+        return split(setting["brightness"], len(self.macs), self.floor(setting["mode"]))
+
+    def look(self, setting):
+        """The part of a setting that says how the fixture looks. Power is left out."""
+        units = int(round(setting["brightness"] * len(self.macs)))
+        if setting["mode"] == "colour":
+            return ("colour", setting["hue"], setting["saturation"], units)
+        return ("white", setting["kelvin"], units)
+
+    def layout(self):
+        """(centre, ring) from fixture.json, read afresh so an edit takes effect.
+
+        Without a full layout there (a centre and six ring bulbs, all of them
+        the fixture's own), the list order stands in: first the centre, then
+        the ring.
+        """
+        given = settings()
+        try:
+            centre, ring = clean_mac(given["centre"]), [clean_mac(mac) for mac in given["ring"]]
+        except Failure:
+            centre, ring = None, []
+        if sorted([centre] + ring) != sorted(self.macs):
+            centre, ring = self.macs[0], self.macs[1:]
+        return centre, ring
+
+    def singled(self, number):
+        """The bulbs singled out when `number` of them are, by PATTERNS."""
+        if len(self.macs) != 7:
+            return self.macs[:number]  # no hexagon: simply the first in the list
+        centre, ring = self.layout()
+        return [centre if place == "C" else ring[place] for place in PATTERNS[number]]
+
+    def lit(self, setting):
+        number, _, others = self.split(setting)
+        return len(self.macs) if others else number
 
     def describe(self, setting):
         if setting["mode"] == "colour":
-            text = "colour hue %d sat %d at %d%%" % (setting["hue"], setting["saturation"], setting["brightness"])
+            text = "colour hue %d sat %d at %s" % (setting["hue"], setting["saturation"], percent(setting["brightness"]))
         else:
-            text = "white %dK at %d%%" % (setting["kelvin"], setting["brightness"])
+            text = "white %dK at %s" % (setting["kelvin"], percent(setting["brightness"]))
+        if self.lit(setting) < len(self.macs):
+            text += " (%d of %d bulbs lit)" % (self.lit(setting), len(self.macs))
         return text if setting["on"] else "off (%s)" % text
 
     def describe_bulbs(self, setting):
-        lit, dimming = self.levels(setting)
-        return "%d of %d bulbs at %d%%" % (lit, len(self.macs), dimming)
+        number, dimming, others = self.split(setting)
+        if not others:
+            return "%d of %d bulbs at %d%%, the rest off" % (number, len(self.macs), dimming) \
+                if number < len(self.macs) else "all %d bulbs at %d%%" % (number, dimming)
+        if not number:
+            return "all %d bulbs at %d%%" % (len(self.macs), others)
+        return "%d bulbs at %d%%, %d at %d%%" % (number, dimming, len(self.macs) - number, others)
 
     # -- the record
 
@@ -395,8 +440,10 @@ class Fixture:
         given = raw.get("setting") if isinstance(raw.get("setting"), dict) else {}
         setting = dict(DEFAULT_SETTING)
         for key, default in DEFAULT_SETTING.items():
-            if isinstance(given.get(key), type(default)):
+            if type(given.get(key)) is type(default):
                 setting[key] = given[key]
+        if isinstance(given.get("brightness"), (int, float)) and not isinstance(given.get("brightness"), bool):
+            setting["brightness"] = clamp(0.01, round(float(given["brightness"]), 2), 100.0)
         bulbs = raw.get("bulbs") if isinstance(raw.get("bulbs"), dict) else {}
         return {
             "setting": setting,
@@ -412,14 +459,20 @@ class Fixture:
         Bulbs that are switched off are still given the look, so they show
         the right thing if the wall switch brings them back on.
         """
-        lit, dimming = self.levels(setting)
+        number, dimming, others = self.split(setting)
+        singled = self.singled(number)
         if setting["mode"] == "colour":
             red, green, blue = hue_to_rgb(setting["hue"], setting["saturation"])
-            look = pilot_look({"r": red, "g": green, "b": blue, "dimming": dimming})
+            look = pilot_look({"r": red, "g": green, "b": blue})
         else:
-            look = {"temp": setting["kelvin"], "dimming": dimming}
-        return {mac: {"on": bool(setting["on"]) and index < lit, "look": dict(look)}
-                for index, mac in enumerate(self.macs)}
+            look = {"temp": setting["kelvin"]}
+        bulbs = {}
+        for mac in self.macs:
+            level = dimming if mac in singled else others
+            # A bulb kept off is at the floor, ready to be lit.
+            bulbs[mac] = {"on": bool(setting["on"]) and level > 0,
+                          "look": dict(look, dimming=level or self.floor(setting["mode"]))}
+        return bulbs
 
     # -- talking to the bulbs
 
@@ -483,7 +536,8 @@ class Fixture:
             taken = self.send(bulbs)
             if not taken:
                 raise Failure("no bulb answers; is the fixture switched on at the wall?")
-            if setting_look(setting) != setting_look(state["setting"]) or not state["bulbs"]:
+            setting = dict(setting, brightness=clamp(0.01, round(float(setting["brightness"]), 2), 100.0))
+            if self.look(setting) != self.look(state["setting"]) or not state["bulbs"]:
                 state["by"], state["set_at"] = by, time.time()
             state.update(setting=dict(setting), bulbs=bulbs, pending=[mac for mac in self.macs if mac not in taken])
             write_json(path("state.json"), state)
@@ -582,8 +636,9 @@ class Fixture:
             setting["mode"] = "colour"
             setting["hue"], setting["saturation"] = rgb_to_hue(
                 coloured[0].get("r", 0), coloured[0].get("g", 0), coloured[0].get("b", 0))
-        total = sum(look.get("dimming", 100) for look in looks) * len(self.macs) / float(len(actual))
-        setting["brightness"] = brightness_for(total, len(self.macs), self.floor(setting["mode"]))
+        # Brightness is the average over every bulb seen; one that is off counts as 0.
+        average = sum(look.get("dimming", 100) for look in looks) / float(len(actual))
+        setting["brightness"] = clamp(0.01, round(average, 2), 100.0)
         return setting
 
 
@@ -606,8 +661,8 @@ def follow_settings():
             good = isinstance(value, (int, float)) and not isinstance(value, bool)
         if good:
             result[key] = value
-    result["night_brightness"] = int(clamp(1, result["night_brightness"], 100))
-    result["day_brightness"] = int(clamp(result["night_brightness"], result["day_brightness"], 100))
+    result["night_brightness"] = clamp(0.01, float(result["night_brightness"]), 100.0)
+    result["day_brightness"] = clamp(result["night_brightness"], float(result["day_brightness"]), 100.0)
     result["hold_minutes"] = max(0, result["hold_minutes"])
     return result
 
@@ -616,16 +671,17 @@ def follow_target(sun, follow, fixture):
     """(kelvin, brightness) for the fixture, from sundial's target.
 
     Brightness runs from the night level to the day level with sundial's
-    "daylight" share. Colour is sundial's, moving to the night colour as the
+    "daylight" share, and is not rounded to a whole number: between whole
+    percentages the fixture moves one bulb at a time. Colour is sundial's, moving to the night colour as the
     sun goes below the horizon, and kept inside what the bulbs can show.
     """
     daylight = clamp(0.0, float(sun["daylight"]), 1.0)
     low, high = follow["night_brightness"], follow["day_brightness"]
-    brightness = int(round(low + (high - low) * daylight))
+    brightness = round(low + (high - low) * daylight, 2)
     night = (NIGHT_COLOUR_FROM - float(sun["sun_elevation"])) / (NIGHT_COLOUR_FROM - NIGHT_COLOUR_BY)
     night = clamp(0.0, night, 1.0)
     colour = float(sun["kelvin"]) + (follow["night_kelvin"] - float(sun["kelvin"])) * night
-    return fixture.kelvin(colour), clamp(1, brightness, 100)
+    return fixture.kelvin(colour), clamp(0.01, brightness, 100.0)
 
 
 def sundial_target(now):
@@ -668,8 +724,10 @@ def follow_step(fixture, now, send=True):
         sun = sundial_target(now)
         kelvin, brightness = follow_target(sun, follow, fixture)
         wanted = dict(setting, mode="white", kelvin=kelvin, brightness=brightness)
-        text = "white %dK at %d%% (%s)" % (kelvin, brightness, fixture.describe_bulbs(wanted))
-        if setting_look(setting) == setting_look(wanted) and state["bulbs"] == fixture.plan(wanted):
+        text = fixture.describe(dict(wanted, on=True))
+        # Only what the bulbs would show counts: a target that moved by less
+        # than one bulb's step is not sent.
+        if state["bulbs"] == fixture.plan(wanted):
             if send and not mine:
                 fixture.claim("follow")
             return "following", "following the sun; the fixture is already at %s" % text, False
@@ -719,6 +777,7 @@ def set_fixture(fixture, **changes):
         state, _ = fixture.reconcile()
         setting = dict(state["setting"], **changes)
         missed = fixture.apply(setting, "cli")
+    setting = fixture.state()["setting"]
     print("%s: %s" % (fixture.describe(setting), fixture.describe_bulbs(setting) if setting["on"] else "all bulbs off"))
     if missed:
         print("fixture: not answering: %s" % ", ".join(missed), file=sys.stderr)
@@ -755,13 +814,20 @@ def cmd_status(fixture, args):
     if setting["on"]:
         print("Bulbs:   %s" % fixture.describe_bulbs(setting))
     print("Set by:  %s, %s" % (state["by"], time.strftime("%F %T", time.localtime(state["set_at"]))))
+    centre, ring = fixture.layout()
+    names = settings()["ring_names"]
+    if len(fixture.macs) == 7 and not settings()["layout_mapped"]:
+        print("Layout:  not mapped yet; the list order stands in (set centre, ring and layout_mapped in fixture.json)")
     for mac in fixture.macs:
         pilot = pilots[mac]
         if pilot is None:
             print("  %s  not answering" % mac)
             continue
         look = " ".join("%s %s" % item for item in sorted(pilot_look(pilot).items()))
-        print("  %s  %-15s %-3s  %s%s" % (mac, fixture.addresses.get(mac, "?"), "on" if pilot.get("state") else "off",
+        place = "centre" if mac == centre else "ring %d" % ring.index(mac) if mac in ring else ""
+        if mac in ring and ring.index(mac) < len(names):
+            place += " " + str(names[ring.index(mac)])
+        print("  %s  %-16s  %-15s %-3s  %s%s" % (mac, place, fixture.addresses.get(mac, "?"), "on" if pilot.get("state") else "off",
                                           look, "  (waiting for the last setting)" if mac in state["pending"] else ""))
     if args.json:
         print(json.dumps({"state": state, "bulbs": pilots}, indent=2, sort_keys=True))
@@ -803,6 +869,9 @@ def cmd_discover(fixture, args):
         saved["min_dimming"] = max(floors)
     for key in ("name", "port", "min_colour_dimming"):
         saved.setdefault(key, SETTINGS_DEFAULTS[key])
+    if len(saved["bulbs"]) == 7 and not saved.get("layout_mapped"):
+        # A stand-in until someone looks at the fixture: the list order.
+        saved.update(centre=saved["bulbs"][0], ring=saved["bulbs"][1:], layout_mapped=False)
     write_json(path("fixture.json"), saved)
     write_json(path("addresses.json"), {mac: address for mac, (address, _) in found.items()})
     print("saved %d bulbs to %s" % (len(saved["bulbs"]), path("fixture.json")))
@@ -832,15 +901,16 @@ def cmd_follow(fixture, args):
         print("following is on" + (": " + line if line else ""))
         return
     follow = follow_settings()
-    print("Following: %s (day %d%%, night %d%% at %dK, hold %g min)" % (
-        "on" if follow["enabled"] else "off", follow["day_brightness"],
-        follow["night_brightness"], fixture.kelvin(follow["night_kelvin"]), follow["hold_minutes"]))
+    print("Following: %s (day %s, night %s at %dK, hold %g min)" % (
+        "on" if follow["enabled"] else "off", percent(follow["day_brightness"]),
+        percent(follow["night_brightness"]), fixture.kelvin(follow["night_kelvin"]), follow["hold_minutes"]))
     now = time.time()
     try:
         sun = sundial_target(now)
         print("Sun:       %+.1f degrees, daylight %d%%" % (
             float(sun["sun_elevation"]), round(float(sun["daylight"]) * 100)))
-        print("Target:    white %dK at %d%%" % follow_target(sun, follow, fixture))
+        kelvin, brightness = follow_target(sun, follow, fixture)
+        print("Target:    white %dK at %s" % (kelvin, percent(brightness)))
     except Failure as failure:
         print("Sun:       unknown (%s)" % failure)
     try:
@@ -860,19 +930,27 @@ def build_parser():
         command.set_defaults(handler=handler)
         return command
 
-    percent = whole(1, 100, "brightness")
+    def level(text):
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError("brightness must be a number")
+        if not 0 < value <= 100:
+            raise argparse.ArgumentTypeError("brightness must be above 0 and at most 100")
+        return value
+
     add("on", cmd_on, "switch the fixture on as it was")
     add("off", cmd_off, "switch every bulb off")
     white = add("white", cmd_white, "white light: fixture white 2700 40")
     white.add_argument("kelvin", type=whole(1000, 10000, "kelvin"))
-    white.add_argument("brightness", type=percent)
+    white.add_argument("brightness", type=level)
     for name in ("colour", "color"):
         colour = add(name, cmd_colour, "a colour: fixture colour 240 100 40")
         colour.add_argument("hue", type=whole(0, 360, "hue"))
         colour.add_argument("saturation", type=whole(0, 100, "saturation"))
-        colour.add_argument("brightness", type=percent)
+        colour.add_argument("brightness", type=level)
     brightness = add("brightness", cmd_brightness, "change the brightness, keep the colour")
-    brightness.add_argument("brightness", type=percent)
+    brightness.add_argument("brightness", type=level)
     status = add("status", cmd_status, "ask every bulb what it is doing")
     status.add_argument("--json", action="store_true", help="also print everything as JSON")
     discover = add("discover", cmd_discover, "list the WiZ bulbs on the network")

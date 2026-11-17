@@ -150,9 +150,10 @@ It talks to the bulbs directly on the home network (the WiZ local protocol, JSON
 ```
 fixture on
 fixture off
-fixture white 2700 40       # colour temperature in kelvin, brightness 1-100
+fixture white 2700 40       # colour temperature in kelvin, brightness up to 100
 fixture colour 240 100 40   # hue 0-360, saturation 0-100, brightness
-fixture brightness 3        # keeps the colour
+fixture brightness 12.5     # keeps the colour; fractions are allowed
+fixture brightness 0.4      # below 1%: only some of the bulbs are lit
 fixture status              # asks every bulb what it is doing
 fixture discover            # lists the WiZ bulbs on the network and their limits
 fixture follow              # show whether the fixture is following the sun
@@ -173,6 +174,10 @@ Bulbs are known by MAC address, never by network address. Their addresses are re
   "name": "Fixture",
   "port": 51827,
   "bulbs": ["a1b2c3d4e5f6", "..."],
+  "centre": "a1b2c3d4e5f6",
+  "ring": ["...", "...", "...", "...", "...", "..."],
+  "ring_names": ["north", "northeast", "southeast", "south", "southwest", "northwest"],
+  "layout_mapped": false,
   "min_dimming": 1,
   "min_colour_dimming": 10,
   "kelvin_min": 2200,
@@ -182,28 +187,42 @@ Bulbs are known by MAC address, never by network address. Their addresses are re
 
 These are the values for the ESP25_SHRGB_01 bulbs (firmware 1.33.39), checked on the bulbs themselves: white takes 2200-6500K and dimming 1-100, and a colour is never dimmer than 10 whatever is asked. Dimming 1 was accepted and read back; nobody has yet judged by eye how much dimmer it is than 10.
 
+### Where the bulbs are
+
+The fixture is one bulb in the centre with six in a hexagon round it. `centre` in `fixture.json` is the centre bulb's MAC address, and `ring` is the other six in order round the hexagon (either direction, starting anywhere). They are read every time the fixture is set, so an edit takes effect without restarting anything. `ring_names` is optional: six labels for the ring places, shown by `fixture status` and used for nothing else.
+
+Until someone has looked at the fixture and filled these in, the order of `bulbs` stands in: the first is taken for the centre and the next six for the ring. `layout_mapped` is `false` to say so, and `fixture status` says so too. Set it to `true` once `centre` and `ring` are the real positions. If `centre` and `ring` are not exactly the seven bulbs of the fixture, they are ignored and the list order is used.
+
 ### Brightness
 
-Brightness is 1-100 for the whole fixture. A bulb cannot go below its own lowest dimming, so the fixture goes lower by lighting fewer bulbs. With seven bulbs:
+Brightness is the average dimming of the seven bulbs.
 
-| Fixture brightness | Bulbs lit | Each bulb's dimming |
-|---|---|---|
-| 1 to 6 | that many | the lowest (1 for white, 10 for a colour) |
-| 7 | all seven | the lowest |
-| 8 to 100 | all seven | rising evenly from the lowest to 100 |
+- **A whole number is every bulb at that dimming.** Fixture 1% is all seven at 1, fixture 37% is all seven at 37, and 100% is all seven at 100. Apple Home only sends whole numbers, so from Home every bulb is always lit and they are all alike.
+- **A fraction puts some bulbs one step higher.** Brightness moves in steps of one seventh of a percent: one bulb, one step. Fixture 12.5% is 88 sevenths, so three bulbs are at 12 and four at 13.
+- **Below 1% only some bulbs are lit**, each at 1, and the rest are off. Fixture 0.4% is three bulbs. The least is one bulb at 1, which is about 0.14%.
 
-So for white the light given, counted in bulbs at 1%, runs 1, 2, 3, 4, 5, 6, 7, 14, 21, and on up to 700. Going down, each step takes away a smaller share until one bulb is left, and no step more than halves the light.
+The command, `follow.json` and the sun follower take fractions. They are printed to one decimal place ("0.4%", "37.6%"), with the number of bulbs lit when that is not all of them.
 
-Two things follow from this:
+The bulbs that are singled out, to be lit below 1% or to take the extra step, are chosen so the fixture stays symmetric. With the ring places numbered 0 to 5:
 
-- From 8 up, the fixture's number is a little above each bulb's own: fixture 50 is every bulb at 47, fixture 10 is every bulb at 4. They meet at 100.
-- The bulbs at the end of the list in `fixture.json` are the ones switched off first. Reorder the list to choose which stay lit.
+| Bulbs singled out | Which |
+|---|---|
+| 1 | the centre |
+| 2 | ring 0 and 3, an opposite pair |
+| 3 | ring 0, 2 and 4, a triangle |
+| 4 | the centre and ring 0, 2 and 4 |
+| 5 | the centre and ring 0, 1, 3 and 4, two opposite pairs |
+| 6 | the whole ring, centre left out |
 
-Bulbs that are kept off are still given the colour and dimming, so if the wall switch brings every bulb back on, they all look right. The fixture then switches the extra ones off again.
+A colour cannot be dimmed below 10 on these bulbs. From 10% up a colour works exactly as white does. Below 10% only some bulbs are lit, each at 10, as many as come nearest to the light asked for (fixture 5% is four bulbs at 10), chosen by the same table.
+
+A fixture of some other number of bulbs works the same way, but has no hexagon: the bulbs singled out are simply the first ones in the list.
+
+Bulbs that are kept off are still given the colour and the lowest dimming, so if the wall switch brings every bulb back on, they all look right. The fixture then switches the extra ones off again.
 
 ### Changes made elsewhere
 
-The bulbs can be asked what they are doing, and they are: by `fixture status`, by the Apple Home service every 5 seconds, and by the sun follower every minute. `state.json` in the settings folder records what the fixture was last set to and by whom. When the bulbs differ from it, something else set them (the WiZ app, a bulb's own tile in Apple Home), and the record is changed to match the bulbs. Nothing is sent to undo it.
+The bulbs can be asked what they are doing, and they are: by `fixture status`, by the Apple Home service every 5 seconds, and by the sun follower every minute. `state.json` in the settings folder records what the fixture was last set to and by whom. When the bulbs differ from it, something else set them (the WiZ app, a bulb's own tile in Apple Home), and the record is changed to match the bulbs. Nothing is sent to undo it. The record keeps what each bulb should show, so bulbs that are deliberately a step apart are not mistaken for a change. The fixture's brightness is then the average of the bulbs as found.
 
 Switching the whole fixture off and on is not a new setting, wherever it is done.
 
@@ -223,6 +242,7 @@ To pair, open the Home app, choose Add Accessory, and scan the QR code or enter 
 Add `--qr code.svg` in place of `--pairing` to write the QR code to a file.
 
 - Home shows one light: on/off, brightness, colour and colour temperature (2200-6500K).
+- Home's brightness is a whole number. A fraction set elsewhere is shown rounded, and anything lit shows as at least 1%.
 - A change made any other way shows up in Home within about 5 seconds.
 - If no bulb answers (the wall switch is off), Home shows "No Response". One bulb answering is enough.
 - The pairing keys are in `homekit-data/` in the settings folder, readable only by you. Deleting that folder unpairs the fixture; remove it from the Home app first.
@@ -240,12 +260,12 @@ fixture follow on         # start again, and take the fixture over now
 
 The rules are the Neewer light's:
 
-- **It never switches the fixture on or off.** While the fixture is off it does nothing. (At low levels it does switch single bulbs off and on; that is how the fixture dims.)
+- **It never switches the fixture on or off.** While the fixture is off it does nothing. (Below 1% it does switch single bulbs off and on; that is how the fixture dims there.)
 - **A setting made elsewhere wins.** After a change from Apple Home, the `fixture` command, the WiZ app or a single bulb's tile, it leaves the fixture alone for two hours, then follows again. `fixture follow on` ends the wait early.
-- **It only sends when the target changes**, and writes one line to the log each time.
+- **It only sends when what a bulb should show changes**, and writes one line to the log each time. It does not round brightness to a whole number, so through dusk and dawn the fixture moves one bulb at a time, in sevenths of a percent.
 - If no bulb answers, or sundial has stopped, it tries again each minute and writes one line, not one a minute.
 
-`follow.json` in the fixture's settings folder has the same five settings as the Neewer light's: `enabled`, `day_brightness` (100), `night_brightness` (5), `night_kelvin` (2700) and `hold_minutes` (120). Colour is kept within the bulbs' 2200-6500K. With the brightness table above, a night level of 5 is five bulbs at their lowest.
+`follow.json` in the fixture's settings folder has the same five settings as the Neewer light's: `enabled`, `day_brightness` (100), `night_brightness` (1), `night_kelvin` (2700) and `hold_minutes` (120). Colour is kept within the bulbs' 2200-6500K. The night level of 1 is every bulb at its lowest. It may be a fraction: 0.4 is three bulbs.
 
 `python3 tests/test_fixture.py` checks all of this against seven pretend bulbs, without touching real ones.
 
