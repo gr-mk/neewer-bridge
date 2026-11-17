@@ -80,9 +80,9 @@ neewer follow on         # start again, and take the light over now
 The rules:
 
 - **It switches the light off and on only at bedtime and in the morning** (below). Otherwise it never does, and while the light is off it does nothing.
-- **A setting made elsewhere wins.** If you set the light from Apple Home or with another `neewer` command, it leaves the light alone for two hours from that change, then follows again. `neewer follow on` ends the wait early.
+- **A setting made elsewhere wins.** If you set the light from Apple Home or with another `neewer` command, sun tracking turns off and the light is left alone until it is turned on again (see Sun Tracking below). `neewer follow on` turns it on.
 - **Switched on by day, it starts afresh** (below): it goes to the sun's setting, not back to how it was left.
-- **It keeps out of a sunrise.** Nothing is sent while `neewer sunrise` runs. What the sunrise leaves is then held for two hours like any other setting.
+- **It keeps out of a sunrise.** Nothing is sent while `neewer sunrise` runs. When it ends, following takes the light over from where the sunrise left it; a sunrise does not turn sun tracking off. (In the older way without the switch, what it leaves is held for two hours like any other setting.)
 - **It only sends when the target changes.** That is about once a minute around sunrise and sunset, and not at all at midday or at night.
 - If the bridge or the light cannot be reached, it tries again each minute and writes one line to the log, not one a minute.
 
@@ -108,7 +108,7 @@ The settings are in `follow.json` in the settings folder, and are read each minu
 - Brightness runs from `night_brightness` to `day_brightness` with sundial's "daylight" share. With sundial's defaults that is the night level until the sun is 6 degrees below the horizon and the day level once it is 20 degrees up.
 - Colour is sundial's colour, kept within the light's 2500-7500K. While the sun goes from the horizon to 6 degrees below, it moves to `night_kelvin`.
 - `night_brightness` cannot go below 1, because 0 would switch the light off.
-- `hold_minutes` is how long a setting made elsewhere is left alone.
+- `hold_minutes` is how long a setting made elsewhere is left alone, in the older way without the Sun Tracking switch. With the switch it is not used.
 
 ### A fresh start
 
@@ -177,6 +177,43 @@ The ramp is set in `homekit.json`; leave out any value to use the command's defa
 ```
 
 Restart the service after changing it: `launchctl kickstart -k gui/$(id -u)/local.neewer-homekit`. A value the command would reject is reported in `neewer-homekit.log` when the service starts, and the defaults are used. The ramp's progress goes to the same log.
+
+## Sun Tracking: one switch for everything
+
+Four things here follow the sun: the Neewer light, the ceiling fixture, the monitors and the keyboard. One switch says whether they do. It is a tile in Apple Home, **Sun Tracking**, on the fixture's accessory ("The Sun"), and a command:
+
+```
+fixture tracking          # how it stands, and why
+fixture tracking on       # everything follows the sun again, at once
+fixture tracking off      # everything stays as it is
+```
+
+(`neewer tracking` is the same command.)
+
+- **On:** everything follows the sun.
+- **Set any one of them by hand and it turns itself off, for all of them.** A colour or a brightness, from Apple Home, a command, the WiZ app, a bulb's own tile, `sundial manual`: any of these. Then every device stays exactly as it is. There is no timer; nothing takes over after two hours. One switch means one state, so a brightness set on the keyboard stops the lights following too.
+- **Switching a device on or off is not setting it.** Tracking stays on.
+- **Turn it on and everything goes to the sun's setting at once**, within a few seconds, including whatever was set by hand. It does not switch on a light that is off.
+- **It turns itself on before sunrise every day**: at civil dawn (the sun 6 degrees below the horizon, worked out for sundial's location, about half an hour before sunrise) or at the followers' morning time (half an hour before waking), whichever comes first. Only if it was turned off before then: turned off later in the day, it stays off until the next morning.
+
+How the other rules sit with it:
+
+- **Bedtime is not tracking.** The lights still fade out and go off at bedtime, and come on in the morning, whatever the switch says. By the morning time the switch is on again anyway.
+- **A fresh start does not turn tracking on.** With tracking off, a light switched on by day still comes on at the sun's setting, once, and is then left there. If you turned tracking off, switching a light on does not turn it back on behind your back.
+- **While it is off, the monitors and the keyboard are held too.** sundial is told to hold what the displays show now (`sundial manual` with no end), and let go when tracking comes back on. sundial's own `pause` and `movie` are separate and are left alone.
+- **Monitors or keyboard switched off stay off** when tracking comes on.
+
+Scenes in Apple Home work as you would hope. A scene that sets colours turns tracking off as it runs. A scene that turns the switch on resumes it. **A scene that does both ends with its colours and tracking off**: Home sends a scene's parts in no particular order, so for five seconds after a device is set by hand, Home's "on" for the switch is not taken. (Tap the switch again after that and it is.)
+
+How quickly a change by hand is noticed: at once from Apple Home and the commands; within about 5 seconds for the WiZ app, a bulb's own tile or `sundial manual`; within a minute for the Neewer's own dial settings made through anything else that writes its state.
+
+The state is one file, `tracking.json` in `~/Library/Application Support/SunTracking/`, which every follower and every Apple Home service reads. `settings.json` beside it takes:
+
+```
+{"switch": true, "on_before_sunrise": true}
+```
+
+`"switch": false` goes back to the older way, in which a setting made by hand is held for `hold_minutes` (two hours) and then followed again, device by device; that is the only time `hold_minutes` is used now. `"on_before_sunrise": false` stops the switch turning itself on. Each `follow` status has a Tracking line: `on since 06:14, switched on before sunrise`, `off since 12:30, when the fixture was set by hand (white 3000K at 40%)`.
 
 ## The ceiling fixture (WiZ bulbs as one light)
 
@@ -359,7 +396,7 @@ fixture follow on         # start again, and take the fixture over now
 The rules are the Neewer light's:
 
 - **It switches the fixture off and on only at bedtime and in the morning**, by the same rule as the Neewer light (see Bedtime above), with the same settings in its own `follow.json`. Otherwise it never does, and while the fixture is off it does nothing.
-- **A setting made elsewhere wins.** After a change from Apple Home, the `fixture` command, the WiZ app or a single bulb's tile, it leaves the fixture alone for two hours, then follows again. `fixture follow on` ends the wait early.
+- **A setting made elsewhere wins.** A change from Apple Home, the `fixture` command, the WiZ app or a single bulb's tile turns sun tracking off, and the fixture is left alone until it is turned on again. `fixture follow on` turns it on.
 - **Switched on by day, it starts afresh**, as the Neewer light does (see A fresh start above), with `"fresh_start"` in its own `follow.json`. From Apple Home's Sun tile it is immediate: no bulb is sent the old setting first. From anywhere else (`fixture on`, the WiZ app, a bulb's own tile, the wall switch) the old setting shows until the follower's next look, up to a minute. Bulbs that did not answer, as when the wall switch is off, count as having been off.
 - **It only sends when what a bulb should show changes**, and writes one line to the log each time. It does not round brightness to a whole number, so through dusk and dawn the fixture moves one bulb at a time, in sevenths of a percent.
 - If no bulb answers, or sundial has stopped, it tries again each minute and writes one line, not one a minute.
@@ -393,7 +430,7 @@ The service runs under the fixture's launcher app, through `fixture host`, so it
 - **Brightness** 0-100 is the brightness of every external display.
 - **Colour temperature** is 2700-6500K: what Night Shift can do. 2700K is the warmest macOS allows and 6000K the coolest tint; anything cooler means no tint, shown as 6500K. There is no colour wheel.
 - **Off is brightness 0**, the backlight at its lowest, not asleep. The brightness held before is remembered, and "on" brings it back (or hands brightness back to the sun if none was held). `"off_means": "sleep"` in `desk.json` makes off sleep the displays and on wake them; that has not been tried on the real displays.
-- **A change from Home is held for two hours** (`hold_minutes`), then the monitors follow the sun again. Brightness and colour are held separately: change only the brightness and the colour keeps following the sun.
+- **A change from Home turns sun tracking off** and is held until tracking is turned on again. (In the older way without the switch it is held for `hold_minutes`, two hours.) Brightness and colour are held separately when set, but while tracking is off both are held as they are.
 - **Home is shown what sundial last applied**, so it moves through the day with the sun, and goes back to the sun's values when a hold runs out.
 - With no external display connected, Home shows "No Response".
 
@@ -405,7 +442,7 @@ sundial has a mode for this, added for it: `sundial manual [MIN] [brightness=N|s
 
 ### Keyboard
 
-Left alone, the keyboard follows the sun as the lights do: 25% and warm at night, rising with sundial's daylight to 100% and no tint by day. Home has On, Brightness and Colour temperature (2700-6500K, which sets how warm the tint is). A change from Home is held for two hours. Off is every key dark.
+Left alone, the keyboard follows the sun as the lights do: 25% and warm at night, rising with sundial's daylight to 100% and no tint by day. Home has On, Brightness and Colour temperature (2700-6500K, which sets how warm the tint is). A brightness or colour from Home turns sun tracking off and is held until tracking is turned on again. Off is every key dark.
 
 The desk service writes `~/.local/state/wooting-workspaces/control`, and the helper re-reads it every second:
 

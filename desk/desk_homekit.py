@@ -73,6 +73,13 @@ SETTINGS_DEFAULTS = {
     },
 }
 
+# Sun tracking: the one switch for everything that follows the sun (see the
+# fixture's follower). While it is off, the monitors and the keyboard stay as
+# they are; setting either by hand turns it off.
+TRACKING_DIR = os.path.expanduser("~/Library/Application Support/SunTracking")
+FOREVER_MINUTES = 5256000   # ten years: a hold with no end, as sundial counts
+FOREVER = 4102444800        # the year 2100, for the keyboard's own hold
+
 log = logging.getLogger("desk-homekit")
 
 
@@ -119,6 +126,20 @@ def settings():
                 result[key] = value
         return result
     return merged(SETTINGS_DEFAULTS, given)
+
+
+def tracking_switch():
+    return read_json(os.path.join(TRACKING_DIR, "settings.json"), {}).get("switch") is not False
+
+
+def tracking_on():
+    return read_json(os.path.join(TRACKING_DIR, "tracking.json"), {}).get("on") is not False
+
+
+def tracking_off(by, why):
+    """Turns sun tracking off for everything, because this device was set by hand."""
+    if tracking_on():
+        write_json(os.path.join(TRACKING_DIR, "tracking.json"), {"on": False, "since": time.time(), "by": by, "why": why})
 
 
 def mired_to_kelvin(mired):
@@ -169,6 +190,12 @@ class Sundial:
         if done.returncode != 0:
             log.warning("sundial manual failed: %s", (done.stderr or done.stdout).strip())
         return done.returncode == 0
+
+    def resume(self):
+        try:
+            subprocess.run([SUNDIAL, "resume"], capture_output=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as error:
+            log.warning("sundial resume failed: %s", error)
 
     def displays(self):
         """How many external displays answer, counted the way sundial counts them."""
@@ -284,7 +311,38 @@ class Monitors:
         if "ColorTemperature" in values:
             held.append("kelvin=%d" % mired_to_kelvin(values["ColorTemperature"]))
         if held:  # nothing to hold (a second "on") must not replace a pause or movie mode
-            self.sundial.manual([str(self.settings["hold_minutes"])] + held)
+            minutes = FOREVER_MINUTES if tracking_switch() else self.settings["hold_minutes"]
+            self.sundial.manual([str(minutes)] + held)
+        if tracking_switch() and ("Brightness" in values or "ColorTemperature" in values):
+            tracking_off("monitors", "set from Apple Home")
+
+    def react(self):
+        """Keeps the monitors in step with the sun tracking switch.
+
+        Off: sundial is told to hold what the displays show now, with no end.
+        On again: sundial is let go. A brightness or colour that sundial is
+        holding while tracking is on was set by hand (`sundial manual`), and
+        turns tracking off.
+        """
+        if not tracking_switch():
+            return
+        memory, state = self.memory(), self.sundial.state()
+        override = manual_override(state, self.clock())
+        applied = state.get("applied") or {}
+        off = bool(memory.get("off")) and self.settings["off_means"] == "dim"
+        if tracking_on():
+            if memory.get("frozen"):
+                self.remember(frozen=False)
+                if off:
+                    self.sundial.manual([str(FOREVER_MINUTES), "brightness=0", "kelvin=sun"])
+                elif override is not None:
+                    self.sundial.resume()
+            elif override is not None and ("kelvin" in override or ("brightness" in override and not off)):
+                tracking_off("monitors", "brightness %s, %sK" % (applied.get("brightness", "?"), applied.get("kelvin", "?")))
+        elif not memory.get("frozen") and "brightness" in applied and "kelvin" in applied:
+            held = ["kelvin=%d" % applied["kelvin"]] + ([] if off else ["brightness=%d" % applied["brightness"]])
+            self.sundial.manual([str(FOREVER_MINUTES)] + held)
+            self.remember(frozen=True)
 
     def describe(self):
         view, state = self.view(), self.sundial.state()
@@ -369,11 +427,31 @@ class Keyboard:
             override["brightness"] = clamp(0, int(values["Brightness"]), 100)
         if "ColorTemperature" in values:
             override["kelvin"] = clamp(KELVIN_MIN, int(round(1e6 / values["ColorTemperature"] / 100.0)) * 100, KELVIN_MAX)
-        override["until"] = self.clock() + self.settings["hold_minutes"] * 60
+        override["until"] = FOREVER if tracking_switch() else self.clock() + self.settings["hold_minutes"] * 60
+        self.hold(override)
+        if tracking_switch() and ("Brightness" in values or "ColorTemperature" in values):
+            tracking_off("keyboard", "set from Apple Home")
+        self.sync()
+
+    def hold(self, override):
         state = read_json(path("desk-state.json"), {})
         state["keyboard"] = override
         write_json(path("desk-state.json"), state)
-        self.sync()
+
+    def react(self):
+        """Keeps the keyboard in step with the sun tracking switch.
+
+        Off: what the keyboard shows now is held, with no end. On again: it
+        is let go, except that a keyboard switched off stays off.
+        """
+        if not tracking_switch():
+            return
+        override = self.override()
+        if tracking_on():
+            if "brightness" in override or "kelvin" in override:
+                self.hold({"on": False, "until": FOREVER} if override.get("on") is False else {})
+        elif not override.get("frozen"):
+            self.hold(dict(self.view(), frozen=True, until=FOREVER))
 
     def describe(self):
         view, override = self.sync(), self.override()
@@ -508,6 +586,8 @@ def build_bridge(driver, chosen, devices):
         @Accessory.run_at_interval(POLL_SECONDS)
         def run(self):
             self.reachable = self.device.reachable()
+            if not self.link.busy():
+                self.device.react()
             if hasattr(self.device, "sync"):
                 self.device.sync()
             if not self.link.busy():  # do not show an old value over one Home has just written

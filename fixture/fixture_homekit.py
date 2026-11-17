@@ -179,6 +179,7 @@ class Link:
         self.trouble = None
         self.refused = False  # macOS has not allowed the local network yet
         self.owner = "home"   # who the setting being sent belongs to: "follow" for a fresh start
+        self.tracking_since = cli.tracking()["since"]
         self.wanted = fixture.state()["setting"]
         self.thread = threading.Thread(target=self.run, name="fixture-sender", daemon=True)
 
@@ -251,6 +252,8 @@ class Link:
                 self.fixture.claim("follow")
                 self.fixture.fresh_done()
                 log.info("fresh start: switched on at %s", self.fixture.describe(target))
+            # A colour or brightness from Home turns sun tracking off.
+            cli.custom_check(self.fixture)
         except cli.Failure as failure:
             self.note_trouble(str(failure))
             return
@@ -259,6 +262,21 @@ class Link:
                 # Anything Home wrote during the send has set the event again.
                 self.unsent = self.wanted != target
         self.note_trouble("not answering: %s" % ", ".join(missed) if missed else None)
+
+    def follow_now(self):
+        """One run of the sun follower, now and not at the next minute."""
+        line = cli.follow_apply(self.fixture)
+        if line:
+            log.info("%s", line)
+
+    def watch_tracking(self):
+        """Sets the fixture from the sun at once when sun tracking is switched on, wherever that was done."""
+        track = cli.tracking()
+        if track["since"] == self.tracking_since:
+            return
+        self.tracking_since = track["since"]
+        if track["on"] and cli.tracking_settings()["switch"]:
+            self.follow_now()
 
     def note_trouble(self, trouble):
         # Said once when it starts and once when it ends, not on every try.
@@ -286,6 +304,7 @@ class Link:
         self.set_reachable(True)
         missing = [mac for mac in self.fixture.macs if pilots[mac] is None]
         self.note_trouble("not answering: %s" % ", ".join(missing) if missing else None)
+        cli.custom_check(self.fixture)  # set in the WiZ app or on a bulb's own tile: tracking goes off
         with self.lock:
             if self.unsent:
                 return False  # Home's newer wish is about to be sent
@@ -328,6 +347,12 @@ def build_accessory(driver, name, link):
             }
             service.setter_callback = self.home_wrote
             service.is_primary_service = True
+            # Added after the light's own service, so the light keeps its
+            # characteristic ids and stays paired.
+            switch = self.add_preload_service("Switch", chars=["Name"])
+            switch.configure_char("Name", value="Sun Tracking")
+            self.tracking = switch.configure_char(
+                "On", value=cli.tracking()["on"], setter_callback=self.tracking_wrote)
             self.address_at_start = driver.state.address
             self.was_paired = driver.state.paired
             self.ticks = 0
@@ -357,8 +382,17 @@ def build_accessory(driver, name, link):
             # Fill in the values Home did not send, such as the hue of a new white.
             self.show(link.snapshot(), notify=True, skip=values.keys())
 
+        def tracking_wrote(self, value):
+            # The switch for everything that follows the sun. Home's "on" is
+            # not taken just after a device was set by hand (a scene's colours
+            # win); the tile is put right at the next look.
+            cli.set_tracking(bool(value), "home")
+
         @Accessory.run_at_interval(POLL_SECONDS)
         def run(self):
+            link.watch_tracking()
+            if self.tracking.get_value() != cli.tracking()["on"]:
+                self.tracking.set_value(cli.tracking()["on"], should_notify=True)
             if link.poll():
                 self.show(link.snapshot(), notify=True)
             paired = driver.state.paired

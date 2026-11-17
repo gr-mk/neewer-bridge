@@ -134,12 +134,16 @@ class Case(unittest.TestCase):
         self.addCleanup(self.folder.cleanup)
         saved = {name: getattr(cli, name) for name in (
             "APP_DIR", "SUNDIAL_STATE_FILE", "SUNDIAL_CONFIG_FILE", "open_socket", "own_address", "WAITS",
-            "SEARCH_WAIT", "pause", "clock")}
+            "SEARCH_WAIT", "pause", "clock", "TRACKING_DIR")}
         self.addCleanup(lambda: [setattr(cli, name, value) for name, value in saved.items()])
         cli.APP_DIR = self.folder.name
         cli.SUNDIAL_STATE_FILE = os.path.join(self.folder.name, "sundial.json")
         # No sundial settings: no bedtime, so the other tests pass at any hour.
         cli.SUNDIAL_CONFIG_FILE = os.path.join(self.folder.name, "sundial.ini")
+        # These tests are of the older way, where a setting made by hand is
+        # held for a time. The Tracking tests are of the switch.
+        cli.TRACKING_DIR = os.path.join(self.folder.name, "tracking")
+        cli.write_json(os.path.join(cli.TRACKING_DIR, "settings.json"), {"switch": False})
         self.net = Network()
         cli.open_socket = lambda: self.net
         cli.own_address = lambda: "10.0.0.2"
@@ -940,8 +944,8 @@ class FollowTest(Case):
         self.assertEqual(cli.FOLLOW_DEFAULTS["night_brightness"], 1)
 
 
-class BedtimeTest(Case):
-    """The bedtime rule, with sundial saying bedtime 23:00 and wake 07:00."""
+class BedtimeScaffold(Case):
+    """An evening with sundial saying bedtime 23:00 and wake 07:00, and a clock to move."""
 
     def setUp(self):
         super().setUp()
@@ -983,6 +987,9 @@ class BedtimeTest(Case):
 
     def sets(self):
         return len(self.net.packets("setPilot"))
+
+class BedtimeTest(BedtimeScaffold):
+    """The bedtime rule."""
 
     def test_times_come_from_sundial(self):
         self.assertEqual(cli.sleep_times(cli.follow_settings()), (23 * 60, 7 * 60))
@@ -1161,7 +1168,7 @@ class BedtimeTest(Case):
         self.assertEqual(len(self.net.lit()), 7)
 
 
-class FreshStartTest(BedtimeTest):
+class FreshStartTest(BedtimeScaffold):
     """A fixture switched on by day after being off goes straight to the sun's setting."""
 
     def outlook(self):
@@ -1268,6 +1275,169 @@ class FreshStartTest(BedtimeTest):
         self.assertIn("set elsewhere", self.apply(10, 58, day=1))  # as it was: the old colour, held
         self.assertEqual(self.net.bulb(MACS[0])["temp"], 2700)
         self.assertIsNone(cli.fresh_start_setting(self.fixture, self.when))
+
+
+class TrackingTest(BedtimeScaffold):
+    """The sun tracking switch: no timer; a setting by hand turns it off for everything."""
+
+    def setUp(self):
+        super().setUp()
+        os.remove(os.path.join(cli.TRACKING_DIR, "settings.json"))  # the switch is the default
+        self.sky = DAY
+        self.apply(9, 0, day=1)
+        self.net.sent = []
+
+    def by_hand(self, hour, minute, day=1, **changes):
+        """A setting made at the bulbs at that time, as the WiZ app makes it."""
+        for bulb in self.net.bulbs.values():
+            bulb.update(changes)
+        self.when = self.midnight + day * 86400 + hour * 3600 + minute * 60
+        self.fixture.reconcile()
+        state = self.fixture.state()
+        state["set_at"] = self.when
+        cli.write_json(cli.path("state.json"), state)
+
+    def test_a_setting_by_hand_turns_it_off_with_no_timer(self):
+        self.by_hand(10, 0, temp=3000, dimming=40)
+        line = self.apply(10, 1, day=1)
+        self.assertIn("sun tracking is off since 10:01, when the fixture was set by hand", line)
+        self.assertEqual((cli.tracking()["on"], cli.tracking()["by"]), (False, "fixture"))
+        sent = self.sets()
+        for hour in (11, 14, 20):
+            self.assertIsNone(self.apply(hour, 0, day=1))
+        self.assertEqual(self.sets(), sent)
+        self.assertEqual(self.shown(), (7, [40]))
+
+    def test_switched_on_again_it_follows_at_once(self):
+        self.by_hand(10, 0, temp=3000, dimming=40)
+        self.apply(10, 1, day=1)
+        cli.set_tracking(True, "home", now=self.midnight + 86400 + 12 * 3600)
+        self.assertIn("white 6500K at 100%", self.apply(12, 0, day=1))
+        self.assertEqual(self.shown(), (7, [100]))
+        self.assertIsNone(self.apply(12, 1, day=1))
+        self.assertTrue(cli.tracking()["on"])
+
+    def test_switching_the_fixture_off_and_on_is_not_a_setting(self):
+        self.switch(False)
+        self.apply(10, 0, day=1)
+        self.switch(True)
+        self.apply(10, 30, day=1)
+        self.assertTrue(cli.tracking()["on"])
+        self.assertEqual(self.shown(), (7, [100]))
+
+    def test_it_turns_itself_on_before_sunrise(self):
+        self.by_hand(20, 0, dimming=40)
+        self.apply(20, 1, day=1)
+        self.assertFalse(cli.tracking()["on"])
+        self.apply(6, 29, day=2)
+        self.assertFalse(cli.tracking()["on"])
+        self.apply(6, 30, day=2)
+        self.assertEqual((cli.tracking()["on"], cli.tracking()["by"]), (True, "dawn"))
+
+    def test_bedtime_comes_whatever_the_switch_says(self):
+        self.by_hand(20, 0, dimming=40)
+        self.apply(20, 1, day=1)
+        self.sky = NIGHT
+        self.assertIn("faded out and switched off", self.apply(23, 0, day=1))
+        self.assertFalse(cli.tracking()["on"])
+        self.sky = DUSK
+        self.assertIn("morning: switched on", self.apply(6, 30, day=2))
+        self.assertTrue(cli.tracking()["on"])
+
+    def test_a_fresh_start_does_not_turn_tracking_on(self):
+        self.by_hand(10, 0, temp=3000, dimming=40)
+        self.apply(10, 1, day=1)
+        self.switch(False)
+        self.apply(11, 0, day=1)
+        self.switch(True)
+        self.assertIn("fresh start", self.apply(12, 0, day=1))
+        self.assertEqual((self.net.bulb(MACS[0])["temp"], self.shown()), (6500, (7, [100])))
+        self.assertFalse(cli.tracking()["on"])
+        sent = self.sets()
+        self.sky = DUSK
+        self.apply(13, 0, day=1)
+        self.assertEqual(self.sets(), sent)
+
+    def test_the_command(self):
+        self.assertEqual(cli.main(["white", "3000", "40"]), 0)
+        self.assertEqual((cli.tracking()["on"], cli.tracking()["by"]), (False, "fixture"))
+        self.assertEqual(cli.main(["tracking"]), 0)
+        self.assertEqual(cli.main(["off"]), 0)   # switching off and on is not a setting
+        self.assertEqual(cli.main(["on"]), 0)
+        self.assertFalse(cli.tracking()["on"])
+        self.assertEqual(cli.main(["tracking", "on"]), 0)
+        self.assertTrue(cli.tracking()["on"])
+        self.assertEqual(self.shown(), (7, [100]))  # and the fixture is back with the sun at once
+        self.assertEqual(cli.main(["tracking", "off"]), 0)
+        self.assertEqual((cli.tracking()["on"], cli.tracking()["by"]), (False, "cli"))
+
+    def test_the_old_way_is_still_there(self):
+        cli.write_json(os.path.join(cli.TRACKING_DIR, "settings.json"), {"switch": False})
+        self.by_hand(10, 0, dimming=40)
+        self.assertIn("following again at 12:00", self.apply(10, 1, day=1))
+        self.assertTrue(cli.tracking()["on"])
+
+
+class HomeTrackingTest(Case):
+    """The switch as Apple Home and the Home service see it."""
+
+    def setUp(self):
+        super().setUp()
+        os.remove(os.path.join(cli.TRACKING_DIR, "settings.json"))
+        self.set(kelvin=6500, brightness=100)           # following: every bulb at 6500K, 100%
+        self.fixture.claim("follow")
+        cli.follow_apply(self.fixture, self.sun(DAY))
+        self.assertTrue(cli.tracking()["on"])
+        self.link = homekit.Link(self.fixture)
+        self.link.poll()
+
+    def write(self, **values):
+        self.link.apply_home(values)
+        self.link.send_wanted()
+
+    def test_a_brightness_from_home_turns_tracking_off(self):
+        self.write(Brightness=40)
+        track = cli.tracking()
+        self.assertEqual((track["on"], track["by"]), (False, "fixture"))
+        self.assertIsNone(cli.follow_apply(self.fixture, self.sun(DUSK, 1)) and None)
+        self.assertEqual(self.shown(), (7, [40]))        # left exactly as he set it
+
+    def test_off_and_on_from_home_do_not(self):
+        self.write(On=False)
+        self.write(On=True)
+        self.write(On=True, Brightness=100)              # Home repeating what it shows
+        self.assertTrue(cli.tracking()["on"])
+
+    def test_a_change_in_the_wiz_app_turns_it_off_within_seconds(self):
+        for bulb in self.net.bulbs.values():
+            bulb.update(temp=3000, dimming=30)
+        self.link.poll()                                 # the service's look at the bulbs
+        self.assertEqual((cli.tracking()["on"], cli.tracking()["by"]), (False, "fixture"))
+
+    def test_switched_on_the_fixture_goes_to_the_sun_at_once(self):
+        self.write(Brightness=40, ColorTemperature=300)
+        self.assertFalse(cli.tracking()["on"])
+        cli.set_tracking(True, "home", now=time.time() + 10)   # the tile, well after the change
+        self.link.watch_tracking()
+        self.assertEqual(self.shown(), (7, [100]))
+        self.assertEqual(self.net.bulb(MACS[0])["temp"], 6500)
+        self.assertEqual(self.fixture.state()["by"], "follow")
+        self.link.watch_tracking()                       # nothing more until it changes again
+        self.assertTrue(cli.tracking()["on"])
+
+    def test_a_scene_with_the_switch_and_colours_ends_with_the_colours(self):
+        self.write(Brightness=40)                        # the scene's colour
+        cli.set_tracking(True, "home")                   # and its "on", in the same breath
+        self.assertFalse(cli.tracking()["on"])
+        self.link.watch_tracking()
+        self.assertEqual(self.shown(), (7, [40]))
+
+    def test_on_from_home_while_tracking_is_off(self):
+        self.write(Brightness=40, ColorTemperature=300)
+        self.write(On=False)
+        self.write(On=True)                              # a fresh start: the sun's setting, once
+        self.assertEqual((self.net.bulb(MACS[0])["temp"], self.shown()), (6500, (7, [100])))
+        self.assertFalse(cli.tracking()["on"])           # but tracking stays off
 
 
 class HomeKitTest(Case):

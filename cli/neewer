@@ -730,6 +730,137 @@ def state_stamp():
         return None
 
 
+# ---------------------------------------------------------------- sun tracking
+#
+# One switch for everything that follows the sun: this light, the other one,
+# the monitors and the keyboard. tracking.json is the one record of it, read
+# by every follower and every Apple Home service:
+#   on      true: everything follows the sun
+#   since   when it last changed
+#   by      who changed it: home, cli, dawn, or the device that was set by hand
+#   why     a few words for the status lines
+# Setting any device by hand (a colour, a brightness; not switching it on or
+# off) turns tracking off, and then every device stays as it is, with no
+# timer, until tracking is turned on again. It turns itself on before sunrise.
+#
+# settings.json beside it: "switch": false goes back to the old way, where a
+# setting made by hand is held for hold_minutes and then followed again;
+# "on_before_sunrise": false stops the switch turning itself on.
+
+TRACKING_DIR = os.path.expanduser("~/Library/Application Support/SunTracking")
+# A Home scene may turn the switch on and set colours in the same breath, in
+# either order. The colours win: for this long after a device was set by hand,
+# Home's "on" is not taken.
+SCENE_SECONDS = 5
+
+
+def tracking_settings():
+    given = read_json(os.path.join(TRACKING_DIR, "settings.json"), {})
+    return {"switch": given.get("switch") is not False,
+            "on_before_sunrise": given.get("on_before_sunrise") is not False}
+
+
+def tracking():
+    state = read_json(os.path.join(TRACKING_DIR, "tracking.json"), {})
+    return {"on": state.get("on") is not False, "since": float(state.get("since") or 0),
+            "by": str(state.get("by") or ""), "why": str(state.get("why") or "")}
+
+
+def set_tracking(on, by, why="", now=None):
+    """Turns sun tracking on or off for everything. Returns how it stands afterwards."""
+    now = time.time() if now is None else now
+    state = tracking()
+    if state["on"] == bool(on):
+        return state
+    if on and by == "home" and state["by"] not in ("home", "cli", "") and now - state["since"] < SCENE_SECONDS:
+        return state  # a scene's colours came first; they win
+    state = {"on": bool(on), "since": now, "by": by, "why": why}
+    write_json(os.path.join(TRACKING_DIR, "tracking.json"), state)
+    return state
+
+
+def tracking_text(state=None):
+    """Sun tracking in a few words, for the status lines."""
+    state = tracking() if state is None else state
+    at = time.strftime("%H:%M", time.localtime(state["since"])) if state["since"] else "the start"
+    if not tracking_settings()["switch"]:
+        return "not in use (a setting made by hand is held for a time instead)"
+    if state["on"]:
+        how = {"dawn": ", switched on before sunrise", "home": ", from Apple Home", "cli": ", by command"}
+        return "on since %s%s" % (at, how.get(state["by"], ""))
+    if state["by"] in ("home", "cli"):
+        return "off since %s, switched off %s" % (at, "from Apple Home" if state["by"] == "home" else "by command")
+    return "off since %s, when the %s %s set by hand%s" % (
+        at, state["by"], "were" if state["by"] == "monitors" else "was", " (%s)" % state["why"] if state["why"] else "")
+
+
+def sun_elevation(moment, latitude, longitude):
+    """The sun's height in degrees at a Unix time (sundial's own formula)."""
+    n = moment / 86400.0 + 2440587.5 - 2451545.0
+    g = math.radians((357.528 + 0.9856003 * n) % 360)
+    lam = math.radians((280.460 + 0.9856474 * n) % 360 + 1.915 * math.sin(g) + 0.020 * math.sin(2 * g))
+    eps = math.radians(23.439 - 0.0000004 * n)
+    ra = math.atan2(math.cos(eps) * math.sin(lam), math.cos(lam))
+    dec = math.asin(math.sin(eps) * math.sin(lam))
+    ha = math.radians(((18.697374558 + 24.06570982441908 * n) % 24) * 15 + longitude) - ra
+    la = math.radians(latitude)
+    return math.degrees(math.asin(math.sin(la) * math.sin(dec) + math.cos(la) * math.cos(dec) * math.cos(ha)))
+
+
+def civil_dawn(now):
+    """When the sun reaches 6 degrees below the horizon this morning, or None.
+
+    The place is sundial's ([location] in its settings). Civil dawn is always
+    before sunrise, by about half an hour.
+    """
+    import configparser
+    sundial = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    try:
+        sundial.read(SUNDIAL_CONFIG_FILE)
+        latitude, longitude = sundial.getfloat("location", "latitude"), sundial.getfloat("location", "longitude")
+    except (configparser.Error, ValueError):
+        return None
+    today = time.localtime(now)
+    midnight = time.mktime((today.tm_year, today.tm_mon, today.tm_mday, 0, 0, 0, 0, 0, -1))
+    if sun_elevation(midnight, latitude, longitude) >= -6:
+        return None  # no night to speak of
+    for minute in range(1, 14 * 60):
+        if sun_elevation(midnight + minute * 60, latitude, longitude) >= -6:
+            return midnight + minute * 60
+    return None
+
+
+def tracking_tick(settings, now):
+    """Turns tracking on before sunrise, once a day: at civil dawn or the morning time, whichever is first.
+
+    Only if it was switched off before then. Switched off later in the day,
+    it stays off until the next morning.
+    """
+    chosen, state = tracking_settings(), tracking()
+    if not chosen["switch"] or not chosen["on_before_sunrise"] or state["on"]:
+        return
+    due = [civil_dawn(now)]
+    times = sleep_times(settings)
+    if times is not None:
+        today = time.localtime(now)
+        due.append(time.mktime((today.tm_year, today.tm_mon, today.tm_mday, times[1] // 60, times[1] % 60, 0, 0, 0, -1))
+                   - settings["morning_lead_minutes"] * 60)
+    due = [moment for moment in due if moment is not None]
+    if due and state["since"] < min(due) <= now:
+        set_tracking(True, "dawn", now=now)
+
+
+def cmd_tracking(thing, args):
+    """`tracking`, `tracking on`, `tracking off`: the one switch for everything that follows the sun."""
+    if args.action in ("on", "off"):
+        set_tracking(args.action == "on", "cli")
+        if args.action == "on":
+            line = follow_apply(thing)  # this one at once; the others notice within seconds
+            if line:
+                print(line)
+    print("Sun tracking: %s" % tracking_text())
+
+
 # ---------------------------------------------------------------- bedtime
 #
 # The one place the follower switches the light off and on. At bedtime it
@@ -1027,6 +1158,7 @@ def follow_step(light, memory, now, send=True, sunrise_running=sunrise_is_runnin
     if not settings["enabled"]:
         return "off", "following is switched off", False
     if send:
+        tracking_tick(settings, now)
         fresh_bookkeeping(memory, settings, light.state.get("on") is True, now)
     verdict = bedtime_step(light, memory, settings, now, send, sunrise_running)
     if verdict is not None:
@@ -1037,7 +1169,7 @@ def follow_step(light, memory, now, send=True, sunrise_running=sunrise_is_runnin
 
     # Whose setting is this? The follower's own, if the state file is as it
     # left it, or shows the same setting (only the power was switched).
-    until = None
+    until, manual = None, None
     if stamp == memory.get("stamp") or look == memory.get("sent"):
         memory.pop("manual", None)
         memory["stamp"] = stamp
@@ -1050,10 +1182,23 @@ def follow_step(light, memory, now, send=True, sunrise_running=sunrise_is_runnin
     if state.get("on") is not True:
         return "light off", "the light is off; leaving it alone", False
     if sunrise_running():
+        if send:
+            memory["sunrise"] = now
         return "sunrise", "a sunrise is running; leaving it alone", False
     fresh = settings["fresh_start"] and memory.get("fresh")
     if fresh:
         until = None  # a fresh start is not held up by a setting made as the light came on
+    if tracking_settings()["switch"]:
+        # One switch, no timer: a setting made by hand turns sun tracking off
+        # for everything, and it stays off until it is turned on again.
+        track = tracking()
+        # What a sunrise leaves behind is not a setting by hand; it is taken over.
+        after_sunrise = manual is not None and manual["since"] <= memory.get("sunrise", 0) + 90
+        if until is not None and track["on"] and manual["since"] > track["since"] and not after_sunrise:
+            track = set_tracking(False, "light", describe(state), now) if send else dict(track, on=False)
+        until = None  # a setting from before tracking was turned on is taken over
+        if not track["on"] and not fresh:
+            return "tracking off", "sun tracking is %s; leaving the light alone" % tracking_text(track), False
     if until is not None and now < until:
         at = time.strftime("%H:%M", time.localtime(until))
         return "hold " + at, "the light was set elsewhere (%s); following again at %s" % (describe(state), at), False
@@ -1136,6 +1281,7 @@ def cmd_follow(light, args):
             print("following is off; the light stays as it is")
             return
         # Switching on also ends any hold: take the light over now.
+        set_tracking(True, "cli")
         memory = read_json(FOLLOW_MEMORY_FILE, {})
         memory.pop("manual", None)
         memory["stamp"], memory["sent"] = state_stamp(), follow_look(light.state)
@@ -1156,6 +1302,7 @@ def cmd_follow(light, args):
     except Failure as failure:
         print("Sun:       unknown (%s)" % failure)
     print("Light:     %s" % describe(light.state))
+    print("Tracking:  %s" % tracking_text())
     print("Bedtime:   %s" % bedtime_outlook(light, settings, read_json(FOLLOW_MEMORY_FILE, {}), now))
     print("Fresh:     %s" % fresh_outlook(settings, read_json(FOLLOW_MEMORY_FILE, {}), light.state.get("on") is True, now))
     try:
@@ -1330,6 +1477,8 @@ def build_parser():
                          help="sky follows the real sky's brightness (default); glow is the red-glow ramp")
     sunrise.add_argument("--plan", action="store_true", help="print the steps and send nothing")
 
+    track = add("tracking", cmd_tracking, "the switch for everything that follows the sun: neewer tracking on")
+    track.add_argument("action", nargs="?", choices=["on", "off", "status"], default="status")
     follow = add("follow", cmd_follow, "follow the sun through the day: neewer follow on")
     follow.add_argument("action", nargs="?", choices=["on", "off", "status", "apply"], default="status",
                         help="on, off, status (default), or apply: set the light once, as the minute timer does")

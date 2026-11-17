@@ -48,7 +48,7 @@ class Scaffold(unittest.TestCase):
         self.addCleanup(self.folder.cleanup)
         self.saved = {name: getattr(cli, name) for name in (
             "LIGHT_FILE", "STATE_FILE", "FOLLOW_FILE", "FOLLOW_MEMORY_FILE", "SUNDIAL_STATE_FILE",
-            "SUNDIAL_CONFIG_FILE", "Bridge", "pause")}
+            "SUNDIAL_CONFIG_FILE", "TRACKING_DIR", "Bridge", "pause")}
         self.addCleanup(lambda: [setattr(cli, name, value) for name, value in self.saved.items()])
         for name, file in (("LIGHT_FILE", "light.json"), ("STATE_FILE", "state.json"),
                            ("FOLLOW_FILE", "follow.json"), ("FOLLOW_MEMORY_FILE", "follow-state.json"),
@@ -58,6 +58,10 @@ class Scaffold(unittest.TestCase):
             setattr(cli, name, os.path.join(self.folder.name, file))
         cli.Bridge = FakeBridge
         FakeBridge.sent, FakeBridge.broken = [], False
+        # These tests are of the older way, where a setting made by hand is
+        # held for a time. TrackingTest is of the switch.
+        cli.TRACKING_DIR = os.path.join(self.folder.name, "tracking")
+        cli.write_json(os.path.join(cli.TRACKING_DIR, "settings.json"), {"switch": False})
         cli.write_json(cli.LIGHT_FILE, {"mac": MAC})
         self.now = time.time()
         self.sunrise = False
@@ -294,8 +298,8 @@ class FollowTest(Scaffold):
         self.assertIs(cli.read_json(cli.FOLLOW_FILE, {})["enabled"], True)
 
 
-class BedtimeTest(Scaffold):
-    """The bedtime rule, with sundial saying bedtime 23:00 and wake 07:00."""
+class BedtimeScaffold(Scaffold):
+    """An evening with sundial saying bedtime 23:00 and wake 07:00, and a clock to move."""
 
     def setUp(self):
         super().setUp()
@@ -335,6 +339,9 @@ class BedtimeTest(Scaffold):
     def status(self):
         light = cli.Light(argparse.Namespace(bridge=None, mac=None, quiet=True))
         return cli.bedtime_outlook(light, cli.follow_settings(), cli.read_json(cli.FOLLOW_MEMORY_FILE, {}), self.now)
+
+class BedtimeTest(BedtimeScaffold):
+    """The bedtime rule."""
 
     def test_times_come_from_sundial(self):
         self.assertEqual(cli.sleep_times(cli.follow_settings()), (23 * 60, 7 * 60))
@@ -529,7 +536,7 @@ class BedtimeTest(Scaffold):
         self.assertIs(self.state()["on"], True)
 
 
-class FreshStartTest(BedtimeTest):
+class FreshStartTest(BedtimeScaffold):
     """A light switched on by day after being off goes straight to the sun's setting."""
 
     def outlook(self):
@@ -652,6 +659,181 @@ class FreshStartTest(BedtimeTest):
         self.sun(DUSK)
         self.at(11, 0, day=1)
         self.assertIn("white 4100K at 29%", self.apply())
+
+
+class TrackingTest(BedtimeScaffold):
+    """The sun tracking switch: no timer; a setting by hand turns it off for everything."""
+
+    def setUp(self):
+        super().setUp()
+        os.remove(os.path.join(cli.TRACKING_DIR, "settings.json"))  # the switch is the default
+        self.sun(DAY)
+        self.at(9, 0, day=1)
+        self.apply()
+        FakeBridge.sent = []
+
+    def test_it_starts_on(self):
+        self.assertTrue(cli.tracking()["on"])
+        self.assertTrue(cli.tracking_settings()["switch"])
+
+    def test_a_setting_by_hand_turns_it_off_with_no_timer(self):
+        self.at(10, 0, day=1)
+        self.by_hand(brightness=40, kelvin=3000)
+        line = self.apply()
+        self.assertIn("sun tracking is off since 10:00, when the light was set by hand", line)
+        track = cli.tracking()
+        self.assertEqual((track["on"], track["by"]), (False, "light"))
+        for hour in (11, 14, 20):                      # long past any two hours
+            self.at(hour, 0, day=1)
+            self.assertIsNone(self.apply())
+        self.assertEqual(FakeBridge.sent, [])
+        self.assertEqual((self.state()["brightness"], self.state()["kelvin"]), (40, 3000))
+
+    def test_switched_on_again_it_follows_at_once(self):
+        self.at(10, 0, day=1)
+        self.by_hand(brightness=40, kelvin=3000)
+        self.apply()
+        self.at(12, 0, day=1)
+        cli.set_tracking(True, "home", now=self.now)
+        self.assertIn("white 6500K at 100%", self.apply())   # the old setting by hand is taken over
+        self.assertTrue(cli.tracking()["on"])
+        self.at(12, 1, day=1)
+        self.assertIsNone(self.apply())
+
+    def test_switching_the_light_off_and_on_is_not_a_setting(self):
+        self.at(10, 0, day=1)
+        self.by_hand(on=False)
+        self.apply()
+        self.at(10, 30, day=1)
+        self.by_hand(on=True)
+        self.apply()
+        self.assertTrue(cli.tracking()["on"])
+
+    def test_switched_off_by_hand_everything_is_left_alone(self):
+        cli.set_tracking(False, "home", now=self.now)
+        self.sun(DUSK)
+        self.at(16, 0, day=1)
+        self.assertIn("sun tracking is off since 09:00, switched off from Apple Home", self.apply())
+        self.assertEqual(FakeBridge.sent, [])
+
+    def test_it_turns_itself_on_before_sunrise(self):
+        self.at(20, 0, day=1)
+        self.by_hand(brightness=40)
+        self.apply()
+        self.assertFalse(cli.tracking()["on"])
+        self.at(6, 29, day=2)
+        self.apply()
+        self.assertFalse(cli.tracking()["on"])
+        self.at(6, 30, day=2)                           # the morning time; this sundial has no place set
+        self.apply()
+        track = cli.tracking()
+        self.assertEqual((track["on"], track["by"]), (True, "dawn"))
+        self.assertIn("switched on before sunrise", cli.tracking_text())
+
+    def test_civil_dawn_comes_first_when_it_is_earlier(self):
+        with open(cli.SUNDIAL_CONFIG_FILE, "w") as handle:
+            handle.write("[location]\nlatitude = 40.71\nlongitude = -74.01\n[sleep]\nwake = 11:00\nbedtime = 23:00\n")
+        self.at(12, 0, day=1)
+        dawn = cli.civil_dawn(self.now)
+        self.assertAlmostEqual(cli.sun_elevation(dawn, 40.71, -74.01), -6, delta=0.3)
+        self.assertLess(cli.sun_elevation(dawn - 60, 40.71, -74.01), -6)
+        self.assertTrue(4 * 3600 < dawn - self.midnight - 86400 < 8 * 3600)  # somewhere between 04:00 and 08:00
+        self.at(20, 0, day=1)
+        cli.set_tracking(False, "home", now=self.now)
+        self.now = dawn + 86400 - 600                    # ten minutes before the next civil dawn, near enough
+        self.sun(NIGHT)
+        self.apply()
+        self.assertFalse(cli.tracking()["on"])
+        self.now = cli.civil_dawn(self.now + 3600) + 30
+        self.sun(NIGHT)
+        self.apply()
+        self.assertTrue(cli.tracking()["on"])            # hours before the 10:30 morning time
+
+    def test_switched_off_after_dawn_it_stays_off_all_day(self):
+        self.at(8, 0, day=1)
+        cli.set_tracking(False, "home", now=self.now)
+        for hour in (9, 15, 22):
+            self.at(hour, 0, day=1)
+            self.apply()
+        self.assertFalse(cli.tracking()["on"])
+        self.at(6, 30, day=2)
+        self.apply()
+        self.assertTrue(cli.tracking()["on"])
+
+    def test_it_can_be_told_not_to_turn_itself_on(self):
+        cli.write_json(os.path.join(cli.TRACKING_DIR, "settings.json"), {"on_before_sunrise": False})
+        cli.set_tracking(False, "home", now=self.now)
+        self.at(7, 0, day=2)
+        self.apply()
+        self.assertFalse(cli.tracking()["on"])
+
+    def test_bedtime_comes_whatever_the_switch_says(self):
+        self.at(20, 0, day=1)
+        self.by_hand(brightness=40)
+        self.apply()
+        self.sun(NIGHT)
+        self.at(23, 0, day=1)
+        self.assertIn("faded out and switched off", self.apply())
+        self.assertFalse(cli.tracking()["on"])
+        self.sun(DUSK)
+        self.at(6, 30, day=2)
+        self.assertIn("morning: switched on", self.apply())  # and by then tracking is on again
+        self.assertTrue(cli.tracking()["on"])
+
+    def test_a_fresh_start_does_not_turn_tracking_on(self):
+        self.at(10, 0, day=1)
+        self.by_hand(brightness=40, kelvin=3000)
+        self.apply()
+        self.at(11, 0, day=1)
+        self.by_hand(on=False)
+        self.apply()
+        self.at(12, 0, day=1)
+        self.by_hand(on=True)
+        self.assertIn("fresh start", self.apply())       # the light comes on at the sun's setting
+        self.assertEqual((self.state()["kelvin"], self.state()["brightness"]), (6500, 100))
+        self.assertFalse(cli.tracking()["on"])           # but he switched tracking off, and off it stays
+        FakeBridge.sent = []
+        self.sun(DUSK)
+        self.at(13, 0, day=1)
+        self.apply()
+        self.assertEqual(FakeBridge.sent, [])
+
+    def test_a_scene_with_the_switch_and_colours_ends_with_the_colours(self):
+        cli.set_tracking(False, "light", "set from Apple Home", now=self.now)   # the scene's colour arrives
+        self.assertFalse(cli.set_tracking(True, "home", now=self.now + 2)["on"])  # and its "on" a moment later
+        cli.set_tracking(True, "home", now=self.now + 60)                        # a tap a minute later does count
+        self.assertTrue(cli.tracking()["on"])
+        cli.set_tracking(False, "light", now=self.now + 61)                      # the other order: "on", then the colour
+        self.assertFalse(cli.tracking()["on"])
+        self.assertTrue(cli.set_tracking(True, "cli", now=self.now + 62)["on"])  # the command is never refused
+
+    def test_a_sunrise_does_not_turn_tracking_off(self):
+        self.sunrise = True
+        self.at(9, 30, day=1)
+        self.apply()
+        self.at(9, 59, day=1)
+        self.apply()
+        self.by_hand(mode="channels", brightness=100, warm=120, cold=56)  # the ramp's last step
+        self.sunrise = False
+        self.at(10, 0, day=1)
+        self.assertIn("white 6500K at 100%", self.apply())   # taken over, not left alone
+        self.assertTrue(cli.tracking()["on"])
+
+    def test_the_command(self):
+        light = cli.Light(argparse.Namespace(bridge=None, mac=None, quiet=True))
+        cli.cmd_tracking(light, argparse.Namespace(action="off"))
+        self.assertEqual((cli.tracking()["on"], cli.tracking()["by"]), (False, "cli"))
+        cli.cmd_tracking(light, argparse.Namespace(action="on"))
+        self.assertTrue(cli.tracking()["on"])
+        cli.cmd_tracking(light, argparse.Namespace(action="status"))
+
+    def test_the_old_way_is_still_there(self):
+        cli.write_json(os.path.join(cli.TRACKING_DIR, "settings.json"), {"switch": False})
+        self.at(10, 0, day=1)
+        self.by_hand(brightness=40)
+        self.assertIn("following again at 12:00", self.apply())
+        self.assertTrue(cli.tracking()["on"])
+        self.assertIn("not in use", cli.tracking_text())
 
 
 if __name__ == "__main__":

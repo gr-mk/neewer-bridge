@@ -131,6 +131,7 @@ class LightLink:
         self.state_stamp = self.stamp()
         self.sunrise = None  # a Sunrise, stopped whenever Home sets the light
         self.fresh = False   # the setting being sent is a fresh start, to be recorded as the follower's
+        self.tracking_since = cli.tracking()["since"]
         self.thread = threading.Thread(target=self.run, name="light-sender", daemon=True)
 
     @property
@@ -181,6 +182,7 @@ class LightLink:
                 wanted.update(on=True, mode="white", kelvin=fresh[0], brightness=fresh[1], tint=0, curve="linear")
                 self.fresh = True
                 values = {}
+            before = cli.follow_look(wanted)
             # Home may send a temperature together with a matching hue and
             # saturation; the temperature is the one the user chose.
             if "ColorTemperature" in values:
@@ -196,6 +198,10 @@ class LightLink:
                 wanted["brightness"] = max(0, min(100, int(values["Brightness"])))
             if "On" in values:
                 wanted["on"] = bool(values["On"])
+            if cli.follow_look(wanted) != before and cli.tracking_settings()["switch"]:
+                # A colour or brightness from Home: sun tracking goes off, for
+                # everything, until it is switched on again.
+                cli.set_tracking(False, "light", "set from Apple Home")
         self.wake.set()
 
     # -- to the light
@@ -265,6 +271,15 @@ class LightLink:
             log.info("light is %s", "reachable" if reachable else "not reachable")
         self.link_age = link_age if reachable else None
         self.reachable = reachable
+
+    def watch_tracking(self):
+        """When sun tracking is switched on, sets the light from the sun at once, not at the next minute."""
+        track = cli.tracking()
+        if track["since"] == self.tracking_since:
+            return
+        self.tracking_since = track["since"]
+        if track["on"] and cli.tracking_settings()["switch"]:
+            subprocess.Popen([sys.executable, "-u", CLI_FILE, "follow", "apply"], stdin=subprocess.DEVNULL)
 
     def adopt_outside_change(self):
         """Picks up a state change made by the `neewer` command. True if there was one."""
@@ -436,6 +451,7 @@ def build_accessory(driver, name, light, sunrise):
         @Accessory.run_at_interval(3)
         def run(self):
             light.refresh_link()
+            light.watch_tracking()
             if light.adopt_outside_change():
                 self.show(light.snapshot(), notify=True)
             running = sunrise.running()

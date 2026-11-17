@@ -48,6 +48,9 @@ class FakeSundial:
         sundial.main(["manual"] + arguments)
         return True
 
+    def resume(self):
+        sundial.main(["resume"])
+
     def displays(self):
         return self.count
 
@@ -61,7 +64,7 @@ class Case(unittest.TestCase):
         self.addCleanup(self.folder.cleanup)
         saved = [(module, name, getattr(module, name)) for module, name in (
             (sundial, "STATE"), (sundial, "CONFIG"), (sundial, "set_brightness"), (sundial, "set_kelvin"),
-            (sundial, "print"), (desk, "APP_DIR"), (desk, "SUNDIAL_STATE_FILE"), (desk, "CONTROL_FILE"))
+            (sundial, "print"), (desk, "APP_DIR"), (desk, "SUNDIAL_STATE_FILE"), (desk, "CONTROL_FILE"), (desk, "TRACKING_DIR"))
             if hasattr(module, name)]
         self.addCleanup(lambda: [setattr(module, name, value) for module, name, value in saved])
         sundial.STATE = os.path.join(self.folder.name, "sundial", "state.json")
@@ -73,6 +76,10 @@ class Case(unittest.TestCase):
         desk.APP_DIR = os.path.join(self.folder.name, "desk")
         desk.SUNDIAL_STATE_FILE = sundial.STATE
         desk.CONTROL_FILE = os.path.join(self.folder.name, "wooting", "control")
+        # These tests are of the older way, where a change from Home is held
+        # for a time. TrackingTest is of the switch.
+        desk.TRACKING_DIR = os.path.join(self.folder.name, "tracking")
+        desk.write_json(os.path.join(desk.TRACKING_DIR, "settings.json"), {"switch": False})
         self.sun = FakeSundial()
         sundial.main([])  # the minute timer has run once
         self.sent = []
@@ -337,6 +344,119 @@ class KeyboardTest(Case):
         warm = desk.tint(2700)
         self.assertEqual(warm[0], 1.0)
         self.assertTrue(0.55 < warm[1] < 0.75 and 0.2 < warm[2] < 0.45)
+
+
+class TrackingTest(Case):
+    """The sun tracking switch, as the monitors and the keyboard keep to it."""
+
+    def setUp(self):
+        super().setUp()
+        os.remove(os.path.join(desk.TRACKING_DIR, "settings.json"))
+        self.now = time.time()
+        self.monitors = desk.Monitors(self.sun)
+        self.keyboard = desk.Keyboard(self.sun, clock=lambda: self.now)
+
+    def track(self, on, by="home"):
+        desk.write_json(os.path.join(desk.TRACKING_DIR, "tracking.json"),
+                        {"on": on, "since": time.time(), "by": by, "why": ""})
+
+    def tracking(self):
+        return desk.read_json(os.path.join(desk.TRACKING_DIR, "tracking.json"), {})
+
+    def sky(self, daylight, kelvin):
+        state = self.state()
+        state["target"].update(daylight=daylight, kelvin=kelvin)
+        sundial.save_state(state)
+
+    def test_a_brightness_from_home_turns_tracking_off_and_is_held_with_no_end(self):
+        self.monitors.set({"Brightness": 40})
+        self.assertEqual((self.tracking()["on"], self.tracking()["by"]), (False, "monitors"))
+        left = datetime.fromisoformat(self.state()["override"]["until"]) - datetime.now().astimezone()
+        self.assertGreater(left.days, 3000)
+        self.monitors.react()
+        self.assertEqual(self.state()["applied"]["brightness"], 40)
+
+    def test_off_and_on_from_home_do_not(self):
+        self.monitors.set({"On": False})
+        self.monitors.react()
+        self.monitors.set({"On": True})
+        self.monitors.react()
+        self.assertTrue(desk.tracking_on())
+        self.keyboard.set({"On": False})
+        self.keyboard.react()
+        self.assertTrue(desk.tracking_on())
+        self.assertFalse(self.keyboard.view()["on"])
+
+    def test_the_monitors_are_held_as_they_are_while_tracking_is_off(self):
+        before = dict(self.state()["applied"])
+        self.track(False, "light")                       # a light was set by hand
+        self.monitors.react()
+        override = self.state()["override"]
+        self.assertEqual((override["mode"], override["brightness"], override["kelvin"]),
+                         ("manual", before["brightness"], before["kelvin"]))
+        self.sent = []
+        self.monitors.react()                            # once is enough
+        sundial.main([])
+        self.assertEqual(self.sent, [])
+        self.track(True)
+        self.monitors.react()
+        self.assertNotIn("override", self.state())       # sundial follows the sun again
+
+    def test_sundial_manual_by_hand_turns_tracking_off(self):
+        sundial.main(["manual", "60", "brightness=55"])
+        self.monitors.react()
+        self.assertEqual((self.tracking()["on"], self.tracking()["by"]), (False, "monitors"))
+        self.monitors.react()                            # and the 60 minutes become no end
+        left = datetime.fromisoformat(self.state()["override"]["until"]) - datetime.now().astimezone()
+        self.assertGreater(left.days, 3000)
+        self.assertEqual(self.state()["override"]["brightness"], 55)
+
+    def test_monitors_switched_off_stay_off_when_tracking_comes_on(self):
+        self.monitors.set({"On": False})
+        self.track(False, "light")
+        self.monitors.react()
+        self.track(True)
+        self.monitors.react()
+        self.assertFalse(self.monitors.view()["on"])
+        self.assertEqual(self.state()["applied"]["brightness"], 0)
+        self.assertNotIn("kelvin", self.state()["override"])   # the colour follows the sun
+        self.monitors.react()
+        self.assertTrue(desk.tracking_on())              # and that hold is not taken for a setting
+
+    def test_a_pause_is_left_alone(self):
+        sundial.main(["pause", "30"])
+        self.monitors.react()
+        self.assertTrue(desk.tracking_on())
+        self.assertEqual(self.state()["override"]["mode"], "pause")
+
+    def test_the_keyboard_is_held_as_it_is_and_let_go(self):
+        self.sky(0.0, 2700)
+        self.assertEqual(self.keyboard.sync()["brightness"], 25)
+        self.track(False, "light")
+        self.keyboard.react()
+        self.sky(1.0, 6500)                              # the sun moves on; the keyboard does not
+        self.now += 6 * 3600
+        self.assertEqual(self.keyboard.sync(), {"on": True, "brightness": 25, "kelvin": 2700})
+        self.track(True)
+        self.keyboard.react()
+        os.utime(sundial.STATE, (self.now, self.now))    # sundial has kept running
+        self.assertEqual(self.keyboard.sync(), {"on": True, "brightness": 100, "kelvin": 6500})
+
+    def test_a_keyboard_brightness_from_home_turns_tracking_off(self):
+        self.sky(0.0, 2700)
+        self.keyboard.set({"Brightness": 60})
+        self.assertEqual((self.tracking()["on"], self.tracking()["by"]), (False, "keyboard"))
+        self.keyboard.react()
+        self.now += 10 * 3600
+        self.assertEqual(self.keyboard.sync()["brightness"], 60)   # no timer
+
+    def test_the_old_way_is_still_there(self):
+        desk.write_json(os.path.join(desk.TRACKING_DIR, "settings.json"), {"switch": False})
+        self.monitors.set({"Brightness": 40})
+        self.monitors.react()
+        self.assertTrue(desk.tracking_on())
+        left = datetime.fromisoformat(self.state()["override"]["until"]) - datetime.now().astimezone()
+        self.assertAlmostEqual(left.total_seconds(), 120 * 60, delta=5)
 
 
 class LinkTest(Case):
