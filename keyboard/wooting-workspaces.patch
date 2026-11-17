@@ -1,5 +1,5 @@
 --- /Users/grayson/Library/Application Support/Desk/backup-wooting-2026-11-17/wooting-workspaces.c	2026-10-30 23:55:42
-+++ /Users/grayson/.config/aerospace/wooting-workspaces.c	2026-11-17 03:14:47
++++ /Users/grayson/.config/aerospace/wooting-workspaces.c	2026-11-17 12:48:21
 @@ -16,6 +16,9 @@
  //
  // Driven by `aerospace subscribe`, so aerospace.toml needs no hook.
@@ -83,6 +83,15 @@
    kbd_retry_at = now + 2000;
    return 0;
  }
+@@ -491,7 +550,7 @@
+   if (r < 1 || r > 5 || c > 13) return 0;
+   if (r == 3) return c != 12;                     // ISO # key
+   if (r == 4) return c != 1 && c != 12;           // ISO \ key, gap before right shift
+-  if (r == 5) return c <= 2 || c == 6 || c >= 10; // left mods, space, right mods
++  if (r == 5) return 1;                           // mods, and every light under the space bar
+   return 1;
+ }
+ 
 @@ -521,7 +580,7 @@
  
  // What every key should show: a binding layer on a dark board, or the profile
