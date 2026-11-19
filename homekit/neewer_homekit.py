@@ -138,19 +138,30 @@ class LightLink:
         """A state as this light can show it: inside its range, with its curve, and white
         if it has no colour LEDs."""
         mode = state.get("mode")
+        curve = state.get("curve") if state.get("curve") in cli.CURVES else "linear"
         normal = {
             "on": bool(state.get("on")),
             "mode": mode if mode in ("white", "colour") else "white",
             "kelvin": cli.fit_kelvin(profile, state.get("kelvin", 5600)),
             "brightness": int(state.get("brightness", 10)),
             "tint": int(state.get("tint", 0)),
-            "curve": profile["curve"] or (state.get("curve") if state.get("curve") in cli.CURVES else "linear"),
+            "curve": curve if profile["hybrid"] else profile["curve"] or curve,
             "hue": int(state.get("hue", 0)),
             "saturation": int(state.get("saturation", 100)),
+            # Light output as a percent of full, and what the light was last sent.
+            "output": cli.output_of(profile, state) if mode == "white" else float(state.get("brightness", 10)),
+            "shown": cli.shown_of(state),
         }
         if normal["mode"] == "colour" and not profile["colour"]:
             normal.update(mode="white", kelvin=cli.nearest_white(profile, normal["hue"], normal["saturation"]))
         return normal
+
+    def home_brightness(self, state):
+        """Home's brightness for a state: light output, a whole number, at least 1 while lit."""
+        if state["mode"] == "colour" and self.profile["colour"]:
+            return state["brightness"]
+        output = state["output"]
+        return max(1, int(round(output))) if output > 0 else 0
 
     @staticmethod
     def stamp():
@@ -179,11 +190,10 @@ class LightLink:
             # the sun's setting, not back to how it was left.
             fresh = cli.fresh_start_look() if values.get("On") and not wanted["on"] else None
             if fresh is not None:
-                wanted.update(on=True, mode="white", kelvin=fresh[0], brightness=fresh[1], tint=0,
-                              curve=self.profile["curve"] or "linear")
+                wanted.update(on=True, mode="white", kelvin=fresh[0], output=float(fresh[1]), tint=0)
                 self.fresh = True
                 values = {}
-            before = cli.follow_look(wanted)
+            before = (cli.follow_look(wanted), wanted["output"])
             # Home may send a temperature together with a matching hue and
             # saturation; the temperature is the one the user chose.
             if "ColorTemperature" in values:
@@ -202,10 +212,16 @@ class LightLink:
                     wanted["mode"] = "white"
                     wanted["kelvin"] = cli.nearest_white(self.profile, wanted["hue"], wanted["saturation"])
             if "Brightness" in values:
-                wanted["brightness"] = max(0, min(100, int(values["Brightness"])))
+                # Light output. Home also writes back the number it was shown;
+                # that is not a change, and must not round a fraction away.
+                level = max(0, min(100, int(values["Brightness"])))
+                if level != self.home_brightness(wanted):
+                    wanted["output"] = float(level)
+                    if wanted["mode"] == "colour":
+                        wanted["brightness"] = level
             if "On" in values:
                 wanted["on"] = bool(values["On"])
-            if cli.follow_look(wanted) != before and cli.tracking_settings()["switch"]:
+            if (cli.follow_look(wanted), wanted["output"]) != before and cli.tracking_settings()["switch"]:
                 # A colour or brightness from Home: sun tracking goes off, for
                 # everything, until it is switched on again.
                 log.info("sun tracking off: %s set from Apple Home", cli.describe(wanted))
@@ -214,13 +230,25 @@ class LightLink:
 
     # -- to the light
 
-    def mode_frame(self, state):
+    def frames(self, state):
+        """The frames to show a state, from what the light was last sent: [(frame, seconds to wait after)],
+        and the look to record. On a hybrid light a change of curve can take two frames (see cli.HYBRID)."""
         if state["mode"] == "colour" and self.profile["colour"]:
-            return cli.colour_frame(self.mac, state["hue"], state["saturation"], state["brightness"])
+            return [(cli.colour_frame(self.mac, state["hue"], state["saturation"], state["brightness"]), 0.0)], {}
         kelvin = state["kelvin"] if state["mode"] == "white" else cli.nearest_white(
             self.profile, state["hue"], state["saturation"])
-        return cli.white_frame(self.mac, cli.fit_kelvin(self.profile, kelvin), state["brightness"], state["tint"],
-                               self.profile["curve"] or state["curve"])
+        steps, look = cli.plan_white(self.profile, state, kelvin, state["output"], state["tint"])
+        return [(cli.white_frame(self.mac, k, number, tint, curve), wait)
+                for k, number, tint, curve, wait in steps], look
+
+    def mode_frame(self, state):
+        """The frame the light last got, for a state as recorded."""
+        if state["mode"] == "colour" and self.profile["colour"]:
+            return cli.colour_frame(self.mac, state["hue"], state["saturation"], state["brightness"])
+        shown = state["shown"]
+        if None in (shown["curve"], shown["brightness"], shown["kelvin"]):
+            return None
+        return cli.white_frame(self.mac, shown["kelvin"], shown["brightness"], state["tint"], shown["curve"])
 
     def run(self):
         while True:
@@ -253,16 +281,26 @@ class LightLink:
                 self.sent_on = True
                 woke = True
                 time.sleep(0.3)  # a light coming out of standby ignores what follows too closely
-            frame = self.mode_frame(target)
-            if woke or frame != self.sent_frame:
-                self.bridge.send(frame)
-                self.sent_frame = frame
+            frames, look = self.frames(target)
+            if woke or frames[-1][0] != self.sent_frame:
+                for frame, wait in frames:
+                    self.bridge.send(frame)
+                    if wait:
+                        time.sleep(wait)
+                self.sent_frame = frames[-1][0]
+            if look:
+                target.update(brightness=look["brightness"], curve=look["curve"], output=look["output"],
+                              shown=look["shown"])
+                with self.lock:
+                    self.wanted["shown"] = look["shown"]
+                    if (self.wanted["kelvin"], self.wanted["output"]) == (target["kelvin"], target["output"]):
+                        self.wanted.update(brightness=look["brightness"], curve=look["curve"])
         cli.write_json(cli.STATE_FILE, target)
         self.state_stamp = self.stamp()
         if self.fresh:
             self.fresh = False
             cli.fresh_start_done()
-            log.info("fresh start: switched on at white %dK at %d%%", target["kelvin"], target["brightness"])
+            log.info("fresh start: switched on at %s", cli.describe(target))
 
     # -- housekeeping, called on a timer
 
@@ -435,7 +473,7 @@ def build_accessory(driver, name, light, sunrise):
                 hue, saturation = kelvin_to_hue_saturation(state["kelvin"])
             values = (
                 ("On", self.on, state["on"]),
-                ("Brightness", self.brightness, state["brightness"]),
+                ("Brightness", self.brightness, light.home_brightness(state)),
                 ("Hue", self.hue, hue),
                 ("Saturation", self.saturation, saturation),
                 ("ColorTemperature", self.temperature, kelvin_to_mired(state["kelvin"], light.profile)),

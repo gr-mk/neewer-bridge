@@ -17,15 +17,15 @@ The split is deliberate. Rebuilding the bridge changes its code signature, and m
 ```
 neewer on
 neewer off
-neewer white 5600 10        # colour temperature in kelvin, brightness 0-100
+neewer white 5600 10        # colour temperature in kelvin, brightness as light output 0-100
 neewer white 3200 --tint -10
-neewer brightness 1         # keeps the current colour; 1 is the lowest it goes
+neewer brightness 0.5       # keeps the current colour
 neewer sunrise --minutes 30 # ramp up the way a real sunrise brightens
 neewer follow               # show whether the light is following the sun
 neewer status
 ```
 
-Brightness is a whole number, and 1% is as low as it goes on the AS600B. Colour temperature is 2700-6500K on the AS600B, in steps of 100K, as on its display.
+Brightness is light output, as a percent of the light's full output. On the AS600B it can be a fraction, down to about 0.01%, because the dim end is sent on the light's exponential curve (see Two curves). On the CB200C it is a whole number from 1. Colour temperature is 2700-6500K on the AS600B, in steps of 100K, as on its display.
 
 These only work on a light that has colour LEDs or takes the five-channel frame, such as the CB200C. On the AS600B each says so and sends nothing (`colour` and `rgb` also name the nearest white):
 
@@ -57,27 +57,36 @@ What the connected light can do is its profile, in `light.json` in the settings 
 | `curve` | `exp` | none: each command chooses, linear unless asked |
 | `channels` (the five-channel frame) | false | true |
 | `colour` (the hue frame) | false | true |
-| `output_curve` | a stand-in (below) | none |
+| `hybrid` | exponential below 20%, linear above (below) | none |
 
 Every white frame, from every path (the command, the follower, the bedtime fade, the morning, a fresh start, the sunrise, Apple Home), is kept inside the profile's colour temperatures and carries its curve. This matters on the AS600B, which:
 
 - **drops a white frame outside 2700-6500K.** 2500K and 6600K were tried; its display kept the old value. So nothing outside the range is sent: the follower and the rest bring a colour into the range, and `neewer white 6600` refuses with the range.
-- **honours the curve byte**, which sets the light's own dimming curve: 04 linear, 01 exponential. It is kept on exponential. `neewer white 5600 5 --curve linear` sends linear once, for a comparison by eye; the next ordinary send puts exponential back.
+- **honours the curve byte**, which sets the light's own dimming curve: 04 linear, 01 exponential. Each send chooses the curve from the brightness (see Two curves).
 - **ignores the channels frame altogether** (cold white at 255, brightness 15%, did nothing), so there is no `faint`, no `channels`, and a different sunrise (below).
 
-### How bright a setting really is
+### Two curves (the AS600B)
 
-On the exponential curve, a brightness setting is not that share of the light's full output: low settings give far less. `output_curve` is how much light each setting really gives, as pairs of setting and share of full output:
+The AS600B's exponential curve goes far dimmer than its linear one, but it is capped: exp 100 is dimmer than linear 50. So the dim end is sent on the exponential curve and the bright end on the linear one, and every brightness, everywhere, is light output as a percent of full: `neewer white` and `neewer brightness`, the Apple Home slider, the follower, the bedtime fade, the morning switch-on, a fresh start and the sunrise. The profile's `hybrid` says how:
 
 ```
-"output_curve": [[1, 0.0005], [20, 0.02], [50, 0.2], [100, 1.0]]
+"hybrid": {"threshold": 20, "hysteresis": [18, 22], "switch_pause": 1.5,
+           "exp_table": [[1, 0.0001], [45, 0.05], [55, 0.20]]}
 ```
 
-(made-up numbers). Between the points the output is taken to follow a power of the setting, which is a straight line when both are drawn on log scales.
+- **Below 20% output, exponential.** `exp_table` is how much light an exponential setting gives, as pairs of setting and share of full output. Two points were matched by eye against the linear curve, which is taken as proportional to output: exp 45 looks like linear 5, and exp 55 like linear 20. Exp 1 at 0.01% is a guess, so everything below exp 45 is an extrapolation. Between points the output follows a power of the setting, a straight line on log scales. Past exp 55 nothing is measured, so the output there is taken as 20%, the least it can be.
+- **From 20% up, linear**, with the setting the output as a whole number.
+- **Hysteresis.** On the linear curve the light stays linear down to 18%, and on the exponential curve it stays there up to 22%. So a slow ramp through 20% changes curve once, not back and forth.
 
-The follower, the bedtime fade, the morning switch-on, a fresh start and the sunrise all work in light output. They work out how much light they want, as a share of full, and send the setting that gives it. So `night_brightness: 5` means 5% of full output, not setting 5. The Apple Home slider and `neewer white` send the setting as given, with no mapping.
+**Changing curve never flashes.** When the curve byte changes, the light first shows the new number on its old curve and changes curve a moment later. So:
 
-**The AS600B's curve is not measured yet.** Its built-in `output_curve` is a stand-in, `[[1, 0.01], [100, 1.0]]`, under which every setting gives exactly that share of output, so for now nothing is mapped and everything behaves as it did. `neewer status` says which it is. Measured points go into `light.json` as `"output_curve"` beside `"model"`.
+- Exponential to linear is one frame, the linear target: for that moment the light shows the number on the exponential curve, which is dimmer.
+- Linear to exponential is two. First an exponential frame with the number the light is showing now, which is the same light on linear and then dims as the curve changes. Then, after `switch_pause` (1.5 seconds), the exponential target. When the light's curve is not known (after the bedtime fade), the first frame is exp 1.
+- A change within one curve, or of colour only, is one frame.
+
+`neewer white 5600 5 --curve linear` (or `--curve exp`) sends the number raw on that curve, with no mapping, for comparisons by eye. The next ordinary send maps again. `neewer status` shows the profile, and the last setting as output with the curve and number that gave it: `white 5600K at 5% (exp 45)`.
+
+A light without `hybrid` (the CB200C) has one curve, and an optional `output_curve` of setting and share pairs in place of the table.
 
 ## Sunrise
 
@@ -97,7 +106,7 @@ The brightness follows the real sky. It uses the standard table of clear-sky ill
 
 The colour is an approximation, not a measured table. It is a view towards the sunrise: cold white in twilight, warming to about 2800K as the sun reaches the horizon, then whitening to the target.
 
-**On the AS600B** there is no channels frame, so the sky sunrise is sent as white frames only, on the exponential curve. It is the same sky in light output: `--brightness` is where it ends as a share of full output, and each step sends the setting that gives the sky's share (see How bright a setting really is; for now the setting is the share). It starts where the sky is as dim, relative to the end, as the light's lowest setting is, so it opens at 1% with the sun about 2 degrees down, rather than in deep twilight. The colour is the sky's, kept within 2700-6500K: cool white in twilight, about 2800K at the horizon, then whitening to the target. `--style glow` on this light is a plain ramp in light output from the lowest setting to the target, warmest white to the target colour. Neither has been watched on the light yet; `--plan` shows the steps.
+**On the AS600B** there is no channels frame, so the sky sunrise is sent as white frames only. It is the same sky in light output: `--brightness` is where it ends as a share of full output, and each step sends the setting that gives the sky's share (see Two curves). It starts where the sky is as dim, relative to the end, as the light's lowest setting is: exp 1, about 0.01%, in deep twilight. It climbs on the exponential curve to exp 55 and changes to linear once, at 22% (about 18 minutes into a 30-minute ramp), going up, so in one frame. The colour is the sky's, kept within 2700-6500K: cool white in twilight, about 2800K at the horizon, then whitening to the target. `--style glow` on this light is a plain ramp in light output from 0.01% to the target, warmest white to the target colour, changing curve in the same way. Neither has been watched on the light yet; `--plan` shows the steps, each with its curve and number.
 
 **On the CB200C** the whole ramp is sent as channels frames, mixing the warm and cold white LEDs, and never uses the white frame. Switching between the two frames shows a wrong colour for a moment, and the channels frame takes fractions of a percent all the way up. The mix was matched by eye against the white frame at 2800K, at 1% and at 10%: channels brightness `b` with levels adding up to 176 is as bright as white at `b`%, 2800K is about 95% warm and 5% cold, and about 1 part in 60 of red takes off a green cast. It has not been compared at other colour temperatures or near full brightness.
 
@@ -152,9 +161,9 @@ The settings are in `follow.json` in the settings folder, and are read each minu
 }
 ```
 
-- Brightness runs from `night_brightness` to `day_brightness` with sundial's "daylight" share. Both are light output as a percent of full; the setting sent is the one that gives it on the light's curve (see How bright a setting really is; for now on the AS600B the setting is the output). With sundial's defaults that is the night level until the sun is 6 degrees below the horizon and the day level once it is 20 degrees up.
+- Brightness runs from `night_brightness` to `day_brightness` with sundial's "daylight" share. Both are light output as a percent of full; the setting sent is the one that gives it (see Two curves: on the AS600B the night's 5% is exp 45, the day's 100% is linear 100). With sundial's defaults that is the night level until the sun is 6 degrees below the horizon and the day level once it is 20 degrees up.
 - Colour is sundial's colour, kept within what the light shows (2700-6500K on the AS600B). While the sun goes from the horizon to 6 degrees below, it moves to `night_kelvin`.
-- `night_brightness` cannot go below 1, because 0 would switch the light off.
+- `night_brightness` cannot go below the light's faintest output (1 on the CB200C, 0.01 on the AS600B), because 0 would switch the light off.
 - `hold_minutes` is how long a setting made elsewhere is left alone, in the older way without the Sun Tracking switch. With the switch it is not used.
 
 ### A fresh start
@@ -179,14 +188,14 @@ Bedtime and the wake time are sundial's (`[sleep]` in `~/.config/sundial/config.
 - **A setting made by hand does not put bedtime off.** A light set an hour before bedtime still goes off at bedtime.
 - **A setting made during the fade stops the fade**, and the light is yours for the night.
 - **Only near the time.** If the Mac was asleep at bedtime, or the rule was switched on in the middle of the night, that night is left alone. Bedtime is acted on within 15 minutes of it.
-- Switching on by hand after the fade brings back the setting from before the fade, not its last step. From Apple Home and the `neewer` command that is certain. The light's own button may wake it at 1%: the old setting is sent to the light as it is switched off, but whether it keeps a setting sent in standby is not known.
+- Switching on by hand after the fade brings back the setting from before the fade, not its last step. From Apple Home and the `neewer` command that is certain. The light's own button may wake it at its faintest: the old setting is sent to the light as it is switched off, but whether it keeps a setting sent in standby is not known.
 - A `neewer sunrise` running at bedtime or at the morning time is left to itself.
 
 `neewer follow` says what the rule will do next: `off at 23:00, on again at 06:30`, `off for the night; on at 06:30`, `on by hand since 01:10; left alone tonight`.
 
 `"bedtime_rule": false` switches the whole rule off. `"morning_on": false` keeps the switching off and drops the switching on. `fade_minutes` and `morning_lead_minutes` are the five minutes and the half hour.
 
-It uses the ordinary white frame, with the light's own curve (exponential on the AS600B). On the CB200C, after a sunrise the light is in the channels mode, so there is one brief wrong colour when following takes over.
+It uses the ordinary white frame. On the AS600B the fade goes down on the linear curve to about 18% and then changes to exponential with the dip above, down to exp 1. From a setting already on the exponential curve it stays exponential, starting at exp 55 at the most (a raw exp 100 counts as 20%, so the fade opens with a step down to exp 55). On the CB200C, after a sunrise the light is in the channels mode, so there is one brief wrong colour when following takes over.
 
 Each change goes to `~/Library/Logs/neewer-follow.log`. `python3 tests/test_follow.py` checks the rules without a light.
 
@@ -205,7 +214,7 @@ Add `--qr code.svg` in place of `--pairing` to write the QR code to a file.
 
 - Home shows the light as on/off, brightness, colour and colour temperature, the range being the light's profile's (2700-6500K on the AS600B: 154-370 mired). The model shown is the profile's.
 - **On a light with white LEDs only (the AS600B)**, a colour chosen on Home's colour wheel becomes the nearest white the light can show, and Home is then shown that white. No colour frame is ever sent. The colour controls are still there, because taking them away would mean pairing the light again.
-- The brightness slider sends the setting as given.
+- The brightness slider is light output (see Two curves), so on the AS600B its whole range works: 1% is exp 17, 10% is exp 50, 80% is linear 80. Home's slider stops at 1; below that is `neewer brightness 0.01`. Home is shown the output too, rounded to a whole number and never below 1 while the light is on, so exp 1 shows as 1. A change of curve from Home goes as above, so dragging down through 18% dips first and never flashes.
 - Home and the `neewer` command share one record of the last setting, so a change made with either shows up in the other within a few seconds.
 - If the bridge loses the light, Home shows "No Response" rather than a state it cannot change.
 - The pairing keys are in `homekit-data/` in the settings folder, readable only by you. Deleting that folder unpairs the light; remove it from the Home app first.
