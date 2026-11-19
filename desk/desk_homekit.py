@@ -610,6 +610,32 @@ def build_bridge(driver, chosen, devices):
     return bridge
 
 
+def log_home_writes(driver):
+    """Logs every value Apple Home writes, with the address it came from: one line a write.
+
+    So a change nobody remembers making (sun tracking turned off by itself,
+    say) can be traced to the iPhone, the home hub or an automation.
+    """
+    original = driver.set_characteristics
+
+    def logged(chars_query, client_addr):
+        parts = []
+        for query in chars_query.get("characteristics", []):
+            if "value" not in query:
+                continue  # only asking to be told of changes
+            char = driver.accessory.get_characteristic(query.get("aid"), query.get("iid"))
+            if char is None:
+                parts.append("aid %s iid %s=%r" % (query.get("aid"), query.get("iid"), query["value"]))
+                continue
+            owner = char.service.broker.display_name if char.service and char.service.broker else "?"
+            service = char.service.display_name if char.service else "?"
+            parts.append("%s %s %s=%r" % (owner, service, char.display_name, query["value"]))
+        if parts:
+            log.info("Home wrote (from %s): %s", client_addr[0] if client_addr else "?", ", ".join(parts))
+        return original(chars_query, client_addr)
+    driver.set_characteristics = logged
+
+
 def record_pairing(driver, accessory):
     pairing = read_json(pairing_file(), {})
     pairing.update({
@@ -644,6 +670,7 @@ def serve():
         interface_choice=[address],
     )
     driver.state.setup_id = pairing["setup_id"]  # keeps the QR code valid across restarts
+    log_home_writes(driver)
     bridge = build_bridge(driver, chosen, devices)
     driver.add_accessory(bridge)
     record_pairing(driver, bridge)

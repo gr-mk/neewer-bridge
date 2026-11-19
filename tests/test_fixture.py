@@ -7,9 +7,12 @@ Each test gets an empty settings folder, a made-up sundial state file, and a
 made-up network of seven bulbs that answer the way the real ones do.
 """
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
+import math
 import os
 import socket
 import sys
@@ -39,11 +42,11 @@ NIGHT = {"sun_elevation": -30.0, "daylight": 0.0, "kelvin": 3400}
 
 
 class Network:
-    """Seven pretend bulbs. Replaces the UDP socket."""
+    """Seven pretend bulbs, or as many as given. Replaces the UDP socket."""
 
-    def __init__(self):
+    def __init__(self, macs=MACS):
         self.bulbs = {"10.0.0.%d" % (n + 11): {"mac": mac, "state": True, "sceneId": 0, "temp": 4000, "dimming": 80}
-                      for n, mac in enumerate(MACS)}
+                      for n, mac in enumerate(macs)}
         self.down = set()   # addresses that do not answer
         self.drop = {}      # address: how many packets to lose first
         self.sent = []      # (address, method, values), in order
@@ -148,8 +151,10 @@ class Case(unittest.TestCase):
         cli.open_socket = lambda: self.net
         cli.own_address = lambda: "10.0.0.2"
         cli.WAITS, cli.SEARCH_WAIT = (0.01,) * 4, 0.01
+        # The older form of layout: the first bulb in the middle, six round it.
         cli.write_json(cli.path("fixture.json"), {"bulbs": MACS, "min_dimming": 1, "min_colour_dimming": 10,
-                                                  "kelvin_min": 2200, "kelvin_max": 6500})
+                                                  "kelvin_min": 2200, "kelvin_max": 6500,
+                                                  "centre": MACS[0], "ring": MACS[1:], "layout_mapped": True})
         self.fixture = cli.Fixture()
         self.now = time.time()
         self.sun(DAY)
@@ -175,7 +180,7 @@ class Case(unittest.TestCase):
         return len(lit), sorted({bulb["dimming"] for bulb in lit})
 
 
-RING = MACS[1:]  # the stand-in layout: the first bulb is the centre
+RING = MACS[1:]  # the test layout: the first bulb is the centre
 
 
 class SplitTest(unittest.TestCase):
@@ -237,13 +242,19 @@ class PatternTest(Case):
         for number, bulbs in expected.items():
             self.assertEqual(sorted(self.fixture.singled(number)), sorted(bulbs), number)
 
-    def test_the_list_order_stands_in_until_the_layout_is_mapped(self):
-        self.assertEqual(self.fixture.layout(), (MACS[0], RING))
+    def test_the_older_form_is_named(self):
+        layout = self.fixture.layout()
+        self.assertEqual(layout["order"], MACS)
+        self.assertEqual((layout["names"][MACS[0]], layout["names"][RING[0]], layout["names"][RING[5]]),
+                         ("centre", "ring 1", "ring 6"))
         self.assertEqual(self.fixture.singled(2), [RING[0], RING[3]])
-        self.layout(MACS[0], RING[:4])  # not a whole layout
-        self.assertEqual(self.fixture.layout(), (MACS[0], RING))
-        self.layout("zz", RING)
-        self.assertEqual(self.fixture.layout(), (MACS[0], RING))
+
+    def test_the_list_order_stands_in_until_the_layout_is_whole(self):
+        for centre, ring in ((MACS[0], RING[:4]), ("zz", RING)):
+            self.layout(centre, ring)
+            layout = self.fixture.layout()
+            self.assertEqual((layout["order"], layout["mapped"]), (MACS, False))
+            self.assertEqual(layout["names"][MACS[2]], "position 3")
 
     def test_a_new_layout_is_used_without_starting_again(self):
         self.set(brightness=1 / 7.0)
@@ -265,9 +276,237 @@ class PatternTest(Case):
         self.assertEqual(higher, sorted([MACS[0], RING[0], RING[1], RING[3], RING[4]]))
         self.assertEqual(self.shown(), (7, [12, 13]))
 
-    def test_other_numbers_of_bulbs_use_the_list_order(self):
+    def test_other_numbers_of_bulbs_are_a_ring_in_list_order(self):
         cli.write_json(cli.path("fixture.json"), {"bulbs": MACS[:4], "min_dimming": 1})
-        self.assertEqual(cli.Fixture().singled(2), MACS[:2])
+        self.assertEqual(cli.Fixture().singled(2), [MACS[0], MACS[2]])  # opposite each other
+        self.assertEqual(cli.Fixture().singled(3), MACS[:3])            # no way to balance three of four
+
+    def test_the_pattern_search_for_the_older_form(self):
+        hexagon = [(0.0, 0.0)] + [(math.sin(2 * math.pi * i / 6), math.cos(2 * math.pi * i / 6)) for i in range(6)]
+        self.assertEqual([list(chosen) for chosen in cli.patterns(hexagon)],
+                         [[], [0], [1, 4], [1, 3, 5], [0, 1, 3, 5], [0, 1, 2, 4, 5], [1, 2, 3, 4, 5, 6],
+                          [0, 1, 2, 3, 4, 5, 6]])
+
+
+UPPER = ["aabbcc0000%02d" % n for n in range(11, 17)]
+LOWER = ["aabbcc0000%02d" % n for n in range(21, 27)]
+# Clockwise round the fixture, the two rings offset: upper 1, lower 2, upper 2, ... upper 6, lower 1.
+ORDER = [bulb for pair in zip(UPPER, LOWER[1:] + LOWER[:1]) for bulb in pair]
+
+
+class TwelveTest(Case):
+    """Twelve bulbs in two rings of six, offset so they alternate: the fixture as it is now."""
+
+    def setUp(self):
+        super().setUp()
+        self.net = Network(UPPER + LOWER)
+        cli.open_socket = lambda: self.net
+        cli.write_json(cli.path("fixture.json"), {
+            "bulbs": UPPER + LOWER, "min_dimming": 1, "min_colour_dimming": 10, "kelvin_min": 2200, "kelvin_max": 6500,
+            "rings": {"upper": UPPER, "lower": LOWER}, "order": ORDER, "layout_mapped": True,
+            "raw_calibration": [{"kelvin": 2700, "percent": 1, "c": 0, "w": 42, "dimming": 10}]})
+        self.fixture = cli.Fixture()
+
+    def names(self, number):
+        names = self.fixture.layout()["names"]
+        return sorted(names[mac] for mac in self.fixture.singled(number))
+
+    def test_names_and_order(self):
+        layout = self.fixture.layout()
+        self.assertEqual(layout["order"], ORDER)
+        self.assertEqual((layout["names"][UPPER[2]], layout["names"][LOWER[4]]), ("upper 3", "lower 5"))
+        self.assertEqual(cli.named_bulb(self.fixture, "Lower 5"), LOWER[4])
+        self.assertEqual(cli.named_bulb(self.fixture, "2"), LOWER[1])  # the second clockwise
+
+    def test_the_patterns_for_twelve(self):
+        def places(*numbers):
+            return sorted(self.fixture.layout()["names"][ORDER[n - 1]] for n in numbers)
+
+        def all_but(*numbers):
+            return places(*[n for n in range(1, 13) if n not in numbers])
+        expected = {
+            1: places(1),                    # one bulb
+            2: places(1, 7),                 # an opposite pair
+            3: places(1, 5, 9),              # a triangle
+            4: places(1, 4, 7, 10),          # a square
+            5: places(1, 2, 6, 7, 10),
+            6: places(2, 4, 6, 8, 10, 12),   # every other one: the whole lower ring
+            7: all_but(3, 6, 7, 11, 12),
+            8: all_but(3, 6, 9, 12),         # all but a square
+            9: all_but(4, 8, 12),            # all but a triangle
+            10: all_but(6, 12),              # all but an opposite pair
+            11: all_but(12),
+            12: places(*range(1, 13)),
+        }
+        for number, bulbs in expected.items():
+            self.assertEqual(self.names(number), bulbs, number)
+        self.assertEqual(self.names(6), sorted("lower %d" % n for n in range(1, 7)))
+
+    def test_every_pattern_is_balanced_where_it_can_be(self):
+        points = self.fixture.layout()["points"]
+        for number, chosen in enumerate(cli.patterns(points)):
+            x, y = sum(points[i][0] for i in chosen), sum(points[i][1] for i in chosen)
+            self.assertLess(math.hypot(x, y), 1e-9 if number not in (1, 11) else 1.0001, number)
+
+    def test_steps_are_twelfths(self):
+        self.set(brightness=12 + 3 / 12.0)
+        higher = sorted(bulb["mac"] for bulb in self.net.bulbs.values() if bulb["dimming"] == 13)
+        self.assertEqual(higher, sorted(ORDER[n - 1] for n in (1, 5, 9)))
+        self.set(brightness=2 / (42 * 12.0))   # below every bulb at the lowest raw level: two bulbs
+        self.assertEqual(sorted(self.net.lit()), sorted([ORDER[0], ORDER[6]]))
+
+    def test_a_new_layout_is_read_without_starting_again(self):
+        self.set(brightness=1 / (42 * 12.0))
+        self.assertEqual(self.net.lit(), [ORDER[0]])
+        saved = cli.read_json(cli.path("fixture.json"), {})
+        saved["order"] = ORDER[5:] + ORDER[:5]
+        cli.write_json(cli.path("fixture.json"), saved)
+        self.set(brightness=1 / (42 * 12.0))
+        self.assertEqual(self.net.lit(), [ORDER[5]])
+
+    def test_status_names_the_places(self):
+        self.set(brightness=50)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.main(["status"])
+        self.assertIn("upper 3", out.getvalue())
+        self.assertIn("lower 5", out.getvalue())
+        self.assertNotIn("not mapped", out.getvalue())
+
+
+class TrackingTripTest(TwelveTest):
+    """What turned sun tracking off by itself while bulbs were being added (2026-11-18)."""
+
+    def setUp(self):
+        super().setUp()
+        os.remove(os.path.join(cli.TRACKING_DIR, "settings.json"))  # the switch, as it is live
+        self.set(kelvin=2700, brightness=1)
+        self.fixture.claim("follow")
+        cli.set_tracking(True, "cli")
+        self.assertIn("already at", cli.follow_apply(self.fixture, self.sun(NIGHT)))
+        self.net.sent = []
+
+    def tracking(self):
+        return cli.tracking()["on"]
+
+    def test_power_back_at_the_wall_is_not_a_setting(self):
+        for bulb in self.net.bulbs.values():   # a power cut: each comes back at its power-on look
+            bulb.update(state=True, temp=4207, dimming=100)
+        state, _ = self.fixture.reconcile()
+        self.assertTrue(self.tracking())
+        self.assertEqual(self.shown(), (12, [1]))           # put back as it was
+        self.assertEqual(self.net.bulb(ORDER[0])["temp"], 2700)
+        self.assertEqual((state["by"], state["fresh"]), ("follow", True))
+
+    def test_power_back_to_some_bulbs_only(self):
+        for mac in ORDER[:5]:
+            self.net.bulb(mac).update(state=True, temp=4207, dimming=100)
+        for mac in ORDER[5:]:
+            self.net.down.add(self.net.address(mac))         # the rest are still starting up
+        self.fixture.reconcile()
+        self.net.down = set()
+        for mac in ORDER[5:]:
+            self.net.bulb(mac).update(state=True, temp=4207, dimming=100)
+        self.fixture.reconcile()
+        cli.custom_check(self.fixture)
+        self.assertTrue(self.tracking())
+        self.assertEqual(self.shown(), (12, [1]))
+
+    def test_switched_on_at_the_wall_when_it_was_off(self):
+        cli.main(["off"])
+        self.assertEqual(self.net.lit(), [])
+        for bulb in self.net.bulbs.values():
+            bulb.update(state=True, temp=4207, dimming=100)
+        state, _ = self.fixture.reconcile()
+        self.assertTrue(state["setting"]["on"])
+        self.assertTrue(state["fresh"])
+        self.assertTrue(self.tracking())
+        self.assertEqual(self.shown(), (12, [1]))
+
+    def test_a_bulb_added_to_the_fixture_is_brought_into_line(self):
+        extra = "aabbcc000099"
+        self.net.bulbs["10.0.0.99"] = {"mac": extra, "state": True, "sceneId": 0, "temp": 4000, "dimming": 80}
+        saved = cli.read_json(cli.path("fixture.json"), {})
+        saved["bulbs"].append(extra)
+        cli.write_json(cli.path("fixture.json"), saved)
+        state, _ = self.fixture.reconcile()       # the same Fixture: it reads the list again
+        self.assertIn(extra, self.fixture.macs)
+        cli.custom_check(self.fixture)
+        self.assertTrue(self.tracking())
+        self.assertEqual((self.net.bulb(extra)["temp"], self.net.bulb(extra)["dimming"]), (2700, 1))
+        self.assertEqual(state["by"], "follow")
+
+    def test_a_bulb_that_was_not_answering_is_brought_into_line(self):
+        mac = ORDER[3]
+        self.net.down.add(self.net.address(mac))
+        self.fixture.reconcile()
+        self.net.down = set()
+        self.net.bulb(mac).update(temp=3000, dimming=40)   # as it was left, out of reach
+        self.fixture.reconcile()
+        cli.custom_check(self.fixture)
+        self.assertTrue(self.tracking())
+        self.assertEqual(self.net.bulb(mac)["temp"], 2700)
+
+    def test_a_change_on_every_bulb_still_counts(self):
+        for bulb in self.net.bulbs.values():
+            bulb.update(temp=3000, dimming=40)            # the WiZ app
+        self.fixture.reconcile()
+        cli.custom_check(self.fixture)
+        self.assertFalse(self.tracking())
+
+    def test_tracking_on_wins_over_a_look_left_from_before(self):
+        cli.set_tracking(False, "home")
+        for i, bulb in enumerate(self.net.bulbs.values()):
+            bulb.update(temp=3000 + 100 * (i % 3), dimming=20 + i)  # a mixed look, never recorded
+        self.assertEqual(cli.main(["tracking", "on"]), 0)
+        self.assertTrue(self.tracking())
+        self.assertEqual(self.shown(), (12, [1]))
+        self.assertEqual(self.net.bulb(ORDER[0])["temp"], 2700)
+        for minute in (1, 2):                              # and it stays won
+            self.assertNotIn("tracking is off", cli.follow_apply(self.fixture, self.sun(NIGHT, minute)) or "")
+        cli.custom_check(self.fixture)
+        self.assertTrue(self.tracking())
+
+    def test_the_service_does_not_undo_tracking_on_before_the_follower_runs(self):
+        cli.set_tracking(False, "home")
+        for bulb in self.net.bulbs.values():
+            bulb.update(temp=3000, dimming=20)
+        cli.set_tracking(True, "home")   # the tile, from Apple Home
+        self.fixture.reconcile()                               # the service looks first
+        cli.custom_check(self.fixture)
+        self.assertTrue(self.tracking())
+        cli.follow_apply(self.fixture, self.sun(NIGHT))        # then the follower takes over
+        self.assertEqual(self.shown(), (12, [1]))
+        for bulb in self.net.bulbs.values():                   # and a change after that counts again
+            bulb.update(temp=3000, dimming=20)
+        self.fixture.reconcile()
+        cli.custom_check(self.fixture)
+        self.assertFalse(self.tracking())
+
+    def test_a_scene_with_the_switch_first_and_then_colours(self):
+        cli.set_tracking(False, "home")
+        cli.set_tracking(True, "home")
+        self.fixture.apply(dict(self.fixture.state()["setting"], brightness=40.0, kelvin=3000), "home")
+        cli.custom_check(self.fixture)
+        self.assertFalse(self.tracking())                      # the colours win
+
+    def test_compare_does_not_turn_tracking_off(self):
+        self.assertEqual(cli.main(["compare", "--bulb", "upper 3", "--raw-w", "42"]), 0)
+        self.fixture.reconcile()
+        cli.custom_check(self.fixture)
+        self.assertTrue(self.tracking())
+        self.assertIn("comparing", cli.follow_apply(self.fixture, self.sun(NIGHT, 1)))
+        self.assertEqual(self.net.bulb(UPPER[2])["w"], 42)      # left alone meanwhile
+        self.assertEqual(cli.main(["compare", "--restore"]), 0)
+        self.assertEqual(self.shown(), (12, [1]))
+        self.assertTrue(self.tracking())
+
+    def test_a_forgotten_comparison_runs_out(self):
+        cli.main(["compare", "--bulb", "upper 3", "--raw-w", "42"])
+        cli.follow_apply(self.fixture, self.sun(NIGHT, 31))
+        self.assertFalse(os.path.exists(cli.path("compare.json")))
+        self.assertEqual(self.net.bulb(UPPER[2])["temp"], 2700)
+        self.assertTrue(self.tracking())
 
 
 class FanOutTest(Case):
@@ -646,21 +885,18 @@ class RawModeTest(Case):
 class CompareTest(Case):
     def setUp(self):
         super().setUp()
-        saved = cli.read_json(cli.path("fixture.json"), {})
-        saved.update(ring_names=["north", "northeast", "southeast", "south", "southwest", "northwest"])
-        cli.write_json(cli.path("fixture.json"), saved)
         self.set(kelvin=2700, brightness=1)
         self.fixture.claim("follow")
 
     def test_bulbs_by_name(self):
-        for name, mac in (("centre", MACS[0]), ("north", RING[0]), ("South", RING[3]), ("ring 5", RING[5]),
-                          ("2", RING[2]), (MACS[4], MACS[4])):
+        for name, mac in (("centre", MACS[0]), ("ring 1", RING[0]), ("Ring  4", RING[3]), ("ring 6", RING[5]),
+                          ("3", RING[1]), (MACS[4], MACS[4])):
             self.assertEqual(cli.named_bulb(self.fixture, name), mac)
         with self.assertRaises(cli.Failure):
             cli.named_bulb(self.fixture, "upstairs")
 
     def test_one_bulb_is_set_and_the_rest_are_left(self):
-        self.assertEqual(cli.main(["compare", "--bulb", "south", "--raw-w", "120", "--raw-dimming", "40"]), 0)
+        self.assertEqual(cli.main(["compare", "--bulb", "ring 4", "--raw-w", "120", "--raw-dimming", "40"]), 0)
         bulb = self.net.bulb(RING[3])
         self.assertEqual((bulb["w"], bulb["c"], bulb["dimming"], bulb["state"]), (120, 0, 40, True))
         self.assertNotIn("temp", bulb)
@@ -676,9 +912,9 @@ class CompareTest(Case):
     def test_restore_puts_it_back_and_leaves_no_hold(self):
         before = self.fixture.state()
         cli.main(["compare", "--bulb", "centre", "--raw-w", "42"])
-        self.fixture.reconcile()  # the service notices the bulb, as it would
-        self.assertEqual(self.fixture.state()["by"], "elsewhere")
-        cli.main(["compare", "--bulb", "north", "--raw-w", "30"])
+        self.fixture.reconcile()  # the service looks at the bulbs, as it would
+        self.assertEqual(self.fixture.state()["by"], "follow")  # not taken for a change made by hand
+        cli.main(["compare", "--bulb", "ring 1", "--raw-w", "30"])
         self.assertEqual(cli.main(["compare", "--restore"]), 0)
         self.assertEqual(self.shown(), (7, [1]))
         for bulb in self.net.bulbs.values():
@@ -1424,6 +1660,41 @@ class HomeTrackingTest(Case):
         self.assertEqual(self.fixture.state()["by"], "follow")
         self.link.watch_tracking()                       # nothing more until it changes again
         self.assertTrue(cli.tracking()["on"])
+
+    def test_power_back_by_day_goes_to_the_sun_at_once(self):
+        cli.main(["off"])
+        for bulb in self.net.bulbs.values():             # the wall switch: on at their power-on look
+            bulb.update(state=True, temp=4207, dimming=100)
+        self.net.sent = []
+        self.link.poll()                                  # the service's next look, within seconds
+        self.assertEqual(self.shown(), (7, [100]))
+        self.assertEqual(self.net.bulb(MACS[0])["temp"], 6500)
+        state = self.fixture.state()
+        self.assertEqual((state["by"], state["fresh"]), ("follow", False))
+        self.assertTrue(cli.tracking()["on"])
+
+    def test_every_write_from_home_is_logged(self):
+        try:
+            from pyhap.accessory import Accessory
+        except ImportError:
+            self.skipTest("HAP-python is not installed here; run with the service's Python")
+        from unittest import mock
+        from pyhap.loader import get_loader
+        driver = mock.MagicMock(loader=get_loader())
+        accessory = Accessory(driver, "The Sun", aid=1)
+        service = accessory.add_preload_service("Lightbulb", chars=["Brightness"])
+        driver.accessory = accessory
+        seen = []
+        driver.set_characteristics = lambda query, client: seen.append(query)
+        homekit.log_home_writes(driver)
+        iid = accessory.iid_manager.get_iid(service.get_characteristic("Brightness"))
+        with self.assertLogs("fixture-homekit", "INFO") as logged:
+            driver.set_characteristics({"characteristics": [
+                {"aid": accessory.aid, "iid": iid, "value": 40}, {"aid": accessory.aid, "iid": iid, "ev": True}]},
+                ("192.168.1.149", 50000))
+        self.assertEqual(len(seen), 1)                    # still handed on to HAP-python
+        self.assertEqual(logged.output, ["INFO:fixture-homekit:Home wrote (from 192.168.1.149): "
+                                         "The Sun Lightbulb Brightness=40"])
 
     def test_a_scene_with_the_switch_and_colours_ends_with_the_colours(self):
         self.write(Brightness=40)                        # the scene's colour

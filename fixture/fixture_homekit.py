@@ -305,6 +305,11 @@ class Link:
         missing = [mac for mac in self.fixture.macs if pilots[mac] is None]
         self.note_trouble("not answering: %s" % ", ".join(missing) if missing else None)
         cli.custom_check(self.fixture)  # set in the WiZ app or on a bulb's own tile: tracking goes off
+        if state["fresh"] and state["setting"]["on"] and not self.unsent and cli.fresh_start_setting(self.fixture):
+            # Switched on, or its power back, by day: the fresh start now, not
+            # at the follower's next minute.
+            self.follow_now()
+            state = self.fixture.state()
         with self.lock:
             if self.unsent:
                 return False  # Home's newer wish is about to be sent
@@ -421,6 +426,32 @@ def build_accessory(driver, name, link):
     return FixtureLight()
 
 
+def log_home_writes(driver):
+    """Logs every value Apple Home writes, with the address it came from: one line a write.
+
+    So a change nobody remembers making (sun tracking turned off by itself,
+    say) can be traced to the iPhone, the home hub or an automation.
+    """
+    original = driver.set_characteristics
+
+    def logged(chars_query, client_addr):
+        parts = []
+        for query in chars_query.get("characteristics", []):
+            if "value" not in query:
+                continue  # only asking to be told of changes
+            char = driver.accessory.get_characteristic(query.get("aid"), query.get("iid"))
+            if char is None:
+                parts.append("aid %s iid %s=%r" % (query.get("aid"), query.get("iid"), query["value"]))
+                continue
+            owner = char.service.broker.display_name if char.service and char.service.broker else "?"
+            service = char.service.display_name if char.service else "?"
+            parts.append("%s %s %s=%r" % (owner, service, char.display_name, query["value"]))
+        if parts:
+            log.info("Home wrote (from %s): %s", client_addr[0] if client_addr else "?", ", ".join(parts))
+        return original(chars_query, client_addr)
+    driver.set_characteristics = logged
+
+
 def record_pairing(driver, accessory):
     pairing = cli.read_json(pairing_file(), {})
     pairing.update({
@@ -460,6 +491,7 @@ def serve():
         interface_choice=[address],
     )
     driver.state.setup_id = pairing["setup_id"]  # keeps the QR code valid across restarts
+    log_home_writes(driver)
     link.poll()
     accessory = build_accessory(driver, name, link)
     driver.add_accessory(accessory)

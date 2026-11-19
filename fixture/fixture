@@ -16,7 +16,7 @@ Every change is sent to all the bulbs at once, over the WiZ local protocol
 
 Brightness is the average dimming of the bulbs. A whole number is every bulb
 at that dimming. Fractions single some bulbs out, and white below 1% drives
-the bulbs' white LEDs directly; see `split`, `PATTERNS` and `Fixture.raw`.
+the bulbs' white LEDs directly; see `split`, `patterns` and `Fixture.raw`.
 """
 
 import argparse
@@ -51,10 +51,17 @@ SETTINGS_DEFAULTS = {
     "name": "Fixture",          # the name shown in Apple Home
     "port": 51827,              # the Apple Home service's port
     "bulbs": [],                # MAC addresses
-    "centre": "",               # the bulb in the middle of the fixture
-    "ring": [],                 # the six around it, in order round the hexagon
-    "ring_names": [],           # optional labels for the six ring places, e.g. "north"
-    "layout_mapped": False,     # true once centre and ring are the real positions
+    # Where the bulbs are. "order" is every bulb, clockwise round the
+    # fixture, evenly spaced: the patterns are chosen from it. "rings" names
+    # them: {"upper": [six MACs clockwise], "lower": [...]} makes "upper 3".
+    "order": [],
+    "rings": {},
+    "centre": "",               # the older form: one bulb in the middle and
+    "ring": [],                 # the rest round it, clockwise
+    "layout_mapped": False,     # true once the above are the real positions
+    # How a bulb looks when its power has just come back (the wall switch, a
+    # power cut). A bulb found like this has not been set by anyone.
+    "power_on_look": {"temp": 4207, "dimming": 100},
     "min_dimming": 10,          # the lowest dimming a bulb takes as white
     "min_colour_dimming": 10,   # and as a colour
     "kelvin_min": 2700,
@@ -174,19 +181,66 @@ def settings():
 
 # ---------------------------------------------------------------- brightness
 
-# Which bulbs are singled out when only some of them are. The fixture is one
-# bulb in the centre with six in a hexagon round it; "C" is the centre and the
-# numbers are places round the ring. Each pattern is symmetric.
-PATTERNS = {
-    0: [],
-    1: ["C"],
-    2: [0, 3],              # an opposite pair
-    3: [0, 2, 4],           # every other one: a triangle
-    4: ["C", 0, 2, 4],
-    5: ["C", 0, 1, 3, 4],   # two opposite pairs
-    6: [0, 1, 2, 3, 4, 5],  # the whole ring, centre left out
-    7: ["C", 0, 1, 2, 3, 4, 5],
-}
+# Which bulbs are singled out when only some of them are: lit, when the
+# fixture is dimmer than every bulb at its lowest, or one step brighter than
+# the rest, between whole percentages. They are chosen so the light stays even
+# round the fixture.
+#
+# For twelve bulbs evenly spaced round a ring (where 1 is the first in
+# "order", 2 the next clockwise, and so on), the bulbs singled out are:
+#    1  1                     7  all but 3 6 7 11 12
+#    2  1 7                   8  all but 3 6 9 12
+#    3  1 5 9                 9  all but 4 8 12
+#    4  1 4 7 10              10 all but 6 12
+#    5  1 2 6 7 10            11 all but 12
+#    6  2 4 6 8 10 12
+# and for the older form, a centre and six round it: 1 the centre, 2 an
+# opposite pair, 3 a triangle, 4 the centre and a triangle, 5 the centre and
+# two opposite pairs, 6 the ring.
+
+PATTERN_CACHE = {}
+SEARCH_ALL_UP_TO = 16  # bulbs; past this, the patterns are built one bulb at a time
+
+
+def patterns(points):
+    """For k = 0 to n: which k bulbs to single out, as indices into `points`.
+
+    `points` are the bulbs' places, (x, y), the middle of the fixture at
+    (0, 0). Of all the ways to pick k bulbs, the one taken is:
+      1. the most even: the directions of the bulbs from the middle add up
+         to the least, so the light is not heavier on one side
+      2. the most spread: the closest two of the smaller group (the bulbs
+         singled out, or the rest) are as far apart as can be
+      3. the fewest bulbs changed from the pattern for one bulb fewer, so a
+         slow ramp does not shuffle the fixture
+      4. and then simply the first, so it is always the same
+    """
+    key = tuple((round(x, 6), round(y, 6)) for x, y in points)
+    if key in PATTERN_CACHE:
+        return PATTERN_CACHE[key]
+    import itertools
+    n = len(points)
+    apart = [[math.hypot(a[0] - b[0], a[1] - b[1]) for b in points] for a in points]
+
+    def score(chosen, previous):
+        x = sum(points[i][0] for i in chosen)
+        y = sum(points[i][1] for i in chosen)
+        smaller = chosen if 2 * len(chosen) <= n else [i for i in range(n) if i not in chosen]
+        closest = min((apart[a][b] for a, b in itertools.combinations(smaller, 2)), default=0.0)
+        return (round(math.hypot(x, y), 6), -round(closest, 6), len(previous.symmetric_difference(chosen)),
+                tuple(sorted(chosen)))
+
+    table, previous = [()], set()
+    for k in range(1, n + 1):
+        if n <= SEARCH_ALL_UP_TO:
+            ways = itertools.combinations(range(n), k)
+        else:
+            ways = (tuple(sorted(previous | {i})) for i in range(n) if i not in previous)
+        best = min(score(chosen, previous) for chosen in ways)
+        table.append(best[3])
+        previous = set(best[3])
+    PATTERN_CACHE[key] = table
+    return table
 
 
 def split(brightness, count, floor):
@@ -390,16 +444,18 @@ class Fixture:
       pending   bulbs that did not answer when that was sent
       by        who chose the look: cli, home, follow or elsewhere
       set_at    when
+      absent    bulbs that did not answer at the last look
+      fresh     a fresh start is due (see the follower)
+      followed_since  the sun tracking switch's "since" the follower last
+                acted under, so the first run after tracking is turned on
+                takes the fixture over whatever it looks like
 
     The bulbs can be asked what they are doing, so a change made elsewhere
     (the WiZ app, a bulb's own tile in Apple Home) is noticed by `reconcile`.
     """
 
     def __init__(self):
-        self.settings = settings()
-        self.macs = [clean_mac(mac) for mac in self.settings["bulbs"]]
-        if not self.macs:
-            raise Failure("no bulbs are listed in %s; run: fixture discover --save" % path("fixture.json"))
+        self.refresh()
         self.addresses = read_json(path("addresses.json"), {})
         self.search_every = 0   # seconds between searches for bulbs that stopped answering
         self.searched = None
@@ -407,6 +463,18 @@ class Fixture:
         self.thread_lock = threading.RLock()
         self.depth = 0
         self.lock_handle = None
+
+    def refresh(self):
+        """Reads fixture.json again, so a bulb added to it or taken out counts at once.
+
+        The Apple Home service runs for weeks; without this it would go on
+        with the bulbs it started with.
+        """
+        self.settings = settings()
+        macs = [clean_mac(mac) for mac in self.settings["bulbs"]]
+        if not macs:
+            raise Failure("no bulbs are listed in %s; run: fixture discover --save" % path("fixture.json"))
+        self.macs = macs
 
     @contextlib.contextmanager
     def locked(self):
@@ -552,27 +620,51 @@ class Fixture:
         return ("white", setting["kelvin"], units, raw and (raw["units"], raw["dimming"]))
 
     def layout(self):
-        """(centre, ring) from fixture.json, read afresh so an edit takes effect.
+        """Where the bulbs are, from fixture.json, read afresh so an edit takes effect.
 
-        Without a full layout there (a centre and six ring bulbs, all of them
-        the fixture's own), the list order stands in: first the centre, then
-        the ring.
+        Returns {"order": the bulbs in the order of "points", "points": each
+        one's place as (x, y), "names": {mac: "upper 3"}, "mapped": bool}.
+
+        "order" puts every bulb on one ring, evenly spaced, clockwise. The
+        older form puts "centre" in the middle and "ring" round it. Without
+        either (or if they are not exactly the fixture's bulbs), the order of
+        "bulbs" stands in, as one ring.
         """
         given = settings()
-        try:
-            centre, ring = clean_mac(given["centre"]), [clean_mac(mac) for mac in given["ring"]]
-        except Failure:
-            centre, ring = None, []
-        if sorted([centre] + ring) != sorted(self.macs):
-            centre, ring = self.macs[0], self.macs[1:]
-        return centre, ring
+
+        def macs_of(values):
+            try:
+                return [clean_mac(mac) for mac in values]
+            except Failure:
+                return []
+
+        def round_ring(count, start=0.0):
+            return [(math.sin(start + 2 * math.pi * i / count), math.cos(start + 2 * math.pi * i / count))
+                    for i in range(count)]
+
+        whole = sorted(self.macs)
+        order, centre, ring = macs_of(given["order"]), macs_of([given["centre"]] if given["centre"] else []), \
+            macs_of(given["ring"])
+        names, mapped = {}, given["layout_mapped"]
+        if sorted(order) == whole:
+            points = round_ring(len(order))
+        elif centre and sorted(centre + ring) == whole:
+            order, points = centre + ring, [(0.0, 0.0)] + round_ring(len(ring))
+            names[centre[0]] = "centre"
+            names.update({mac: "ring %d" % (i + 1) for i, mac in enumerate(ring)})
+        else:
+            order, points, mapped = list(self.macs), round_ring(len(self.macs)), False
+        for name, members in given["rings"].items() if isinstance(given["rings"], dict) else ():
+            names.update({mac: "%s %d" % (name, i + 1) for i, mac in enumerate(macs_of(members))
+                          if mac in self.macs and isinstance(members, list)})
+        for i, mac in enumerate(order):
+            names.setdefault(mac, "position %d" % (i + 1))
+        return {"order": order, "points": points, "names": names, "mapped": mapped}
 
     def singled(self, number):
-        """The bulbs singled out when `number` of them are, by PATTERNS."""
-        if len(self.macs) != 7:
-            return self.macs[:number]  # no hexagon: simply the first in the list
-        centre, ring = self.layout()
-        return [centre if place == "C" else ring[place] for place in PATTERNS[number]]
+        """The bulbs singled out when `number` of them are, by `patterns`."""
+        layout = self.layout()
+        return [layout["order"][i] for i in patterns(layout["points"])[clamp(0, number, len(self.macs))]]
 
     def lit(self, setting):
         number, _, others = self.split(setting)
@@ -623,10 +715,12 @@ class Fixture:
             "setting": setting,
             "bulbs": {mac: bulbs[mac] for mac in self.macs if isinstance(bulbs.get(mac), dict)},
             "pending": [mac for mac in raw.get("pending", []) if mac in self.macs],
+            "absent": [mac for mac in raw.get("absent", []) if mac in self.macs],
             "by": raw.get("by") or "elsewhere",
             "set_at": float(raw.get("set_at") or 0),
             "fresh": bool(raw.get("fresh")),            # a fresh start is due (see the follower)
             "fresh_at": float(raw.get("fresh_at") or 0),  # when the last one was made
+            "followed_since": float(raw.get("followed_since") or 0),
         }
 
     def plan(self, setting):
@@ -635,9 +729,9 @@ class Fixture:
         Bulbs that are switched off are still given the look, so they show
         the right thing if the wall switch brings them back on.
         """
-        # fixture.json is read afresh, so a new calibration point or white_mode
-        # takes effect without starting anything again.
-        self.settings = settings()
+        # fixture.json is read afresh, so a new bulb, a new calibration point
+        # or white_mode takes effect without starting anything again.
+        self.refresh()
         number, dimming, others = self.split(setting)
         singled = self.singled(number)
         raw = self.raw(setting)
@@ -733,6 +827,7 @@ class Fixture:
     def apply(self, setting, by):
         """Sets the whole fixture. Returns the MACs of bulbs that did not take it."""
         with self.locked():
+            self.refresh()
             if any(mac not in self.addresses for mac in self.macs):
                 self.read_all()  # finds the bulbs
             state = self.state()
@@ -758,11 +853,12 @@ class Fixture:
             state.update(fresh=False, fresh_at=time.time() if now is None else now)
             write_json(path("state.json"), state)
 
-    def claim(self, by):
+    def claim(self, by, **more):
         """Marks the present look as chosen by `by`, without sending anything."""
         with self.locked():
             state = self.state()
             state["by"], state["set_at"] = by, time.time()
+            state.update(more)
             write_json(path("state.json"), state)
 
     def reconcile(self, dry=False):
@@ -774,6 +870,7 @@ class Fixture:
         # The bulbs are slow to answer, so they are asked before taking the
         # lock. If the record changed meanwhile, the answers may be from before
         # that change, and are left for the next look.
+        self.refresh()
         record = self.state()
         pilots = self.read_all()
         seen = {mac: pilot for mac, pilot in pilots.items() if pilot}
@@ -784,6 +881,7 @@ class Fixture:
             if before != record and self.depth == 1:
                 return before, pilots
             state = self.settle(json.loads(json.dumps(before)), seen, dry)
+            state["absent"] = [mac for mac in self.macs if mac not in seen]
             if state != before and not dry:
                 write_json(path("state.json"), state)
             return state, pilots
@@ -791,32 +889,53 @@ class Fixture:
     def settle(self, state, seen, dry):
         setting, bulbs = state["setting"], state["bulbs"]
         actual = {mac: {"on": bool(pilot.get("state")), "look": pilot_look(pilot)} for mac, pilot in seen.items()}
+        want = dict(self.plan(setting), **bulbs)
 
         def matches(mac):
             # A bulb that is off has no look to compare.
-            want, have = bulbs.get(mac), actual[mac]
-            return want is not None and want["on"] == have["on"] and (not have["on"] or want["look"] == have["look"])
+            have = actual[mac]
+            return want[mac]["on"] == have["on"] and (not have["on"] or want[mac]["look"] == have["look"])
 
+        # Bulbs that have just had their power back, at the wall or after a
+        # power cut, come on at their own power-on look. Nobody set them.
+        default = pilot_look(self.settings["power_on_look"])
+        returned = [mac for mac in actual
+                    if actual[mac]["on"] and default and actual[mac]["look"] == default and not matches(mac)]
+        if returned:
+            state["fresh"] = True  # by day, the follower starts afresh
+            if not setting["on"]:
+                # The fixture was off and is now on: switched on at the wall.
+                setting["on"] = True
+                want = self.plan(setting)
         differing = [mac for mac in actual if not matches(mac)]
+        # Not a change by anyone either: bulbs that are new to the fixture, or
+        # have just had their power back. Nor, if every other bulb is as it
+        # should be, bulbs that missed the last setting or did not answer at
+        # the last look. They are all sent what they should show.
+        behind = [mac for mac in differing if mac in returned or mac not in bulbs]
+        late = [mac for mac in differing if mac in state["pending"] or mac in state["absent"]]
+        if set(differing) <= set(behind) | set(late):
+            behind = differing
         waiting = [mac for mac in state["pending"] if mac not in actual]
-        late = [mac for mac in differing if mac in state["pending"]]
+        if behind:
+            taken = set() if dry else self.send({mac: want[mac] for mac in behind})
+            for mac in behind:
+                bulbs[mac] = actual[mac] = want[mac]
+            waiting += [mac for mac in behind if mac not in taken]
+        state["pending"] = waiting
+        differing = [mac for mac in differing if mac not in behind]
+        for mac in actual:
+            bulbs.setdefault(mac, want[mac])
         if not differing:
-            state["pending"] = waiting
-            return state
-        if len(late) == len(differing):
-            # These bulbs were out of reach when the setting was sent. Send it now.
-            taken = set() if dry else self.send({mac: bulbs[mac] for mac in late})
-            state["pending"] = waiting + [mac for mac in late if mac not in taken]
             return state
 
-        state["pending"] = waiting
         lit = [mac for mac in actual if actual[mac]["on"]]
         if not lit:
             # The whole fixture was switched off elsewhere. Not a new setting.
             setting["on"] = False
             state["fresh"] = True
             for mac in actual:
-                bulbs[mac] = {"on": False, "look": bulbs.get(mac, actual[mac])["look"]}
+                bulbs[mac] = {"on": False, "look": want[mac]["look"]}
             return state
         planned = self.plan(dict(setting, on=True))
         if all(actual[mac]["look"] == planned[mac]["look"] for mac in lit):
@@ -826,8 +945,8 @@ class Fixture:
                 state["bulbs"] = planned
                 return state
             if len(lit) == len(actual):
-                # Every bulb is lit: the power came back at the wall. Switch
-                # off again the bulbs that a low brightness keeps off.
+                # Every bulb is lit as it was: the power came back at the wall.
+                # Switch off again the bulbs that a low brightness keeps off.
                 taken = set(actual) if dry else self.send({mac: planned[mac] for mac in actual})
                 setting["on"] = True
                 state["bulbs"] = planned
@@ -1059,6 +1178,21 @@ def cmd_tracking(thing, args):
     print("Sun tracking: %s" % tracking_text())
 
 
+def set_by_hand(state, track):
+    """True if the fixture was set by hand since sun tracking was turned on.
+
+    When tracking is turned on, the follower takes the fixture over first,
+    whatever it looks like then, even if the bulbs are only now found to
+    differ from the record. Until it has, only a setting made deliberately,
+    from Apple Home or a command, counts. So turning tracking on wins over a
+    look left from before, and a scene's colours still win over a scene's
+    "on".
+    """
+    if state["by"] == "follow" or not state["setting"]["on"] or state["fresh"] or state["set_at"] <= track["since"]:
+        return False
+    return state["by"] in ("home", "cli") or state["followed_since"] == track["since"]
+
+
 def custom_check(fixture, now=None):
     """Turns sun tracking off if the fixture has been set by hand since it was turned on.
 
@@ -1068,9 +1202,30 @@ def custom_check(fixture, now=None):
     if not tracking_settings()["switch"]:
         return
     track, state = tracking(), fixture.state()
-    if (track["on"] and state["by"] != "follow" and state["set_at"] > track["since"]
-            and state["setting"]["on"] and not state["fresh"]):
+    if track["on"] and set_by_hand(state, track):
         set_tracking(False, "fixture", fixture.describe(state["setting"]), now)
+
+
+# ---------------------------------------------------------------- comparing
+#
+# `fixture compare` sets one bulb by hand, to match it against the others by
+# eye. The record is given that bulb's new look, so nothing takes it for a
+# change made elsewhere, and the follower leaves the fixture alone meanwhile,
+# for up to COMPARE_MINUTES. compare.json keeps how it was before.
+
+COMPARE_MINUTES = 30
+
+
+def comparing(fixture, state, now, send):
+    """True while a bulb is set for comparing. A comparison that ran out or was set over is forgotten."""
+    saved = read_json(path("compare.json"), {})
+    if not saved:
+        return False
+    live = (now - float(saved.get("at") or 0) < COMPARE_MINUTES * 60
+            and all(state["bulbs"].get(mac) == bulb for mac, bulb in (saved.get("bulbs") or {}).items()))
+    if not live and send:
+        os.remove(path("compare.json"))
+    return live
 
 
 # ---------------------------------------------------------------- bedtime
@@ -1356,6 +1511,9 @@ def follow_step(fixture, now, send=True, memory=None):
             if send:
                 memory["fresh"] = True  # no bulb answers: off at the wall, most likely
             raise
+        if comparing(fixture, state, now, send):
+            return "comparing", "a bulb is set by hand for comparing; leaving the fixture alone " \
+                "(fixture compare --restore)", False
         if send:
             tracking_tick(follow, now)
             times = sleep_times(follow) if follow["bedtime_rule"] else None
@@ -1381,15 +1539,18 @@ def follow_sun(fixture, follow, state, now, send, memory):
     # Whose setting is this? Anyone's but the follower's is left alone for a while.
     mine = state["by"] == "follow"
     until = state["set_at"] + follow["hold_minutes"] * 60
+    tracked = {}
     if tracking_settings()["switch"]:
         # One switch, no timer: a setting made by hand turns sun tracking off
         # for everything, and it stays off until it is turned on again.
         track = tracking()
-        if track["on"] and not mine and not fresh and state["set_at"] > track["since"]:
+        if track["on"] and set_by_hand(state, track):
             track = set_tracking(False, "fixture", fixture.describe(setting), now) if send else dict(track, on=False)
         if not track["on"] and not fresh:
             return "tracking off", "sun tracking is %s; leaving the fixture alone" % tracking_text(track), False
-        until = 0  # a setting from before tracking was turned on is taken over
+        until = 0  # a look from before tracking was turned on is taken over
+        if track["on"]:
+            tracked = {"followed_since": track["since"]}
     if not mine and now < until and not fresh:
         at = time.strftime("%H:%M", time.localtime(until))
         return "hold " + at, "the fixture was set elsewhere (%s); following again at %s" % (
@@ -1402,8 +1563,8 @@ def follow_sun(fixture, follow, state, now, send, memory):
     # Only what the bulbs would show counts: a target that moved by less
     # than one bulb's step is not sent.
     if state["bulbs"] == fixture.plan(wanted):
-        if send and not mine:
-            fixture.claim("follow")
+        if send and (not mine or tracked.get("followed_since", state["followed_since"]) != state["followed_since"]):
+            fixture.claim("follow", **tracked)
         if send and fresh:
             fixture.fresh_done(now)
             memory["fresh"] = False
@@ -1411,7 +1572,7 @@ def follow_sun(fixture, follow, state, now, send, memory):
     if not send:
         return "following", "%s; about to set %s" % ("fresh start" if fresh else "following the sun", text), False
     missed = fixture.apply(wanted, "follow")
-    fixture.claim("follow")
+    fixture.claim("follow", **tracked)
     if missed:
         text += "; not answering: %s" % ", ".join(missed)
     if fresh:
@@ -1554,24 +1715,21 @@ def cmd_sweep(fixture, args):
 
 
 def named_bulb(fixture, name):
-    """A bulb by its place: centre, a ring name from ring_names, "ring 3" or "3", or a MAC address."""
-    centre, ring = fixture.layout()
-    name = name.strip().lower()
-    names = [str(label).lower() for label in settings()["ring_names"]]
-    if name in ("centre", "center"):
-        return centre
-    if name in names and names.index(name) < len(ring):
-        return ring[names.index(name)]
-    place = name[4:].strip() if name.startswith("ring") else name
-    if place.isdigit() and int(place) < len(ring):
-        return ring[int(place)]
+    """A bulb by its place ("upper 3", "centre", "position 5"), its place in "order" (5) or its MAC address."""
+    layout = fixture.layout()
+    wanted = " ".join(name.strip().lower().split())
+    for mac, place in layout["names"].items():
+        if place.lower() == wanted:
+            return mac
+    if wanted.isdigit() and 1 <= int(wanted) <= len(layout["order"]):
+        return layout["order"][int(wanted) - 1]
     try:
         if clean_mac(name) in fixture.macs:
             return clean_mac(name)
     except Failure:
         pass
-    raise Failure("no bulb is called '%s'; try centre, %s, or ring 0-%d" % (
-        name, ", ".join(names) or "a MAC address", len(ring) - 1))
+    raise Failure("no bulb is called '%s'; try %s, 1-%d, or a MAC address" % (
+        name, ", ".join(sorted(set(layout["names"].values()))[:3]) + ", ...", len(layout["order"])))
 
 
 def cmd_compare(fixture, args):
@@ -1595,17 +1753,24 @@ def cmd_compare(fixture, args):
             print("fixture: not answering: %s" % ", ".join(missed), file=sys.stderr)
         return
     if not args.bulb:
-        raise Failure("say which bulb: fixture compare --bulb centre --raw-w 42")
+        raise Failure("say which bulb: fixture compare --bulb \"upper 3\" --raw-w 42")
     mac = named_bulb(fixture, args.bulb)
     if args.raw_c + args.raw_w == 0:
         raise Failure("--raw-c and --raw-w cannot both be 0")
     with fixture.locked():
         state, _ = fixture.reconcile()
         if not saved:
-            write_json(path("compare.json"), {key: state[key] for key in ("setting", "by", "set_at")})
-        look = pilot_look({"c": args.raw_c, "w": args.raw_w, "dimming": args.raw_dimming})
-        if not fixture.send({mac: {"on": True, "look": look}}):
+            saved = {key: state[key] for key in ("setting", "by", "set_at")}
+        bulb = {"on": True, "look": pilot_look({"c": args.raw_c, "w": args.raw_w, "dimming": args.raw_dimming})}
+        if not fixture.send({mac: bulb}):
             raise Failure("%s is not answering" % mac)
+        # The record shows it, so this is not taken for a change made by hand,
+        # and the follower leaves the fixture alone meanwhile.
+        state = fixture.state()
+        state["bulbs"][mac] = bulb
+        write_json(path("state.json"), state)
+        saved.update(at=time.time(), bulbs=dict(saved.get("bulbs") or {}, **{mac: bulb}))
+        write_json(path("compare.json"), saved)
     print("%s (%s): cold %d, warm %d at dimming %d; the others are untouched" % (
         args.bulb, mac, args.raw_c, args.raw_w, args.raw_dimming))
     print("put it back with: fixture compare --restore")
@@ -1623,19 +1788,16 @@ def cmd_status(fixture, args):
         print("Note:    this white is outside the measured points in raw_calibration; its brightness and colour are a guess")
     if os.path.exists(path("compare.json")):
         print("Note:    a bulb is set by hand for comparing; put it back with: fixture compare --restore")
-    centre, ring = fixture.layout()
-    names = settings()["ring_names"]
-    if len(fixture.macs) == 7 and not settings()["layout_mapped"]:
-        print("Layout:  not mapped yet; the list order stands in (set centre, ring and layout_mapped in fixture.json)")
-    for mac in fixture.macs:
+    layout = fixture.layout()
+    if not layout["mapped"]:
+        print("Layout:  not mapped yet; the list order stands in (set order, rings and layout_mapped in fixture.json)")
+    for mac in layout["order"]:
         pilot = pilots[mac]
         if pilot is None:
             print("  %s  not answering" % mac)
             continue
         look = " ".join("%s %s" % item for item in sorted(pilot_look(pilot).items()))
-        place = "centre" if mac == centre else "ring %d" % ring.index(mac) if mac in ring else ""
-        if mac in ring and ring.index(mac) < len(names):
-            place += " " + str(names[ring.index(mac)])
+        place = layout["names"].get(mac, "")
         print("  %s  %-16s  %-15s %-3s  %s%s" % (mac, place, fixture.addresses.get(mac, "?"), "on" if pilot.get("state") else "off",
                                           look, "  (waiting for the last setting)" if mac in state["pending"] else ""))
     if args.json:
@@ -1678,9 +1840,6 @@ def cmd_discover(fixture, args):
         saved["min_dimming"] = max(floors)
     for key in ("name", "port", "min_colour_dimming", "white_mode", "raw_calibration", "stream_rate"):
         saved.setdefault(key, SETTINGS_DEFAULTS[key])
-    if len(saved["bulbs"]) == 7 and not saved.get("layout_mapped"):
-        # A stand-in until someone looks at the fixture: the list order.
-        saved.update(centre=saved["bulbs"][0], ring=saved["bulbs"][1:], layout_mapped=False)
     write_json(path("fixture.json"), saved)
     write_json(path("addresses.json"), {mac: address for mac, (address, _) in found.items()})
     print("saved %d bulbs to %s" % (len(saved["bulbs"]), path("fixture.json")))
@@ -1776,8 +1935,8 @@ def build_parser():
     sweep.add_argument("end", type=level)
     sweep.add_argument("--seconds", type=float, default=30.0, help="how long to take (default 30)")
     sweep.add_argument("--kelvin", type=whole(1000, 10000, "kelvin"), help="white at this colour temperature")
-    compare = add("compare", cmd_compare, "set one bulb by hand: fixture compare --bulb centre --raw-w 42")
-    compare.add_argument("--bulb", help="centre, a ring name such as north, ring 0-5, or a MAC address")
+    compare = add("compare", cmd_compare, "set one bulb by hand: fixture compare --bulb \"upper 3\" --raw-w 42")
+    compare.add_argument("--bulb", help="a place such as \"upper 3\", a number round the fixture, or a MAC address")
     compare.add_argument("--raw-w", type=whole(0, 255, "warm level"), default=1, help="warm white LED, 0-255 (default 1)")
     compare.add_argument("--raw-c", type=whole(0, 255, "cold level"), default=0, help="cold white LED, 0-255 (default 0)")
     compare.add_argument("--raw-dimming", type=whole(RAW_DIMMING, 100, "dimming"), default=RAW_DIMMING,

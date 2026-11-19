@@ -193,7 +193,7 @@ fixture tracking off      # everything stays as it is
 - **On:** everything follows the sun.
 - **Set any one of them by hand and it turns itself off, for all of them.** A colour or a brightness, from Apple Home, a command, the WiZ app, a bulb's own tile, `sundial manual`: any of these. Then every device stays exactly as it is. There is no timer; nothing takes over after two hours. One switch means one state, so a brightness set on the keyboard stops the lights following too.
 - **Switching a device on or off is not setting it.** Tracking stays on.
-- **Turn it on and everything goes to the sun's setting at once**, within a few seconds, including whatever was set by hand. It does not switch on a light that is off.
+- **Turn it on and everything goes to the sun's setting at once**, within a few seconds, including whatever was set by hand. It does not switch on a light that is off. For the fixture, turning it on wins: the follower takes the fixture over first, whatever the bulbs look like then, and only a change made after that counts. Until the follower has done so, only a setting made deliberately (from Apple Home or a command) turns tracking off again, so a scene's colours still win over the scene's "on".
 - **It turns itself on before sunrise every day**: at civil dawn (the sun 6 degrees below the horizon, worked out for sundial's location, about half an hour before sunrise) or at the followers' morning time (half an hour before waking), whichever comes first. Only if it was turned off before then: turned off later in the day, it stays off until the next morning.
 
 How the other rules sit with it:
@@ -229,7 +229,7 @@ fixture colour 240 100 40   # hue 0-360, saturation 0-100, brightness
 fixture brightness 12.5     # keeps the colour; fractions are allowed
 fixture brightness 0.4      # below 1%: every bulb still lit, on its raw white LEDs
 fixture sweep 1.2 0.8 --seconds 60   # move slowly between two brightnesses
-fixture compare --bulb centre --raw-w 42   # set one bulb by hand; --restore puts it back
+fixture compare --bulb "upper 3" --raw-w 42   # set one bulb by hand; --restore puts it back
 fixture status              # asks every bulb what it is doing
 fixture discover            # lists the WiZ bulbs on the network and their limits
 fixture fade                # how long the bulbs themselves take to change
@@ -255,10 +255,10 @@ Bulbs are known by MAC address, never by network address. Their addresses are re
   "name": "Fixture",
   "port": 51827,
   "bulbs": ["a1b2c3d4e5f6", "..."],
-  "centre": "a1b2c3d4e5f6",
-  "ring": ["...", "...", "...", "...", "...", "..."],
-  "ring_names": ["north", "northeast", "southeast", "south", "southwest", "northwest"],
-  "layout_mapped": false,
+  "rings": {"upper": ["...six, clockwise..."], "lower": ["...six, clockwise..."]},
+  "order": ["...all twelve, clockwise round the fixture..."],
+  "layout_mapped": true,
+  "power_on_look": {"temp": 4207, "dimming": 100},
   "min_dimming": 1,
   "min_colour_dimming": 10,
   "kelvin_min": 2200,
@@ -274,30 +274,51 @@ These are the values for the ESP25_SHRGB_01 bulbs (firmware 1.33.39), checked on
 
 ### Where the bulbs are
 
-The fixture is one bulb in the centre with six in a hexagon round it. `centre` in `fixture.json` is the centre bulb's MAC address, and `ring` is the other six in order round the hexagon (either direction, starting anywhere). They are read every time the fixture is set, so an edit takes effect without restarting anything. `ring_names` is optional: six labels for the ring places, shown by `fixture status` and used for nothing else.
+The fixture is twelve bulbs in two rings of six, upper and lower. The rings are offset, so going round the fixture the bulbs alternate: upper 1, lower 2, upper 2, lower 3, and so on to upper 6, lower 1, about 30 degrees apart.
 
-Until someone has looked at the fixture and filled these in, the order of `bulbs` stands in: the first is taken for the centre and the next six for the ring. `layout_mapped` is `false` to say so, and `fixture status` says so too. Set it to `true` once `centre` and `ring` are the real positions. If `centre` and `ring` are not exactly the seven bulbs of the fixture, they are ignored and the list order is used.
+Two settings in `fixture.json` say so:
+
+- `rings` names the bulbs: each ring's MAC addresses in order, clockwise. `fixture status` then shows "upper 3", "lower 5", and `fixture compare --bulb "upper 3"` takes the same names.
+- `order` is every bulb, clockwise round the fixture, taken as evenly spaced on one circle. This is what the patterns below are chosen from.
+
+`layout_mapped` is `true` once these are the real positions. They are read every time the fixture is set, so an edit takes effect without restarting anything. If `order` is not exactly the fixture's bulbs, the order of `bulbs` stands in, as one ring, and `fixture status` says the layout is not mapped. Bulbs not named in `rings` are called "position 5" and so on, by their place in `order`. The older form, `centre` and `ring` (one bulb in the middle, the rest round it), still works.
 
 ### Brightness
 
-Brightness is the average dimming of the seven bulbs.
+Brightness is the average dimming of the twelve bulbs.
 
-- **A whole number is every bulb at that dimming.** Fixture 1% is all seven at 1, fixture 37% is all seven at 37, and 100% is all seven at 100. Apple Home only sends whole numbers, so from Home every bulb is always lit and they are all alike.
-- **A fraction puts some bulbs one step higher.** Brightness moves in steps of one seventh of a percent: one bulb, one step. Fixture 12.5% is 88 sevenths, so three bulbs are at 12 and four at 13.
+- **A whole number is every bulb at that dimming.** Fixture 1% is all twelve at 1, fixture 37% is all twelve at 37, and 100% is all twelve at 100. Apple Home only sends whole numbers, so from Home every bulb is always lit and they are all alike.
+- **A fraction puts some bulbs one step higher.** Brightness moves in steps of one twelfth of a percent: one bulb, one step. Fixture 12.5% is 150 twelfths, so six bulbs are at 12 and six at 13.
 - **Below 1% every bulb stays lit, on its raw white LEDs.** See the next section. Only below about 0.024% are bulbs switched off.
 
-The command, `follow.json` and the sun follower take fractions. They are printed to one decimal place from 1% up ("37.6%") and to three below ("0.4%", "0.03%"), with the raw level when that is in use and the number of bulbs lit when that is not all of them: `white 2700K at 0.4% (raw warm 16.9)`.
+The command, `follow.json` and the sun follower take fractions. They are printed to one decimal place from 1% up ("37.6%") and to three below ("0.4%", "0.03%"), with the raw level when that is in use and the number of bulbs lit when that is not all of them: `white 2700K at 0.4% (raw warm 16.8)`.
 
-The bulbs that are singled out, to take the extra step or to be the only ones lit, are chosen so the fixture stays symmetric. With the ring places numbered 0 to 5:
+### Which bulbs are singled out
 
-| Bulbs singled out | Which |
-|---|---|
-| 1 | the centre |
-| 2 | ring 0 and 3, an opposite pair |
-| 3 | ring 0, 2 and 4, a triangle |
-| 4 | the centre and ring 0, 2 and 4 |
-| 5 | the centre and ring 0, 1, 3 and 4, two opposite pairs |
-| 6 | the whole ring, centre left out |
+The bulbs singled out, to take the extra step or to be the only ones lit, are chosen so the light stays even round the fixture. Of every way to pick that many bulbs, the one taken is:
+
+1. the most even: the directions of the bulbs from the middle add up to the least, so no side is heavier;
+2. the most spread: the closest two of the smaller group (the bulbs singled out, or the rest) are as far apart as they can be;
+3. the fewest bulbs changed from the pattern for one bulb fewer, so a slow ramp does not shuffle the fixture;
+4. and then simply the first, so it is always the same.
+
+For the twelve, numbered 1 to 12 clockwise in `order` (1 is upper 1, 2 is lower 2, 3 is upper 2, ... 11 is upper 6, 12 is lower 1):
+
+| Singled out | Which | Shape |
+|---|---|---|
+| 1 | 1 (upper 1) | one bulb |
+| 2 | 1, 7 (upper 1, upper 4) | an opposite pair |
+| 3 | 1, 5, 9 (upper 1, 3, 5) | a triangle |
+| 4 | 1, 4, 7, 10 (upper 1, lower 3, upper 4, lower 6) | a square |
+| 5 | 1, 2, 6, 7, 10 (upper 1, lower 2, lower 4, upper 4, lower 6) | a pair and a triangle |
+| 6 | 2, 4, 6, 8, 10, 12 | every other one: the whole lower ring |
+| 7 | all but 3, 6, 7, 11, 12 (upper 2, lower 4, upper 4, upper 6, lower 1) | all but a pair and a triangle |
+| 8 | all but 3, 6, 9, 12 (upper 2, lower 4, upper 5, lower 1) | all but a square |
+| 9 | all but 4, 8, 12 (lower 3, lower 5, lower 1) | all but a triangle |
+| 10 | all but 6, 12 (lower 4, lower 1) | all but an opposite pair |
+| 11 | all but 12 (lower 1) | all but one |
+
+Every pattern except 1 and 11 is exactly balanced. The table is worked out from `order`, so it follows the layout if that changes; any number of bulbs works the same way. For the older form with a centre, the same rules give the old table: the centre, an opposite pair, a triangle, the centre and a triangle, the centre and two opposite pairs, the ring.
 
 ### Below 1%: the raw white LEDs
 
@@ -307,8 +328,8 @@ One raw setting has been matched by eye against ordinary white, on one bulb besi
 
 So below 1%, white brightness B is every bulb at warm level 42 x B, at dimming 10:
 
-- It moves in sevenths of a level, the same way as above 1%: every bulb at the whole level, and the left-over sevenths go one each to the singled-out bulbs. Fixture 0.4% is level 16.9: six bulbs at 17 and one at 16.
-- Below every bulb at level 1 (about 0.024%) there is nothing lower to send, so fewer bulbs are lit, each at level 1, by the same table. The least is one bulb at level 1, about 0.003%.
+- It moves in twelfths of a level, the same way as above 1%: every bulb at the whole level, and the left-over twelfths go one each to the singled-out bulbs. Fixture 0.4% is level 16.8: ten bulbs at 17 and two at 16.
+- Below every bulb at level 1 (about 0.024%) there is nothing lower to send, so fewer bulbs are lit, each at level 1, by the same table. The least is one bulb at level 1, about 0.002%.
 - At 1% and above nothing is raw: it is ordinary white, as described above.
 
 **Only 2700K is matched.** At other colour temperatures below 1% the same total is shared between the cold and warm LEDs, evenly in mireds from 2700K (all warm) to 6500K (all cold), and warmer than 2700K is all warm. That is a guess at both the colour and the brightness. The sun follower's night colour is 2700K, so the matched case is the one it uses. `fixture status` says when the present setting is a guess.
@@ -339,12 +360,14 @@ To measure a point, set the fixture to an ordinary white, then set one bulb by h
 
 ```
 fixture white 2700 50
-fixture compare --bulb centre --raw-w 200 --raw-dimming 60
-fixture compare --bulb centre --raw-w 210 --raw-dimming 60
+fixture compare --bulb "upper 1" --raw-w 200 --raw-dimming 60
+fixture compare --bulb "upper 1" --raw-w 210 --raw-dimming 60
 fixture compare --restore
 ```
 
-`--bulb` takes `centre`, a name from `ring_names` such as `north`, `ring 0` to `ring 5`, or a MAC address. `--raw-c` is the cold LED. Left out, the levels are warm 1, cold 0, dimming 10, so a bulb is never made bright by accident. The other bulbs are not touched. While a bulb is set by hand the sun follower leaves the fixture alone; `--restore` puts every bulb back as it was and hands the fixture back to whoever had set it, so no two-hour wait is left behind.
+`--bulb` takes a place from `rings` such as `"upper 3"`, a number round the fixture in `order` (1 to 12), or a MAC address. `--raw-c` is the cold LED. Left out, the levels are warm 1, cold 0, dimming 10, so a bulb is never made bright by accident. The other bulbs are not touched.
+
+A comparison is not a change made by hand: the record is given the bulb's new look, so it does not turn Sun Tracking off, and the sun follower leaves the fixture alone meanwhile, for up to 30 minutes. `--restore` puts every bulb back as it was and hands the fixture back to whoever had set it. A comparison left longer than 30 minutes, or set over from Apple Home, is forgotten and the follower takes the fixture back.
 
 ### Colours
 
@@ -358,7 +381,11 @@ Bulbs that are kept off are still given the colour and the lowest level, so if t
 
 The bulbs can be asked what they are doing, and they are: by `fixture status`, by the Apple Home service every 5 seconds, and by the sun follower every minute. `state.json` in the settings folder records what the fixture was last set to and by whom. When the bulbs differ from it, something else set them (the WiZ app, a bulb's own tile in Apple Home), and the record is changed to match the bulbs. Nothing is sent to undo it. The record keeps what each bulb should show, so bulbs that are deliberately a step apart are not mistaken for a change. The fixture's brightness is then the average of the bulbs as found.
 
-Switching the whole fixture off and on is not a new setting, wherever it is done.
+Switching the whole fixture off and on is not a new setting, wherever it is done. Nor are these, which are put right without counting as anyone's change (so they never turn Sun Tracking off):
+
+- **Power back at the wall, or after a power cut.** A bulb whose power comes back lights at its own power-on look, which on these bulbs is about 4200K at full brightness (`power_on_look` in `fixture.json`: temp 4207, dimming 100, as seen on 2026-11-18). A bulb found like that is sent what it should show. If the fixture was off, it is now on: it was switched on at the wall. Either way, by day the fixture then starts afresh at the sun's setting, within a few seconds.
+- **A bulb new to the fixture**, just added to `bulbs`, is brought to what the others show. The list is read again every time, so the Apple Home service picks up a new bulb without a restart.
+- **A bulb that missed the last setting, or did not answer at the last look**, is sent what it should show, as long as every other bulb is as it should be. (If they differ too, it is a change made elsewhere after all.)
 
 ### Apple Home
 
@@ -376,7 +403,8 @@ To pair, open the Home app, choose Add Accessory, and scan the QR code or enter 
 Add `--qr code.svg` in place of `--pairing` to write the QR code to a file.
 
 - Home shows one light: on/off, brightness, colour and colour temperature (2200-6500K).
-- **Dragging a slider.** While Home is writing one change after another, the newest is sent to every bulb ten times a second without waiting for the bulbs to answer. When nothing new has come for a third of a second, the last one is sent again the careful way, waiting for every bulb, and only then is the record written. `stream_rate` in `fixture.json` is the ten; 0 goes back to waiting for the bulbs after every send. Measured on the seven bulbs with a two-second drag: each bulb showed 12 to 17 steps where it had shown 3 or 4, and all were at the last value 0.3 to 0.75 seconds after the drag ended, where it had taken 0.5 to 2.9. Twenty a second was no better.
+- **Every write from Apple Home is logged**, one line each, with the address it came from, in `~/Library/Logs/fixture-homekit.log`: `Home wrote (from 192.168.1.149): The Sun Lightbulb Brightness=40`. The Neewer and Desk services do the same in their logs, so a change nobody remembers making can be traced to a phone, the home hub or an automation.
+- **Dragging a slider.** While Home is writing one change after another, the newest is sent to every bulb ten times a second without waiting for the bulbs to answer. When nothing new has come for a third of a second, the last one is sent again the careful way, waiting for every bulb, and only then is the record written. `stream_rate` in `fixture.json` is the ten; 0 goes back to waiting for the bulbs after every send. Measured on the first seven bulbs with a two-second drag: each bulb showed 12 to 17 steps where it had shown 3 or 4, and all were at the last value 0.3 to 0.75 seconds after the drag ended, where it had taken 0.5 to 2.9. Twenty a second was no better.
 - Home's brightness is a whole number. A fraction set elsewhere is shown rounded, and anything lit shows as at least 1%.
 - A change made any other way shows up in Home within about 5 seconds.
 - If no bulb answers (the wall switch is off), Home shows "No Response". One bulb answering is enough.
@@ -398,14 +426,14 @@ The rules are the Neewer light's:
 - **It switches the fixture off and on only at bedtime and in the morning**, by the same rule as the Neewer light (see Bedtime above), with the same settings in its own `follow.json`. Otherwise it never does, and while the fixture is off it does nothing.
 - **A setting made elsewhere wins.** A change from Apple Home, the `fixture` command, the WiZ app or a single bulb's tile turns sun tracking off, and the fixture is left alone until it is turned on again. `fixture follow on` turns it on.
 - **Switched on by day, it starts afresh**, as the Neewer light does (see A fresh start above), with `"fresh_start"` in its own `follow.json`. From Apple Home's Sun tile it is immediate: no bulb is sent the old setting first. From anywhere else (`fixture on`, the WiZ app, a bulb's own tile, the wall switch) the old setting shows until the follower's next look, up to a minute. Bulbs that did not answer, as when the wall switch is off, count as having been off.
-- **It only sends when what a bulb should show changes**, and writes one line to the log each time. It does not round brightness to a whole number, so through dusk and dawn the fixture moves one bulb at a time, in sevenths of a percent.
+- **It only sends when what a bulb should show changes**, and writes one line to the log each time. It does not round brightness to a whole number, so through dusk and dawn the fixture moves one bulb at a time, in twelfths of a percent.
 - If no bulb answers, or sundial has stopped, it tries again each minute and writes one line, not one a minute.
 
 The fixture's fade at bedtime goes down through the raw levels below 1%, to a single bulb at its lowest, and then every bulb is switched off. The bulbs are given the setting from before the fade as they go off, so switching the fixture on by hand, from anywhere, brings that back. In the morning every bulb comes back on.
 
 `follow.json` in the fixture's settings folder has the same settings as the Neewer light's: `enabled`, `day_brightness` (100), `night_brightness` (1), `night_kelvin` (2700) and `hold_minutes` (120). Colour is kept within the bulbs' 2200-6500K. The night level of 1 is every bulb at dimming 1. It may be lower: 0.4 is every bulb on its raw warm LED at about level 17, and the ramp down to it at dusk is then smooth all the way.
 
-`python3 tests/test_fixture.py` checks all of this against seven pretend bulbs, without touching real ones.
+`python3 tests/test_fixture.py` checks all of this against pretend bulbs (seven in the older form, and twelve as the fixture is now), without touching real ones.
 
 ## The desk (monitors and keyboard)
 
