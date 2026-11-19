@@ -1863,9 +1863,24 @@ def cmd_follow(fixture, args):
         if args.action == "off":
             print("following is off; the fixture stays as it is")
             return
-        # Switching on also ends any hold: take the fixture over now.
-        set_tracking(True, "cli")
+        # Switching on also ends any hold: take the fixture over now. The sun
+        # tracking switch is left as it is: `fixture tracking on` is the one for that.
         fixture.claim("follow")
+        # Not a new day, nor a fresh start: a follower that was off through
+        # the morning would otherwise set the sun's level at once.
+        memory, follow, now = read_json(path("follow-state.json"), {}), follow_settings(), time.time()
+        times = sleep_times(follow) if follow["bedtime_rule"] else None
+        if times is not None:
+            morning = night_window(now, times[0], times[1], follow["morning_lead_minutes"])[1]
+            if now >= morning:
+                memory["day"] = morning
+        with fixture.locked():
+            state = fixture.state()
+            if state["setting"]["on"]:
+                memory["fresh"] = False
+                state["fresh"] = False
+                write_json(path("state.json"), state)
+        write_json(path("follow-state.json"), memory)
         line = follow_apply(fixture)
         print("following is on" + (": " + line if line else ""))
         return

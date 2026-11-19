@@ -9,6 +9,7 @@ bridge is replaced by one that only records the frames it is given.
 
 import argparse
 import importlib.machinery
+import math
 import importlib.util
 import os
 import sys
@@ -834,6 +835,263 @@ class TrackingTest(BedtimeScaffold):
         self.assertIn("following again at 12:00", self.apply())
         self.assertTrue(cli.tracking()["on"])
         self.assertIn("not in use", cli.tracking_text())
+
+
+AS600B = {"model": "AS600B"}
+# A made-up measured curve, to check the mapping is used where it should be:
+# far less light at low settings than the setting says, as on an exponential curve.
+MEASURED = [[1, 0.001], [20, 0.02], [50, 0.2], [100, 1.0]]
+
+
+class AS600BTest(Scaffold):
+    """The AS600B: white only, 2700-6500K, its own exponential curve, no channels frame."""
+
+    def setUp(self):
+        super().setUp()
+        self.profile_is(AS600B)
+
+    def profile_is(self, profile):
+        cli.write_json(cli.LIGHT_FILE, {"mac": MAC, "profile": profile})
+
+    def run_command(self, *words):
+        args = cli.build_parser().parse_args(["--quiet"] + list(words))
+        args.function(cli.Light(args), args)
+
+    def frame(self, kelvin, brightness, curve="exp", tint=0):
+        return cli.to_hex(cli.white_frame(cli.parse_mac(MAC), kelvin, brightness, tint, curve))
+
+    def test_the_profile(self):
+        profile = cli.light_profile()
+        self.assertEqual((profile["model"], profile["kelvin_min"], profile["kelvin_max"], profile["curve"]),
+                         ("AS600B", 2700, 6500, "exp"))
+        self.assertFalse(profile["channels"] or profile["colour"])
+        self.assertEqual([cli.fit_kelvin(profile, k) for k in (2500, 2650, 2700, 5555, 6500, 6600, 7500)],
+                         [2700, 2700, 2700, 5600, 6500, 6500, 6500])
+        self.profile_is(dict(AS600B, kelvin_max=6000, curve="nonsense", channels="yes"))
+        profile = cli.light_profile()
+        self.assertEqual((profile["kelvin_max"], profile["curve"], profile["channels"]), (6000, "exp", False))
+        cli.write_json(cli.LIGHT_FILE, {"mac": MAC})   # no profile: the CB200C, as before
+        self.assertEqual(cli.light_profile()["model"], "CB200C")
+        self.assertTrue(cli.light_profile()["channels"])
+
+    def test_white_carries_the_profiles_curve_and_range(self):
+        self.run_command("white", "5600", "5")
+        self.assertEqual(FakeBridge.sent[-1], self.frame(5600, 5))
+        self.assertEqual((self.state()["kelvin"], self.state()["curve"]), (5600, "exp"))
+        with self.assertRaises(cli.Failure):
+            self.run_command("white", "6600", "5")     # the light would drop it
+        with self.assertRaises(cli.Failure):
+            self.run_command("white", "2500", "5")
+
+    def test_a_curve_given_by_hand_is_sent_once(self):
+        self.run_command("white", "5600", "5", "--curve", "linear")
+        self.assertEqual(FakeBridge.sent[-1], self.frame(5600, 5, curve="linear"))
+        self.run_command("brightness", "4")              # the next ordinary send puts exp back
+        self.assertEqual(FakeBridge.sent[-1], self.frame(5600, 4))
+
+    def test_an_old_6600_is_put_right_on_the_next_send(self):
+        cli.write_json(cli.STATE_FILE, {"on": True, "mode": "white", "kelvin": 6600, "brightness": 5, "curve": "exp"})
+        self.run_command("brightness", "4")
+        self.assertEqual(FakeBridge.sent[-1], self.frame(6500, 4))
+        self.assertEqual(self.state()["kelvin"], 6500)
+
+    def test_old_channels_or_colour_settings_become_white(self):
+        cli.write_json(cli.STATE_FILE, {"on": True, "mode": "channels", "brightness": 5, "cold": 255, "kelvin": 6600})
+        self.run_command("brightness", "3")
+        self.assertEqual(FakeBridge.sent[-1], self.frame(6500, 3))
+        cli.write_json(cli.STATE_FILE, {"on": True, "mode": "colour", "hue": 30, "saturation": 60, "brightness": 5})
+        self.run_command("brightness", "3")
+        self.assertEqual(self.state()["mode"], "white")
+        self.assertEqual(FakeBridge.sent[-1][:22], self.frame(2700, 3)[:22])  # a white frame, not a colour one
+
+    def test_what_it_cannot_do_is_said_plainly(self):
+        for words, said in ((["faint", "5"], "does not take the channels frame"),
+                            (["channels", "1", "--cold", "255"], "does not take the channels frame"),
+                            (["colour", "30", "60", "5"], "white LEDs only; the nearest white is"),
+                            (["rgb", "ff8800", "5"], "white LEDs only")):
+            with self.assertRaises(cli.Failure) as raised:
+                self.run_command(*words)
+            self.assertIn(said, str(raised.exception))
+            self.assertIn("AS600B", str(raised.exception))
+        self.assertEqual(FakeBridge.sent, [])
+
+    def test_the_nearest_white(self):
+        profile = cli.light_profile()
+        for kelvin in (2700, 3500, 5000, 6500):
+            hue, saturation = cli.white_hue_saturation(kelvin)
+            self.assertEqual(cli.nearest_white(profile, hue, saturation), kelvin)
+        self.assertEqual(cli.nearest_white(profile, 240, 100), 6500)  # blue: the coolest white
+        self.assertEqual(cli.nearest_white(profile, 20, 100), 2700)   # orange: the warmest
+
+    def test_the_follower_stays_inside_the_range_with_the_curve(self):
+        self.sun(dict(DAY, kelvin=9000))
+        self.assertIn("white 6500K at 100%", self.apply())
+        self.assertEqual(FakeBridge.sent, [self.frame(6500, 100)])
+        cli.write_json(cli.FOLLOW_FILE, {"night_kelvin": 2000})
+        self.assertEqual(cli.follow_settings()["night_kelvin"], 2700)
+        self.later(1)
+        self.sun(NIGHT)
+        self.assertIn("white 2700K at 5%", self.apply())
+        self.later(1)
+        self.sun(NIGHT)
+        self.assertIsNone(self.apply())                  # and it does not resend every minute
+
+    def test_the_sunrise_is_white_only(self):
+        profile = cli.light_profile()
+        for style in ("sky", "glow"):
+            steps = [cli.sunrise_setting(t / 400.0, 100, 5600, style, profile) for t in range(401)]
+            self.assertEqual({step[0] for step in steps}, {"white"})
+            self.assertTrue(all(2700 <= step[1] <= 6500 for step in steps))
+            self.assertEqual(steps[0][2], 1)
+            self.assertEqual(steps[-1], ("white", 5600, 100))
+            brightness = [step[2] for step in steps]
+            self.assertEqual(brightness, sorted(brightness))
+        sky = [cli.sunrise_setting(t / 400.0, 100, 5600, "sky", profile) for t in range(401)]
+        colours = [step[1] for step in sky]
+        self.assertGreater(colours[0], 4000)             # cool in twilight
+        self.assertEqual(min(colours), 2800)             # the sun on the horizon
+        self.assertEqual(colours[-1], 5600)
+        on_cb200c = cli.sunrise_setting(0.0, 100, 5600, "sky", cli.light_profile({}))
+        self.assertEqual(on_cb200c[0], "channels")       # a light with channels keeps its own sunrise
+
+    def test_a_sunrise_sends_white_frames_with_the_curve(self):
+        sleeps = []
+        original = cli.time.sleep
+        cli.time.sleep = sleeps.append
+        self.addCleanup(lambda: setattr(cli.time, "sleep", original))
+        self.run_command("sunrise", "--minutes", "0.002", "--brightness", "5", "--kelvin", "5600")
+        tags = {frame[2:4] for frame in FakeBridge.sent}
+        self.assertEqual(tags, {"90", "8d"})              # white and power only
+        self.assertTrue(all(frame[26:28] == "01" for frame in FakeBridge.sent if frame[2:4] == "90"))
+        self.assertEqual(FakeBridge.sent[-1], self.frame(5600, 5))
+
+    def test_the_identity_placeholder_maps_nothing(self):
+        profile = cli.light_profile()
+        self.assertEqual([cli.output_setting(profile, s / 100.0) for s in range(1, 101)], list(range(1, 101)))
+        self.assertAlmostEqual(cli.setting_output(profile, 37), 0.37, places=2)
+        self.assertIn("output taken as the setting", cli.describe_profile(cli.light_profile({})))
+
+    def test_a_measured_curve_is_used_for_light_output(self):
+        self.profile_is(dict(AS600B, output_curve=MEASURED))
+        profile = cli.light_profile()
+        power = math.log(10) / math.log(2.5)             # between (20, 2%) and (50, 20%)
+        self.assertAlmostEqual(cli.setting_output(profile, 35), 0.02 * (35 / 20.0) ** power, places=9)
+        self.assertEqual(cli.output_setting(profile, 0.02), 20)
+        self.assertEqual(cli.output_setting(profile, 0.05), 29)
+        self.assertEqual(cli.output_setting(profile, 0.001), 1)
+        # The follower asks for 5% of full output at night: setting 29 on this curve.
+        self.sun(NIGHT)
+        self.assertIn("white 2700K at 29%", self.apply())
+        self.assertEqual(cli.follow_target(NIGHT, cli.follow_settings()), (2700, 29))
+        # A fresh start and the morning use the same target.
+        self.assertEqual(cli.fresh_start_look(self.now), (2700, 29))
+        # The command and Apple Home send the setting as given.
+        self.run_command("white", "5600", "5")
+        self.assertEqual(FakeBridge.sent[-1], self.frame(5600, 5))
+
+    def test_the_sunrise_works_in_light_output(self):
+        self.profile_is(dict(AS600B, output_curve=MEASURED))
+        profile = cli.light_profile()
+        steps = [cli.sunrise_setting(t / 400.0, 100, 5600, "sky", profile) for t in range(401)]
+        self.assertEqual((steps[0][2], steps[-1][2]), (1, 100))
+        # Half way up the sky's light is far less than half; on this curve the
+        # setting for it is much higher than with no curve.
+        middle = cli.sunrise_setting(0.5, 100, 5600, "sky", profile)[2]
+        plain = cli.sunrise_setting(0.5, 100, 5600, "sky", cli.light_profile({"profile": AS600B}))[2]
+        self.assertGreater(middle, plain)
+        # It starts earlier in the sky: the lowest setting is far dimmer than 1% of full.
+        self.assertLess(cli.sky_start_elevation(100, 100 * cli.setting_output(profile, 1)),
+                        cli.sky_start_elevation(100, 1.0))
+
+    def test_a_bad_measured_curve_is_ignored(self):
+        self.profile_is(dict(AS600B, output_curve=[[1, 0.5], [50, 0.1], [100, 1.0]]))  # not rising
+        self.assertEqual(cli.light_profile()["output_curve"], [])
+        self.profile_is(dict(AS600B, output_curve=[[1, 0.01], "x", [100, 1.0]]))
+        self.assertEqual(cli.light_profile()["output_curve"], [(1.0, 0.01), (100.0, 1.0)])
+
+    def test_follow_on_at_midday_is_not_a_fresh_start(self):
+        # The follower was off through the morning; the light is on, set by him.
+        with open(cli.SUNDIAL_CONFIG_FILE, "w") as handle:
+            handle.write("[sleep]\nwake = 07:00\nbedtime = 23:00\n")
+        os.makedirs(cli.TRACKING_DIR, exist_ok=True)
+        cli.write_json(os.path.join(cli.TRACKING_DIR, "settings.json"), {})
+        cli.set_tracking(False, "home")
+        cli.write_json(cli.FOLLOW_MEMORY_FILE, {"day": 0, "situation": "off"})
+        cli.write_json(cli.STATE_FILE, {"on": True, "mode": "white", "kelvin": 5600, "brightness": 20, "curve": "exp"})
+        self.run_command("follow", "off")
+        noon = time.mktime(time.localtime()[:3] + (12, 0, 0, 0, 0, -1))
+        original = cli.time.time
+        cli.time.time = lambda: noon
+        self.addCleanup(lambda: setattr(cli.time, "time", original))
+        self.sun(DAY)
+        os.utime(cli.SUNDIAL_STATE_FILE, (noon, noon))
+        self.run_command("follow", "on")
+        self.assertEqual(FakeBridge.sent, [])            # not 6500K at 100%
+        self.assertEqual((self.state()["kelvin"], self.state()["brightness"]), (5600, 20))
+        self.assertFalse(cli.tracking()["on"])
+
+    def test_follow_on_leaves_sun_tracking_alone(self):
+        os.makedirs(cli.TRACKING_DIR, exist_ok=True)
+        cli.write_json(os.path.join(cli.TRACKING_DIR, "settings.json"), {})   # the switch in use
+        cli.set_tracking(False, "home")
+        self.run_command("follow", "off")
+        self.run_command("follow", "on")
+        self.assertTrue(cli.follow_settings()["enabled"])
+        self.assertFalse(cli.tracking()["on"])
+        self.assertEqual(FakeBridge.sent, [])            # tracking is off, so the light is left alone
+
+
+class AS600BHomeKitTest(Scaffold):
+    """The Apple Home service's side, without HAP-python: the link that turns Home's values into frames."""
+
+    def setUp(self):
+        super().setUp()
+        cli.write_json(cli.LIGHT_FILE, {"mac": MAC, "profile": AS600B})
+        cli.write_json(cli.STATE_FILE, {"on": True, "mode": "white", "kelvin": 6600, "brightness": 5, "curve": "exp"})
+        sys.modules["neewer_cli"] = cli
+        loader = importlib.machinery.SourceFileLoader(
+            "neewer_homekit", os.path.join(HERE, "..", "homekit", "neewer_homekit.py"))
+        self.homekit = importlib.util.module_from_spec(importlib.util.spec_from_loader("neewer_homekit", loader))
+        loader.exec_module(self.homekit)
+        self.link = self.homekit.LightLink()
+
+    def frame(self, kelvin, brightness, curve="exp"):
+        return cli.white_frame(cli.parse_mac(MAC), kelvin, brightness, 0, curve)
+
+    def test_the_colour_temperature_range(self):
+        self.assertEqual(self.homekit.mired_range(self.link.profile), (154, 370))
+        self.assertEqual(self.homekit.mired_to_kelvin(154, self.link.profile), 6500)
+        self.assertEqual(self.homekit.mired_to_kelvin(370, self.link.profile), 2700)
+        self.assertEqual(self.homekit.mired_to_kelvin(140, self.link.profile), 6500)  # never past the range
+
+    def test_the_recorded_6600_is_shown_and_sent_as_6500(self):
+        self.assertEqual(self.link.snapshot()["kelvin"], 6500)
+        self.assertEqual(self.link.mode_frame(self.link.snapshot()), self.frame(6500, 5))
+
+    def test_a_colour_from_home_becomes_the_nearest_white(self):
+        self.link.apply_home({"Hue": 30, "Saturation": 60})
+        wanted = self.link.snapshot()
+        self.assertEqual(wanted["mode"], "white")
+        hue, saturation = cli.white_hue_saturation(wanted["kelvin"])
+        self.assertEqual(cli.nearest_white(self.link.profile, 30, 60), wanted["kelvin"])
+        self.assertEqual(self.link.mode_frame(wanted), self.frame(wanted["kelvin"], 5))
+        self.link.apply_home({"Hue": 240, "Saturation": 100})
+        self.assertEqual(self.link.snapshot()["kelvin"], 6500)
+
+    def test_the_slider_is_the_setting_as_given(self):
+        cli.write_json(cli.LIGHT_FILE, {"mac": MAC, "profile": dict(AS600B, output_curve=MEASURED)})
+        self.link = self.homekit.LightLink()
+        self.link.apply_home({"Brightness": 5, "ColorTemperature": 179})
+        self.assertEqual(self.link.mode_frame(self.link.snapshot()), self.frame(5600, 5))
+
+    def test_a_fresh_start_uses_the_curve_and_the_profile(self):
+        cli.write_json(cli.LIGHT_FILE, {"mac": MAC, "profile": dict(AS600B, output_curve=MEASURED)})
+        cli.write_json(cli.STATE_FILE, {"on": False, "mode": "white", "kelvin": 4000, "brightness": 50, "curve": "linear"})
+        self.sun(NIGHT)
+        self.link = self.homekit.LightLink()
+        self.link.apply_home({"On": True})
+        wanted = self.link.snapshot()
+        self.assertEqual((wanted["kelvin"], wanted["brightness"], wanted["curve"]), (2700, 29, "exp"))
 
 
 if __name__ == "__main__":

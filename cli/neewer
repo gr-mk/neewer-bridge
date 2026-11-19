@@ -4,7 +4,8 @@
 The bridge only moves bytes. This file holds the whole command format, so it is
 the place to experiment: nothing here needs the bridge rebuilt.
 
-Frame layout, confirmed on a CB200C (product code 20250017):
+Frame layout, confirmed on a CB200C (product code 20250017), and the power and
+white frames again on an AS600B (product code 20240064):
 
     78 <tag> <size> <6 address bytes> <subtag> <values...> <checksum>
 
@@ -16,9 +17,10 @@ Frame layout, confirmed on a CB200C (product code 20250017):
     colour  tag 8F  subtag 86  values: hue low byte, hue high byte, saturation 0-100, brightness 0-100, 00
     channels tag A9 subtag A8  values: brightness 0-100, red, green, blue, cold white, warm white (0-255 each), 00
 
-The channels frame is the only way found to go below 1%: brightness 1 with a
-single white channel at a low level is far dimmer than "white ... 1", and it is
-still lit at level 1.
+On the CB200C the channels frame is the only way found to go below 1%:
+brightness 1 with a single white channel at a low level is far dimmer than
+"white ... 1", and it is still lit at level 1. The AS600B ignores the channels
+and colour frames altogether; see PROFILES.
 """
 
 import argparse
@@ -37,11 +39,47 @@ LIGHT_FILE = os.path.join(APP_DIR, "light.json")
 STATE_FILE = os.path.join(APP_DIR, "state.json")
 
 DEFAULT_BRIDGE = "http://127.0.0.1:18490"
+# The widest range any light here takes. What the connected light takes is in
+# its profile (below), and every frame is kept inside that.
 KELVIN_MIN, KELVIN_MAX = 2500, 7500
 # The curve byte is taken from captures of sibling lights; "linear" is what the
-# NEEWER app sends by default. Whether the CB200C honours the others is untested.
+# NEEWER app sends by default. The CB200C ignores it; the AS600B honours it
+# (04 makes the light's own setting linear, 01 exponential).
 CURVES = {"linear": 0x04, "exp": 0x01, "log": 0x02, "s": 0x03}
 CHANNELS = ("red", "green", "blue", "cold", "warm")
+
+# What each light can do. light.json's "profile" picks one by "model" and may
+# override any field; without a profile the light is taken to be a CB200C.
+#   kelvin_min/max  the colour temperatures it shows. The AS600B drops a white
+#                   frame outside 2700-6500K (its display keeps the old value),
+#                   so nothing outside the range is ever sent.
+#   curve           the dimming curve every white frame carries, or "" to let
+#                   each command choose (linear unless asked).
+#   channels        whether it takes the five-channel frame: `faint`,
+#                   `channels` and the "sky" sunrise below 1% need it.
+#   colour          whether it takes the hue/saturation frame.
+#   output_curve    [[setting %, light output as a share of full], ...]: how
+#                   bright each brightness setting really is on the light's
+#                   dimming curve, measured by eye. The follower, the bedtime
+#                   fade, the morning, a fresh start and the sunrise all work
+#                   out how much light they want and send the setting that
+#                   gives it. The Home slider and `neewer white` send the
+#                   setting as given. Between points the output is taken to
+#                   follow a power of the setting (a straight line when both
+#                   are on log scales). Empty: setting % = output %.
+PROFILES = {
+    "CB200C": {"kelvin_min": 2500, "kelvin_max": 7500, "curve": "", "channels": True, "colour": True,
+               "output_curve": []},
+    # A 600 W bi-colour COB. Checked on the light, by eye on its display:
+    # power and white frames as on the CB200C; the curve byte is honoured;
+    # the channels frame is ignored; 2500K and 6600K are dropped.
+    # Its output curve is a stand-in for now, two points that make each setting
+    # give exactly that share of full output, so nothing is mapped yet. To be
+    # replaced by points measured by eye.
+    "AS600B": {"kelvin_min": 2700, "kelvin_max": 6500, "curve": "exp", "channels": False, "colour": False,
+               "output_curve": [[1, 0.01], [100, 1.0]]},
+}
+DEFAULT_MODEL = "CB200C"
 
 
 class Failure(Exception):
@@ -197,6 +235,113 @@ def light_address(settings, override):
     raise Failure("more than one Neewer light is known (%s). Pick one with: neewer address <address>" % names)
 
 
+def light_profile(settings=None):
+    """The connected light's profile: PROFILES[model] with light.json's own fields over it."""
+    settings = read_json(LIGHT_FILE, {}) if settings is None else settings
+    given = settings.get("profile") if isinstance(settings.get("profile"), dict) else {}
+    model = given.get("model") if given.get("model") in PROFILES else DEFAULT_MODEL
+    profile = dict(PROFILES[model], model=str(given.get("model") or model))
+    for key, default in PROFILES[DEFAULT_MODEL].items():
+        if key in given and type(given[key]) is type(default):
+            if key == "curve" and given[key] not in CURVES and given[key] != "":
+                continue  # not a curve: the model's own stands
+            profile[key] = given[key]
+    points = []
+    for point in profile["output_curve"]:
+        try:
+            setting, share = float(point[0]), float(point[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if 1 <= setting <= 100 and 0 < share <= 1:
+            points.append((setting, share))
+    points.sort()
+    # Kept only if brighter settings give more light all the way up.
+    good = all(b[0] > a[0] and b[1] > a[1] for a, b in zip(points, points[1:]))
+    profile["output_curve"] = points if len(points) >= 2 and good else []
+    low = int(round(max(1000, min(10000, profile["kelvin_min"])) / 100.0)) * 100
+    high = int(round(max(1000, min(10000, profile["kelvin_max"])) / 100.0)) * 100
+    profile["kelvin_min"], profile["kelvin_max"] = min(low, high), max(low, high)
+    return profile
+
+
+def fit_kelvin(profile, value):
+    """A colour temperature as the light can show it: whole hundreds, inside its range."""
+    value = int(round(float(value) / 100.0)) * 100
+    return max(profile["kelvin_min"], min(profile["kelvin_max"], value))
+
+
+def setting_output(profile, setting):
+    """How much light a brightness setting gives, as a share of full: 0.01-1.0 when no curve is measured."""
+    points = profile["output_curve"]
+    if not points:
+        return max(1, min(100, setting)) / 100.0
+    setting = max(1.0, min(100.0, float(setting)))
+    if setting <= points[0][0]:
+        return points[0][1] * setting / points[0][0]
+    for (s0, f0), (s1, f1) in zip(points, points[1:]):
+        if setting <= s1:
+            along = (math.log(setting) - math.log(s0)) / (math.log(s1) - math.log(s0))
+            return math.exp(math.log(f0) + (math.log(f1) - math.log(f0)) * along)
+    return points[-1][1]
+
+
+def output_setting(profile, share):
+    """The whole-percent setting, 1-100, whose light comes nearest to a share of full output."""
+    share = max(1e-6, float(share))
+    if not profile["output_curve"]:
+        return max(1, min(100, int(round(share * 100))))
+    return min(range(1, 101), key=lambda setting: abs(math.log(setting_output(profile, setting) / share)))
+
+
+def white_hue_saturation(kelvin_value):
+    """Approximate colour of a white point, as hue 0-360 and saturation 0-100."""
+    t = kelvin_value / 100.0
+    if t <= 66:
+        red = 255.0
+        green = 99.4708025861 * math.log(t) - 161.1195681661
+        blue = 0.0 if t <= 19 else 138.5177312231 * math.log(t - 10) - 305.0447927307
+    else:
+        red = 329.698727446 * (t - 60) ** -0.1332047592
+        green = 288.1221695283 * (t - 60) ** -0.0755148492
+        blue = 255.0
+    red, green, blue = (max(0.0, min(255.0, c)) / 255.0 for c in (red, green, blue))
+    hue, saturation, _ = colorsys.rgb_to_hsv(red, green, blue)
+    return int(round(hue * 360)) % 360, int(round(saturation * 100))
+
+
+def nearest_white(profile, hue, saturation):
+    """The white the light can show that is closest to a colour, for lights with no colour LEDs.
+
+    Closest on the colour wheel: hue as the angle, saturation as the distance
+    from the middle.
+    """
+    def point(h, s):
+        return s * math.cos(math.radians(h)), s * math.sin(math.radians(h))
+    want = point(hue, saturation)
+    best = None
+    for value in range(profile["kelvin_min"], profile["kelvin_max"] + 1, 100):
+        here = point(*white_hue_saturation(value))
+        gap = math.hypot(here[0] - want[0], here[1] - want[1])
+        if best is None or gap < best[0]:
+            best = (gap, value)
+    return best[1]
+
+
+def describe_profile(profile):
+    can = [name for name, flag in (("colour", profile["colour"]), ("faint/channels", profile["channels"])) if flag]
+    linear = all(abs(setting_output(profile, s) - s / 100.0) < 1e-9 for s in range(1, 101))
+    return "%s: %d-%dK, %s curve%s; %s" % (
+        profile["model"], profile["kelvin_min"], profile["kelvin_max"], profile["curve"] or "chosen per command",
+        ", also " + " and ".join(can) if can else ", white only",
+        "output taken as the setting (no measured output curve)" if linear else
+        "output curve measured at %d points" % len(profile["output_curve"]))
+
+
+def unsupported(profile, frame, command=None):
+    return Failure("this light (%s) does not take the %s frame%s" % (
+        profile["model"], frame, ", so %s cannot work on it" % command if command else ""))
+
+
 # ---------------------------------------------------------------- argument checks
 
 def whole_percent(text):
@@ -273,6 +418,7 @@ def describe(state):
 class Light:
     def __init__(self, args):
         self.settings = read_json(LIGHT_FILE, {})
+        self.profile = light_profile(self.settings)
         self.state = read_json(STATE_FILE, {})
         self.bridge = Bridge(args.bridge or self.settings.get("bridge") or DEFAULT_BRIDGE)
         self.mac_override = args.mac
@@ -306,19 +452,30 @@ class Light:
         self.remember(on=on)
         self.say("on" if on else "off")
 
+    def white_frame(self, kelvin_value, brightness, tint=0, curve="linear"):
+        """A white frame as this light takes it: inside its range, with its curve."""
+        return white_frame(self.mac, fit_kelvin(self.profile, kelvin_value), brightness, tint,
+                           self.profile["curve"] or curve)
+
     def white(self, kelvin_value, brightness, tint, curve, no_power=False):
         self.wake_if_needed(no_power)
+        kelvin_value, curve = fit_kelvin(self.profile, kelvin_value), self.profile["curve"] or curve
         self.bridge.send(white_frame(self.mac, kelvin_value, brightness, tint, curve))
         self.remember(mode="white", kelvin=kelvin_value, brightness=brightness, tint=tint, curve=curve)
         self.say(describe(self.state))
 
     def colour(self, hue, saturation, brightness, no_power=False):
+        if not self.profile["colour"]:
+            # White LEDs only: the nearest white instead.
+            return self.white(nearest_white(self.profile, hue, saturation), brightness, 0, "linear", no_power)
         self.wake_if_needed(no_power)
         self.bridge.send(colour_frame(self.mac, hue, saturation, brightness))
         self.remember(mode="colour", hue=hue, saturation=saturation, brightness=brightness)
         self.say(describe(self.state))
 
     def channels(self, brightness, levels, no_power=False):
+        if not self.profile["channels"]:
+            raise unsupported(self.profile, "channels")
         self.wake_if_needed(no_power)
         self.bridge.send(channels_frame(self.mac, brightness, **levels))
         self.remember(mode="channels", brightness=brightness, **levels)
@@ -337,13 +494,31 @@ def cmd_off(light, args):
 
 
 def cmd_white(light, args):
+    profile = light.profile
+    if not profile["kelvin_min"] <= args.kelvin <= profile["kelvin_max"]:
+        raise Failure("this light (%s) shows %d-%dK" % (profile["model"], profile["kelvin_min"], profile["kelvin_max"]))
     brightness = light.last_brightness() if args.brightness is None else args.brightness
     tint = light.state.get("tint", 0) if args.tint is None else args.tint
     curve = light.state.get("curve", "linear") if args.curve is None else args.curve
+    if args.curve and profile["curve"] and args.curve != profile["curve"]:
+        # For a comparison by eye. The curve byte changes the light's own
+        # setting, so the next ordinary send puts the profile's curve back.
+        light.bridge.send(white_frame(light.mac, args.kelvin, brightness, tint, args.curve))
+        light.remember(mode="white", kelvin=args.kelvin, brightness=brightness, tint=tint, curve=args.curve)
+        light.say("%s (once: the next ordinary send puts the %s curve back)" % (describe(light.state), profile["curve"]))
+        return
     light.white(args.kelvin, brightness, tint, curve, args.no_power)
 
 
+def no_colour(light, hue, saturation):
+    return Failure("this light (%s) has white LEDs only; the nearest white is %dK: neewer white %d" % (
+        light.profile["model"], nearest_white(light.profile, hue, saturation),
+        nearest_white(light.profile, hue, saturation)))
+
+
 def cmd_colour(light, args):
+    if not light.profile["colour"]:
+        raise no_colour(light, args.hue % 360, args.saturation)
     brightness = light.last_brightness() if args.brightness is None else args.brightness
     light.colour(args.hue % 360, args.saturation, brightness, args.no_power)
 
@@ -351,11 +526,15 @@ def cmd_colour(light, args):
 def cmd_rgb(light, args):
     red, green, blue = args.colour
     hue, saturation, _ = colorsys.rgb_to_hsv(red / 255.0, green / 255.0, blue / 255.0)
+    if not light.profile["colour"]:
+        raise no_colour(light, int(round(hue * 360)) % 360, int(round(saturation * 100)))
     brightness = light.last_brightness() if args.brightness is None else args.brightness
     light.colour(int(round(hue * 360)) % 360, int(round(saturation * 100)), brightness, args.no_power)
 
 
 def cmd_channels(light, args):
+    if not light.profile["channels"]:
+        raise unsupported(light.profile, "channels", "`neewer channels`")
     levels = {name: getattr(args, name) for name in CHANNELS}
     brightness = light.last_brightness() if args.brightness is None else args.brightness
     light.channels(brightness, levels, args.no_power)
@@ -363,6 +542,9 @@ def cmd_channels(light, args):
 
 def cmd_faint(light, args):
     """Below 1%: brightness 1 with only white channels lit, at a level of 1-255."""
+    if not light.profile["channels"]:
+        raise Failure("this light (%s) does not take the channels frame, so `neewer faint` cannot work on it; "
+                      "neewer white <kelvin> 1 is as low as it goes" % light.profile["model"])
     levels = dict.fromkeys(CHANNELS, 0)
     for name in ("warm", "cold") if args.white == "both" else (args.white,):
         levels[name] = args.level
@@ -373,7 +555,7 @@ def cmd_brightness(light, args):
     state = light.state
     if state.get("mode") == "colour":
         light.colour(state.get("hue", 0), state.get("saturation", 100), args.brightness, args.no_power)
-    elif state.get("mode") == "channels":
+    elif state.get("mode") == "channels" and light.profile["channels"]:
         light.channels(args.brightness, {name: state.get(name, 0) for name in CHANNELS}, args.no_power)
     else:
         light.white(
@@ -428,9 +610,13 @@ def interpolate(table, x, log=False):
     return table[-1][1]
 
 
-def sky_start_elevation(top_brightness):
-    """The elevation at which the real sky is as dim as the light's faintest level."""
-    floor = interpolate(SKY_LUX, SKY_TOP_ELEVATION, log=True) / (top_brightness * float(CHANNELS_FULL))
+def sky_start_elevation(top_brightness, faintest=1.0 / CHANNELS_FULL):
+    """The elevation at which the real sky is as dim as the light's faintest level.
+
+    `faintest` is that level as a percent of full output: 1/176 of 1% with the
+    channels frame, and with the white frame alone the output at setting 1.
+    """
+    floor = interpolate(SKY_LUX, SKY_TOP_ELEVATION, log=True) * faintest / float(top_brightness)
     low, high = SKY_LUX[0][0], SKY_TOP_ELEVATION
     for _ in range(40):
         middle = (low + high) / 2
@@ -439,6 +625,24 @@ def sky_start_elevation(top_brightness):
         else:
             high = middle
     return high
+
+
+def sky_white_setting(progress, top_brightness, top_kelvin, profile):
+    """The "sky" sunrise for a light with no channels frame: the white frame only.
+
+    The same sky as below, in light output: `top_brightness` is the output to
+    end at, as a percent of full. The ramp starts where the sky is as dim,
+    relative to that, as the light's lowest setting is, and each step sends
+    the setting that gives the sky's share (see output_setting). The colour is
+    the sky's, kept inside what the light shows, so blue twilight is the
+    light's coolest white.
+    """
+    start = sky_start_elevation(top_brightness, faintest=100.0 * setting_output(profile, 1))
+    elevation = start + (SKY_TOP_ELEVATION - start) * min(1.0, max(0.0, progress))
+    percent = top_brightness * interpolate(SKY_LUX, elevation, log=True) / interpolate(
+        SKY_LUX, SKY_TOP_ELEVATION, log=True)
+    colour = interpolate(SKY_KELVIN + ((SKY_TOP_ELEVATION, top_kelvin),), elevation)
+    return ("white", fit_kelvin(profile, colour), output_setting(profile, percent / 100.0))
 
 
 def sky_setting(progress, top_brightness, top_kelvin):
@@ -468,15 +672,31 @@ def sky_setting(progress, top_brightness, top_kelvin):
     return ("channels", brightness, levels)
 
 
-def sunrise_setting(progress, top_brightness, top_kelvin, style="sky"):
+def sunrise_setting(progress, top_brightness, top_kelvin, style="sky", profile=None):
     """The light setting at a point in the sunrise, from 0.0 (start) to 1.0 (end).
 
     Returns ("channels", brightness, levels) or ("white", kelvin, brightness).
-    The sky style only ever returns the first kind.
+    On a light that takes the channels frame, the sky style only ever returns
+    the first kind; on one that does not, every style returns only the second.
     """
+    profile = PROFILES[DEFAULT_MODEL] if profile is None else profile
+    if not profile["channels"]:
+        if style == "sky":
+            return sky_white_setting(progress, top_brightness, top_kelvin, profile)
+        return glow_white_setting(progress, top_brightness, top_kelvin, profile)
     if style == "sky":
         return sky_setting(progress, top_brightness, top_kelvin)
     return glow_setting(progress, top_brightness, top_kelvin)
+
+
+def glow_white_setting(progress, top_brightness, top_kelvin, profile):
+    """The "glow" sunrise for a light with no channels frame: its last stage only,
+    over the whole time. Light output from the lowest setting's up to the target
+    by a constant ratio, warmest white to the target colour."""
+    x = min(1.0, max(0.0, progress))
+    low = setting_output(profile, 1)
+    brightness = output_setting(profile, low * (top_brightness / 100.0 / low) ** x)
+    return ("white", fit_kelvin(profile, profile["kelvin_min"] + (top_kelvin - profile["kelvin_min"]) * x), brightness)
 
 
 def glow_setting(progress, top_brightness, top_kelvin):
@@ -517,10 +737,11 @@ def describe_setting(setting):
 
 def cmd_sunrise(light, args):
     total = args.minutes * 60.0
+    args.kelvin = fit_kelvin(light.profile, args.kelvin)
     if args.plan:
         last = None
         for tick in range(4001):
-            setting = sunrise_setting(tick / 4000.0, args.brightness, args.kelvin, args.style)
+            setting = sunrise_setting(tick / 4000.0, args.brightness, args.kelvin, args.style, light.profile)
             if setting != last:
                 at = total * tick / 4000.0
                 print("%3d:%02d  %s" % (at // 60, at % 60, describe_setting(setting)))
@@ -569,7 +790,7 @@ def cmd_sunrise(light, args):
     try:
         while True:
             progress = min(1.0, (time.monotonic() - started) / total)
-            setting = sunrise_setting(progress, args.brightness, args.kelvin, args.style)
+            setting = sunrise_setting(progress, args.brightness, args.kelvin, args.style, light.profile)
             if setting != last or not awake:
                 # Anything else that sets the light (Home, another neewer
                 # command) rewrites the state file; treat that as "stop".
@@ -597,7 +818,8 @@ def cmd_sunrise(light, args):
                     lost_since = None
                 last = setting
                 if args.style == "sky":
-                    name = "twilight" if setting[1] == 1 else "daylight coming up"
+                    faint = setting[1] == 1 if setting[0] == "channels" else setting[2] == 1
+                    name = "twilight" if faint else "daylight coming up"
                 elif setting[0] == "channels":
                     name = "warm white coming in" if setting[2].get("warm") else "red glow"
                 else:
@@ -667,26 +889,33 @@ def follow_settings():
     settings["morning_lead_minutes"] = max(0, settings["morning_lead_minutes"])
     settings["night_brightness"] = int(max(1, min(100, settings["night_brightness"])))
     settings["day_brightness"] = int(max(settings["night_brightness"], min(100, settings["day_brightness"])))
-    settings["night_kelvin"] = int(max(KELVIN_MIN, min(KELVIN_MAX, settings["night_kelvin"])))
+    settings["night_kelvin"] = fit_kelvin(light_profile(), settings["night_kelvin"])
     settings["hold_minutes"] = max(0, settings["hold_minutes"])
     return settings
 
 
-def follow_target(sun, settings):
-    """(kelvin, brightness) for the light, from sundial's target.
-
-    Brightness runs from the night level to the day level with sundial's
-    "daylight" share. Colour is sundial's, moving to the night colour as the
-    sun goes below the horizon, and kept inside what the light can show.
-    """
+def follow_output(sun, settings):
+    """The light output the sun calls for, as a percent of full."""
     daylight = max(0.0, min(1.0, float(sun["daylight"])))
     low, high = settings["night_brightness"], settings["day_brightness"]
-    brightness = int(round(low + (high - low) * daylight))
+    return low + (high - low) * daylight
+
+
+def follow_target(sun, settings):
+    """(kelvin, brightness setting) for the light, from sundial's target.
+
+    The light output runs from the night level to the day level with
+    sundial's "daylight" share, and the brightness is the setting that gives
+    that output on the light's curve (the setting itself, with no measured
+    curve). Colour is sundial's, moving to the night colour as the sun goes
+    below the horizon, and kept inside what the light can show.
+    """
+    profile = light_profile()
+    brightness = output_setting(profile, follow_output(sun, settings) / 100.0)
     night = (NIGHT_COLOUR_FROM - float(sun["sun_elevation"])) / (NIGHT_COLOUR_FROM - NIGHT_COLOUR_BY)
     night = max(0.0, min(1.0, night))
     colour = float(sun["kelvin"]) + (settings["night_kelvin"] - float(sun["kelvin"])) * night
-    colour = int(round(colour / 100.0)) * 100
-    return max(KELVIN_MIN, min(KELVIN_MAX, colour)), max(1, min(100, brightness))
+    return fit_kelvin(profile, colour), max(1, min(100, brightness))
 
 
 def sundial_target(now):
@@ -1031,6 +1260,23 @@ def fresh_bookkeeping(memory, settings, on, now):
             memory["day"], memory["fresh"] = morning, True
 
 
+def starting_now(memory, settings, on, now):
+    """Following is switched on: that is not a new day, nor a fresh start.
+
+    A follower that was off through the morning has not seen the day begin.
+    Left to itself it would take that, or the light having been on all along,
+    for a fresh start, and set the sun's level at once: full brightness at
+    midday, with sun tracking off and nobody asking.
+    """
+    times = sleep_times(settings) if settings["bedtime_rule"] else None
+    if times is not None:
+        morning = night_window(now, times[0], times[1], settings["morning_lead_minutes"])[1]
+        if now >= morning:
+            memory["day"] = morning
+    if on:
+        memory["fresh"] = False
+
+
 def fresh_start_look(now=None):
     """(kelvin, brightness) a light switched on right now should get, or None.
 
@@ -1079,8 +1325,10 @@ def fade_out(light, memory, seconds, now):
         elapsed += FADE_STEP_SECONDS
         if state_stamp() != stamp:
             return False, now + elapsed
-        # Each step is the same share dimmer than the last, which looks even.
-        level = max(1, int(round(top * (1.0 / top) ** min(1.0, elapsed / seconds))))
+        # Each step is the same share dimmer than the last, in light output,
+        # which looks even: on the light's measured curve when there is one.
+        high, low = setting_output(light.profile, top), setting_output(light.profile, 1)
+        level = output_setting(light.profile, high * (low / high) ** min(1.0, elapsed / seconds))
         if level != shown:
             if before["mode"] == "colour":
                 light.colour(before.get("hue", 0), before.get("saturation", 100), level, no_power=True)
@@ -1096,9 +1344,12 @@ def fade_out(light, memory, seconds, now):
         # one, so its own button wakes it as it was. Not known to work.
         try:
             pause(0.3)
-            frame = colour_frame(light.mac, before.get("hue", 0), before.get("saturation", 100), top) \
-                if before["mode"] == "colour" else white_frame(
-                    light.mac, before.get("kelvin", 5600), top, before.get("tint", 0), before.get("curve", "linear"))
+            if before["mode"] == "colour" and light.profile["colour"]:
+                frame = colour_frame(light.mac, before.get("hue", 0), before.get("saturation", 100), top)
+            elif before["mode"] == "colour":
+                frame = light.white_frame(nearest_white(light.profile, before.get("hue", 0), before.get("saturation", 100)), top)
+            else:
+                frame = light.white_frame(before.get("kelvin", 5600), top, before.get("tint", 0), before.get("curve", "linear"))
             light.bridge.send(frame)
         except Failure:
             pass
@@ -1280,11 +1531,12 @@ def cmd_follow(light, args):
         if args.action == "off":
             print("following is off; the light stays as it is")
             return
-        # Switching on also ends any hold: take the light over now.
-        set_tracking(True, "cli")
+        # Switching on also ends any hold on this light. The sun tracking
+        # switch is left as it is: `neewer tracking on` is the one for that.
         memory = read_json(FOLLOW_MEMORY_FILE, {})
         memory.pop("manual", None)
         memory["stamp"], memory["sent"] = state_stamp(), follow_look(light.state)
+        starting_now(memory, follow_settings(), light.state.get("on") is True, time.time())
         write_json(FOLLOW_MEMORY_FILE, memory)
         line = follow_apply(light)
         print("following is on" + (": " + line if line else ""))
@@ -1298,7 +1550,10 @@ def cmd_follow(light, args):
         sun = sundial_target(now)
         print("Sun:       %+.1f degrees, daylight %d%%" % (
             float(sun["sun_elevation"]), round(float(sun["daylight"]) * 100)))
-        print("Target:    white %dK at %d%%" % follow_target(sun, settings))
+        target = follow_target(sun, settings)
+        print("Target:    white %dK at %d%%" % target + (
+            "" if not light.profile["output_curve"] or target[1] == round(follow_output(sun, settings)) else
+            " (for %g%% of full output)" % round(follow_output(sun, settings), 1)))
     except Failure as failure:
         print("Sun:       unknown (%s)" % failure)
     print("Light:     %s" % describe(light.state))
@@ -1364,6 +1619,7 @@ def cmd_status(light, args):
     else:
         print("Light:     not connected (%s). Check it is on and in Infinity mode." % (
             "scanning" if info.get("scanning") else "waiting"))
+    print("Profile:   %s" % describe_profile(light.profile))
     print("Last set:  %s" % describe(light.state))
     print("           (what this command last sent; changes made on the light itself are not seen)")
 
@@ -1412,6 +1668,16 @@ def cmd_selftest(light, args):
         ok = actual == expected
         failed += 0 if ok else 1
         print("%-9s %s  %s" % (name, "ok  " if ok else "FAIL", actual if ok else "%s != %s" % (actual, expected)))
+    # The AS600B's profile: every white frame is kept inside 2700-6500K, which
+    # the light takes, and carries its exponential curve (01). 6600K and 2500K
+    # would be dropped by the light, so they become 6500K and 2700K.
+    as600b = light_profile({"profile": {"model": "AS600B"}})
+    mac = parse_mac("AA:BB:CC:DD:EE:FF")
+    for name, wanted, expected in (("AS600B hi", 6600, 65), ("AS600B lo", 2500, 27)):
+        frame = white_frame(mac, fit_kelvin(as600b, wanted), 5, 0, as600b["curve"])
+        ok = frame[11] == expected and frame[13] == 0x01
+        failed += 0 if ok else 1
+        print("%-9s %s  %s" % (name, "ok  " if ok else "FAIL", to_hex(frame)))
     if failed:
         raise Failure("%d frame(s) do not match the captures" % failed)
 
@@ -1438,10 +1704,10 @@ def build_parser():
     add("off", cmd_off, "switch to standby")
 
     white = add("white", cmd_white, "white light: neewer white 5600 10", aliases=["cct"])
-    white.add_argument("kelvin", type=kelvin, help="colour temperature, %d-%d" % (KELVIN_MIN, KELVIN_MAX))
+    white.add_argument("kelvin", type=kelvin, help="colour temperature, within what the light shows (neewer status)")
     white.add_argument("brightness", type=whole_percent, nargs="?", help="0-100 (default: last used)")
     white.add_argument("--tint", type=bounded(-50, 50, "tint"), help="green/magenta, -50 to 50")
-    white.add_argument("--curve", choices=sorted(CURVES), help="dimming curve (experimental)")
+    white.add_argument("--curve", choices=sorted(CURVES), help="dimming curve, if the light's profile leaves it open")
     add_no_power(white)
 
     colour = add("colour", cmd_colour, "colour by hue: neewer colour 240 100 10", aliases=["color", "hsi"])

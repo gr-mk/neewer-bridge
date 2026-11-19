@@ -42,8 +42,6 @@ SETTINGS_FILE = os.path.join(cli.APP_DIR, "homekit.json")
 
 DEFAULT_NAME = "Neewer CB200C"
 DEFAULT_PORT = 51826
-MIRED_MIN = int(round(1e6 / cli.KELVIN_MAX))  # 133, the coolest white
-MIRED_MAX = int(round(1e6 / cli.KELVIN_MIN))  # 400, the warmest white
 # The HomeKit specification rejects these setup codes as too guessable.
 WEAK_CODES = {str(d) * 8 for d in range(10)} | {"12345678", "87654321"}
 
@@ -52,29 +50,25 @@ log = logging.getLogger("neewer-homekit")
 
 # ---------------------------------------------------------------- conversions
 
-def mired_to_kelvin(mired):
-    kelvin = int(round(1e6 / mired / 100.0)) * 100
-    return max(cli.KELVIN_MIN, min(cli.KELVIN_MAX, kelvin))
+# The light's profile (model, colour temperatures, curve, what it takes) is
+# the command's: light.json's "profile". It is read when the service starts.
+
+def mired_range(profile):
+    """(coolest, warmest) in mireds, both inside what the light shows: 154-370 for 2700-6500K."""
+    return int(math.ceil(1e6 / profile["kelvin_max"])), int(math.floor(1e6 / profile["kelvin_min"]))
 
 
-def kelvin_to_mired(kelvin):
-    return max(MIRED_MIN, min(MIRED_MAX, int(round(1e6 / kelvin))))
+def mired_to_kelvin(mired, profile):
+    return cli.fit_kelvin(profile, 1e6 / mired)
 
 
-def kelvin_to_hue_saturation(kelvin):
-    """Approximate colour of a white point, so Home's colour wheel matches the light."""
-    t = kelvin / 100.0
-    if t <= 66:
-        red = 255.0
-        green = 99.4708025861 * math.log(t) - 161.1195681661
-        blue = 0.0 if t <= 19 else 138.5177312231 * math.log(t - 10) - 305.0447927307
-    else:
-        red = 329.698727446 * (t - 60) ** -0.1332047592
-        green = 288.1221695283 * (t - 60) ** -0.0755148492
-        blue = 255.0
-    red, green, blue = (max(0.0, min(255.0, c)) / 255.0 for c in (red, green, blue))
-    hue, saturation, _ = colorsys.rgb_to_hsv(red, green, blue)
-    return int(round(hue * 360)) % 360, int(round(saturation * 100))
+def kelvin_to_mired(kelvin, profile):
+    low, high = mired_range(profile)
+    return max(low, min(high, int(round(1e6 / kelvin))))
+
+
+# Approximate colour of a white point, so Home's colour wheel matches the light.
+kelvin_to_hue_saturation = cli.white_hue_saturation
 
 
 # ---------------------------------------------------------------- pairing record
@@ -118,6 +112,7 @@ class LightLink:
 
     def __init__(self):
         settings = cli.read_json(cli.LIGHT_FILE, {})
+        self.profile = cli.light_profile(settings)
         self.bridge = cli.Bridge(settings.get("bridge") or cli.DEFAULT_BRIDGE)
         self.mac = cli.light_address(settings, None)
         self.lock = threading.Lock()
@@ -125,7 +120,7 @@ class LightLink:
         self.stopping = False
         self.reachable = False
         self.link_age = None
-        self.wanted = self.normalise(cli.read_json(cli.STATE_FILE, {}))
+        self.wanted = self.normalise(cli.read_json(cli.STATE_FILE, {}), self.profile)
         self.sent_on = self.wanted["on"]
         self.sent_frame = None
         self.state_stamp = self.stamp()
@@ -139,18 +134,23 @@ class LightLink:
         return "".join("%02X" % byte for byte in self.mac[3:])
 
     @classmethod
-    def normalise(cls, state):
+    def normalise(cls, state, profile):
+        """A state as this light can show it: inside its range, with its curve, and white
+        if it has no colour LEDs."""
         mode = state.get("mode")
-        return {
+        normal = {
             "on": bool(state.get("on")),
             "mode": mode if mode in ("white", "colour") else "white",
-            "kelvin": int(state.get("kelvin", 5600)),
+            "kelvin": cli.fit_kelvin(profile, state.get("kelvin", 5600)),
             "brightness": int(state.get("brightness", 10)),
             "tint": int(state.get("tint", 0)),
-            "curve": state.get("curve") if state.get("curve") in cli.CURVES else "linear",
+            "curve": profile["curve"] or (state.get("curve") if state.get("curve") in cli.CURVES else "linear"),
             "hue": int(state.get("hue", 0)),
             "saturation": int(state.get("saturation", 100)),
         }
+        if normal["mode"] == "colour" and not profile["colour"]:
+            normal.update(mode="white", kelvin=cli.nearest_white(profile, normal["hue"], normal["saturation"]))
+        return normal
 
     @staticmethod
     def stamp():
@@ -179,7 +179,8 @@ class LightLink:
             # the sun's setting, not back to how it was left.
             fresh = cli.fresh_start_look() if values.get("On") and not wanted["on"] else None
             if fresh is not None:
-                wanted.update(on=True, mode="white", kelvin=fresh[0], brightness=fresh[1], tint=0, curve="linear")
+                wanted.update(on=True, mode="white", kelvin=fresh[0], brightness=fresh[1], tint=0,
+                              curve=self.profile["curve"] or "linear")
                 self.fresh = True
                 values = {}
             before = cli.follow_look(wanted)
@@ -187,13 +188,19 @@ class LightLink:
             # saturation; the temperature is the one the user chose.
             if "ColorTemperature" in values:
                 wanted["mode"] = "white"
-                wanted["kelvin"] = mired_to_kelvin(values["ColorTemperature"])
+                wanted["kelvin"] = mired_to_kelvin(values["ColorTemperature"], self.profile)
             elif "Hue" in values or "Saturation" in values:
-                wanted["mode"] = "colour"
                 if "Hue" in values:
                     wanted["hue"] = int(round(values["Hue"])) % 360
                 if "Saturation" in values:
                     wanted["saturation"] = max(0, min(100, int(round(values["Saturation"]))))
+                if self.profile["colour"]:
+                    wanted["mode"] = "colour"
+                else:
+                    # White LEDs only: the colour asked for becomes the nearest
+                    # white, and Home is shown that white.
+                    wanted["mode"] = "white"
+                    wanted["kelvin"] = cli.nearest_white(self.profile, wanted["hue"], wanted["saturation"])
             if "Brightness" in values:
                 wanted["brightness"] = max(0, min(100, int(values["Brightness"])))
             if "On" in values:
@@ -208,9 +215,12 @@ class LightLink:
     # -- to the light
 
     def mode_frame(self, state):
-        if state["mode"] == "colour":
+        if state["mode"] == "colour" and self.profile["colour"]:
             return cli.colour_frame(self.mac, state["hue"], state["saturation"], state["brightness"])
-        return cli.white_frame(self.mac, state["kelvin"], state["brightness"], state["tint"], state["curve"])
+        kelvin = state["kelvin"] if state["mode"] == "white" else cli.nearest_white(
+            self.profile, state["hue"], state["saturation"])
+        return cli.white_frame(self.mac, cli.fit_kelvin(self.profile, kelvin), state["brightness"], state["tint"],
+                               self.profile["curve"] or state["curve"])
 
     def run(self):
         while True:
@@ -289,7 +299,7 @@ class LightLink:
             return False
         self.state_stamp = stamp
         raw = cli.read_json(cli.STATE_FILE, {})
-        on_disk = self.normalise(raw)
+        on_disk = self.normalise(raw, self.profile)
         # Home has no way to show the command's "channels" mode (used for levels
         # below 1%), so it is shown as white. Forgetting the last frame makes
         # sure the next change from Home is really sent.
@@ -386,7 +396,8 @@ def build_accessory(driver, name, light, sunrise):
         def __init__(self):
             super().__init__(driver, name)
             self.set_info_service(
-                firmware_revision=VERSION, manufacturer="NEEWER", model="CB200C", serial_number=light.serial)
+                firmware_revision=VERSION, manufacturer="NEEWER", model=light.profile["model"],
+                serial_number=light.serial)
             service = self.add_preload_service(
                 "Lightbulb", chars=["Brightness", "Hue", "Saturation", "ColorTemperature"])
             self.on = service.configure_char("On")
@@ -394,7 +405,7 @@ def build_accessory(driver, name, light, sunrise):
             self.hue = service.configure_char("Hue")
             self.saturation = service.configure_char("Saturation")
             self.temperature = service.configure_char(
-                "ColorTemperature", properties={"minValue": MIRED_MIN, "maxValue": MIRED_MAX})
+                "ColorTemperature", properties=dict(zip(("minValue", "maxValue"), mired_range(light.profile))))
             service.setter_callback = self.home_wrote
             service.is_primary_service = True
             # Added after the light's own service, so the light keeps its
@@ -427,7 +438,7 @@ def build_accessory(driver, name, light, sunrise):
                 ("Brightness", self.brightness, state["brightness"]),
                 ("Hue", self.hue, hue),
                 ("Saturation", self.saturation, saturation),
-                ("ColorTemperature", self.temperature, kelvin_to_mired(state["kelvin"])),
+                ("ColorTemperature", self.temperature, kelvin_to_mired(state["kelvin"], light.profile)),
             )
             for label, characteristic, value in values:
                 if label not in skip and characteristic.get_value() != value:

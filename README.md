@@ -1,6 +1,6 @@
 # Neewer Bridge
 
-Controls a Neewer CB200C over Bluetooth from a Mac, with no window and no vendor app.
+Controls a Neewer Bluetooth light from a Mac, with no window and no vendor app. The light now is a NEEWER AS600B, a 600 W bi-colour COB light. It was first written for a CB200C, and that light is still supported (see Light profiles).
 
 It has three parts:
 
@@ -17,22 +17,67 @@ The split is deliberate. Rebuilding the bridge changes its code signature, and m
 ```
 neewer on
 neewer off
-neewer white 5600 10        # colour temperature in kelvin (2500-7500), brightness 0-100
+neewer white 5600 10        # colour temperature in kelvin, brightness 0-100
 neewer white 3200 --tint -10
-neewer colour 240 100 10    # hue 0-360, saturation 0-100, brightness
-neewer rgb ff8800 10
-neewer brightness 1         # keeps the current colour; 1 is the lowest ordinary level
-neewer faint 5              # dimmer than 1%: level 1 (dimmest) to 255
-neewer faint 5 --white both # use the cold white LEDs as well as the warm ones
-neewer channels 1 --warm 20 # drive the five LED channels directly, 0-255 each
+neewer brightness 1         # keeps the current colour; 1 is the lowest it goes
 neewer sunrise --minutes 30 # ramp up the way a real sunrise brightens
 neewer follow               # show whether the light is following the sun
 neewer status
 ```
 
-Brightness is a whole number, and 1% is as low as the ordinary control goes. `neewer faint` goes below that. It uses the light's five-channel mode at brightness 1 with only the white LEDs lit, which is much dimmer than `white ... 1` and is still visibly lit at level 1.
+Brightness is a whole number, and 1% is as low as it goes on the AS600B. Colour temperature is 2700-6500K on the AS600B, in steps of 100K, as on its display.
 
-`neewer status` shows what the command last sent, not what the light is doing: the light does not report its state, so changes made on its own dial are not seen.
+These only work on a light that has colour LEDs or takes the five-channel frame, such as the CB200C. On the AS600B each says so and sends nothing (`colour` and `rgb` also name the nearest white):
+
+```
+neewer colour 240 100 10    # hue 0-360, saturation 0-100, brightness
+neewer rgb ff8800 10
+neewer faint 5              # dimmer than 1%: level 1 (dimmest) to 255
+neewer channels 1 --warm 20 # drive the five LED channels directly, 0-255 each
+```
+
+`neewer status` shows the light's profile and what the command last sent, not what the light is doing: the light does not report its state, so changes made on its own dial are not seen.
+
+## Light profiles
+
+What the connected light can do is its profile, in `light.json` in the settings folder:
+
+```
+{
+  "mac": "F0:6F:33:D3:09:34",
+  "profile": {"model": "AS600B"}
+}
+```
+
+`model` picks one of the profiles built into `cli/neewer`, and any field given beside it overrides that profile's own. Without a profile the light is taken to be a CB200C.
+
+| | AS600B | CB200C |
+|---|---|---|
+| `kelvin_min`, `kelvin_max` | 2700, 6500 | 2500, 7500 |
+| `curve` | `exp` | none: each command chooses, linear unless asked |
+| `channels` (the five-channel frame) | false | true |
+| `colour` (the hue frame) | false | true |
+| `output_curve` | a stand-in (below) | none |
+
+Every white frame, from every path (the command, the follower, the bedtime fade, the morning, a fresh start, the sunrise, Apple Home), is kept inside the profile's colour temperatures and carries its curve. This matters on the AS600B, which:
+
+- **drops a white frame outside 2700-6500K.** 2500K and 6600K were tried; its display kept the old value. So nothing outside the range is sent: the follower and the rest bring a colour into the range, and `neewer white 6600` refuses with the range.
+- **honours the curve byte**, which sets the light's own dimming curve: 04 linear, 01 exponential. It is kept on exponential. `neewer white 5600 5 --curve linear` sends linear once, for a comparison by eye; the next ordinary send puts exponential back.
+- **ignores the channels frame altogether** (cold white at 255, brightness 15%, did nothing), so there is no `faint`, no `channels`, and a different sunrise (below).
+
+### How bright a setting really is
+
+On the exponential curve, a brightness setting is not that share of the light's full output: low settings give far less. `output_curve` is how much light each setting really gives, as pairs of setting and share of full output:
+
+```
+"output_curve": [[1, 0.0005], [20, 0.02], [50, 0.2], [100, 1.0]]
+```
+
+(made-up numbers). Between the points the output is taken to follow a power of the setting, which is a straight line when both are drawn on log scales.
+
+The follower, the bedtime fade, the morning switch-on, a fresh start and the sunrise all work in light output. They work out how much light they want, as a share of full, and send the setting that gives it. So `night_brightness: 5` means 5% of full output, not setting 5. The Apple Home slider and `neewer white` send the setting as given, with no mapping.
+
+**The AS600B's curve is not measured yet.** Its built-in `output_curve` is a stand-in, `[[1, 0.01], [100, 1.0]]`, under which every setting gives exactly that share of output, so for now nothing is mapped and everything behaves as it did. `neewer status` says which it is. Measured points go into `light.json` as `"output_curve"` beside `"model"`.
 
 ## Sunrise
 
@@ -52,11 +97,13 @@ The brightness follows the real sky. It uses the standard table of clear-sky ill
 
 The colour is an approximation, not a measured table. It is a view towards the sunrise: cold white in twilight, warming to about 2800K as the sun reaches the horizon, then whitening to the target.
 
-The whole ramp is sent as channels frames, mixing the warm and cold white LEDs, and never uses the white frame. Switching between the two frames shows a wrong colour for a moment, and the channels frame takes fractions of a percent all the way up. The mix was matched by eye against the white frame at 2800K, at 1% and at 10%: channels brightness `b` with levels adding up to 176 is as bright as white at `b`%, 2800K is about 95% warm and 5% cold, and about 1 part in 60 of red takes off a green cast. It has not been compared at other colour temperatures or near full brightness.
+**On the AS600B** there is no channels frame, so the sky sunrise is sent as white frames only, on the exponential curve. It is the same sky in light output: `--brightness` is where it ends as a share of full output, and each step sends the setting that gives the sky's share (see How bright a setting really is; for now the setting is the share). It starts where the sky is as dim, relative to the end, as the light's lowest setting is, so it opens at 1% with the sun about 2 degrees down, rather than in deep twilight. The colour is the sky's, kept within 2700-6500K: cool white in twilight, about 2800K at the horizon, then whitening to the target. `--style glow` on this light is a plain ramp in light output from the lowest setting to the target, warmest white to the target colour. Neither has been watched on the light yet; `--plan` shows the steps.
+
+**On the CB200C** the whole ramp is sent as channels frames, mixing the warm and cold white LEDs, and never uses the white frame. Switching between the two frames shows a wrong colour for a moment, and the channels frame takes fractions of a percent all the way up. The mix was matched by eye against the white frame at 2800K, at 1% and at 10%: channels brightness `b` with levels adding up to 176 is as bright as white at `b`%, 2800K is about 95% warm and 5% cold, and about 1 part in 60 of red takes off a green cast. It has not been compared at other colour temperatures or near full brightness.
 
 `neewer sunrise --style glow` is the older, designed ramp: a red glow, then warm white, then white, each climbing by a constant ratio.
 
-Setting the light any other way, from Apple Home or with another `neewer` command, stops the ramp. When it finishes, the light is left in the channels mode, which Apple Home shows as white.
+Setting the light any other way, from Apple Home or with another `neewer` command, stops the ramp. When it finishes on the CB200C, the light is left in the channels mode, which Apple Home shows as white.
 
 A sunrise usually runs with nobody watching, so:
 
@@ -74,13 +121,13 @@ It does not work out the sun's position itself. It reads the file that sundial w
 ```
 neewer follow            # show what it is doing and why
 neewer follow off        # pause it; the light stays as it is
-neewer follow on         # start again, and take the light over now
+neewer follow on         # start again (Sun Tracking is its own switch: neewer tracking on)
 ```
 
 The rules:
 
 - **It switches the light off and on only at bedtime and in the morning** (below). Otherwise it never does, and while the light is off it does nothing.
-- **A setting made elsewhere wins.** If you set the light from Apple Home or with another `neewer` command, sun tracking turns off and the light is left alone until it is turned on again (see Sun Tracking below). `neewer follow on` turns it on.
+- **A setting made elsewhere wins.** If you set the light from Apple Home or with another `neewer` command, sun tracking turns off and the light is left alone until it is turned on again (see Sun Tracking below), with `neewer tracking on` or the Sun Tracking switch.
 - **Switched on by day, it starts afresh** (below): it goes to the sun's setting, not back to how it was left.
 - **It keeps out of a sunrise.** Nothing is sent while `neewer sunrise` runs. When it ends, following takes the light over from where the sunrise left it; a sunrise does not turn sun tracking off. (In the older way without the switch, what it leaves is held for two hours like any other setting.)
 - **It only sends when the target changes.** That is about once a minute around sunrise and sunset, and not at all at midday or at night.
@@ -105,8 +152,8 @@ The settings are in `follow.json` in the settings folder, and are read each minu
 }
 ```
 
-- Brightness runs from `night_brightness` to `day_brightness` with sundial's "daylight" share. With sundial's defaults that is the night level until the sun is 6 degrees below the horizon and the day level once it is 20 degrees up.
-- Colour is sundial's colour, kept within the light's 2500-7500K. While the sun goes from the horizon to 6 degrees below, it moves to `night_kelvin`.
+- Brightness runs from `night_brightness` to `day_brightness` with sundial's "daylight" share. Both are light output as a percent of full; the setting sent is the one that gives it on the light's curve (see How bright a setting really is; for now on the AS600B the setting is the output). With sundial's defaults that is the night level until the sun is 6 degrees below the horizon and the day level once it is 20 degrees up.
+- Colour is sundial's colour, kept within what the light shows (2700-6500K on the AS600B). While the sun goes from the horizon to 6 degrees below, it moves to `night_kelvin`.
 - `night_brightness` cannot go below 1, because 0 would switch the light off.
 - `hold_minutes` is how long a setting made elsewhere is left alone, in the older way without the Sun Tracking switch. With the switch it is not used.
 
@@ -139,7 +186,7 @@ Bedtime and the wake time are sundial's (`[sleep]` in `~/.config/sundial/config.
 
 `"bedtime_rule": false` switches the whole rule off. `"morning_on": false` keeps the switching off and drops the switching on. `fade_minutes` and `morning_lead_minutes` are the five minutes and the half hour.
 
-It uses the ordinary white frame. After a sunrise the light is in the channels mode, so there is one brief wrong colour when following takes over.
+It uses the ordinary white frame, with the light's own curve (exponential on the AS600B). On the CB200C, after a sunrise the light is in the channels mode, so there is one brief wrong colour when following takes over.
 
 Each change goes to `~/Library/Logs/neewer-follow.log`. `python3 tests/test_follow.py` checks the rules without a light.
 
@@ -156,7 +203,9 @@ To pair, open the Home app, choose Add Accessory, and scan the QR code or enter 
 
 Add `--qr code.svg` in place of `--pairing` to write the QR code to a file.
 
-- Home shows the light as on/off, brightness, colour and colour temperature (2500-7500K).
+- Home shows the light as on/off, brightness, colour and colour temperature, the range being the light's profile's (2700-6500K on the AS600B: 154-370 mired). The model shown is the profile's.
+- **On a light with white LEDs only (the AS600B)**, a colour chosen on Home's colour wheel becomes the nearest white the light can show, and Home is then shown that white. No colour frame is ever sent. The colour controls are still there, because taking them away would mean pairing the light again.
+- The brightness slider sends the setting as given.
 - Home and the `neewer` command share one record of the last setting, so a change made with either shows up in the other within a few seconds.
 - If the bridge loses the light, Home shows "No Response" rather than a state it cannot change.
 - The pairing keys are in `homekit-data/` in the settings folder, readable only by you. Deleting that folder unpairs the light; remove it from the Home app first.
@@ -418,13 +467,13 @@ The fixture follows the sun the same way the Neewer light does, from the same su
 ```
 fixture follow            # show what it is doing and why
 fixture follow off        # pause it; the fixture stays as it is
-fixture follow on         # start again, and take the fixture over now
+fixture follow on         # start again (Sun Tracking is its own switch: fixture tracking on)
 ```
 
 The rules are the Neewer light's:
 
 - **It switches the fixture off and on only at bedtime and in the morning**, by the same rule as the Neewer light (see Bedtime above), with the same settings in its own `follow.json`. Otherwise it never does, and while the fixture is off it does nothing.
-- **A setting made elsewhere wins.** A change from Apple Home, the `fixture` command, the WiZ app or a single bulb's tile turns sun tracking off, and the fixture is left alone until it is turned on again. `fixture follow on` turns it on.
+- **A setting made elsewhere wins.** A change from Apple Home, the `fixture` command, the WiZ app or a single bulb's tile turns sun tracking off, and the fixture is left alone until it is turned on again, with `fixture tracking on` or the Sun Tracking switch.
 - **Switched on by day, it starts afresh**, as the Neewer light does (see A fresh start above), with `"fresh_start"` in its own `follow.json`. From Apple Home's Sun tile it is immediate: no bulb is sent the old setting first. From anywhere else (`fixture on`, the WiZ app, a bulb's own tile, the wall switch) the old setting shows until the follower's next look, up to a minute. Bulbs that did not answer, as when the wall switch is off, count as having been off.
 - **It only sends when what a bulb should show changes**, and writes one line to the log each time. It does not round brightness to a whole number, so through dusk and dawn the fixture moves one bulb at a time, in twelfths of a percent.
 - If no bulb answers, or sundial has stopped, it tries again each minute and writes one line, not one a minute.
@@ -551,7 +600,7 @@ launchctl kickstart -k gui/$(id -u)/local.neewer-bridge
 
 ## Command format
 
-Confirmed on a CB200C that advertises as `NW-20250017&00000000`:
+Confirmed on a CB200C that advertises as `NW-20250017&00000000`, and the power and white frames again on an AS600B that advertises as `NW-20240064&00000000`:
 
 ```
 78 <tag> <size> <6 address bytes> <subtag> <values...> <checksum>
@@ -564,7 +613,9 @@ channels tag A9 subtag A8  values: brightness, red, green, blue, cold white, war
 
 `size` counts every byte after itself up to the checksum. The checksum is the low byte of the sum of all bytes before it. `neewer selftest` checks the builder against known-good frames.
 
-What was tried on this light, judged by eye:
+On the AS600B, judged by eye on its display: the power and white frames work as on the CB200C, and its display steps colour temperature in 100K, the same as the kelvin/100 byte. The curve byte is honoured (04 linear, 01 exponential). The channels frame is ignored. A white frame at 2500K or 6600K is dropped. It answers the device-info query with `... 41 53 36 30 30 42` ("AS600" "B") and the temperature query too.
+
+What was tried on the CB200C, judged by eye:
 
 - The older, shorter frames (`78 81 ...`, `78 87 ...`) are ignored.
 - The channels frame works and reaches below 1%. Brightness 1 with warm white at 20, 5 and 1 out of 255 were each dimmer than the last, and all still lit.
@@ -572,9 +623,9 @@ What was tried on this light, judged by eye:
 - Brightness 0 is off, whatever else the frame says. A white frame with brightness 0 and an extra "decimal brightness" byte is dark, and so is a channels frame with brightness 0 and a decimal value of 5.
 - The dimming-curve byte in the white frame is ignored: the exponential and linear curves looked the same at 1% and at 10%.
 
-So the floor is brightness 1 with one channel at level 1, and nothing found goes lower without switching the light off.
+So on the CB200C the floor is brightness 1 with one channel at level 1, and nothing found goes lower without switching the light off.
 
-The light answers some address-tagged queries: device info (`78 9E 07 <address> 00`) and temperature and fan (`78 B3 06 <address>`). It does not answer the power-state query (`78 8E 08 <address> 84 00`) or the old read request `78 84 00`. Its device-info reply names the model CB300C, although it was sold as a CB200C; the two manuals differ only in wattage.
+The CB200C answers some address-tagged queries: device info (`78 9E 07 <address> 00`) and temperature and fan (`78 B3 06 <address>`). It does not answer the power-state query (`78 8E 08 <address> 84 00`) or the old read request `78 84 00`. Its device-info reply names the model CB300C, although it was sold as a CB200C; the two manuals differ only in wattage.
 
 The channels frame and the queries come from the protocol notes in [neewer-sacn](https://github.com/amattas/neewer-sacn).
 
