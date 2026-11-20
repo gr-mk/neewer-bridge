@@ -58,53 +58,49 @@ CHANNELS = ("red", "green", "blue", "cold", "warm")
 #   channels        whether it takes the five-channel frame: `faint`,
 #                   `channels` and the "sky" sunrise below 1% need it.
 #   colour          whether it takes the hue/saturation frame.
-#   hybrid          brightness as light output, on two curves: see HYBRID below.
-#                   Empty: one curve, with output_curve.
-#   output_curve    for a light with no "hybrid": [[setting %, output as a
-#                   share of full], ...], how bright each setting really is.
-#                   Empty: setting % = output %.
+#   tenths          whether its white frame takes a fifth value, the tenths of
+#                   the brightness, so the setting goes 0.0-100.0 in 0.1 steps.
+#                   The AS600B needs it: without the byte it reads the tenths
+#                   as 255, so every brightness arrives 25.5 too high, and one
+#                   that comes out above 100.0 is dropped (its curve byte is
+#                   still applied).
+#   firmware_curves whether the light dims on the firmware's own curves (see
+#                   CURVE_SHARES), honouring the curve byte. Brightness is then
+#                   light output, sent as the setting that gives it.
+#   dial            whether a brightness set by hand (`neewer white`, `neewer
+#                   brightness`, Apple Home) is the light's own setting on its
+#                   curve, the number on its dial, rather than light output.
+#                   On the AS600B it is, so control is fine at the low end:
+#                   exp 20.0 is 1.3% output. The follower, the bedtime fade,
+#                   the morning, a fresh start and the sunrise work in light
+#                   output either way.
+#   switch_pause    seconds between the two frames of a change to the
+#                   exponential curve from another one (see plan_white).
+#   output_curve    for a light without firmware curves: [[setting %, output
+#                   as a share of full], ...], how bright each setting really
+#                   is. Empty: setting % = output %.
 #
-# Brightness, everywhere (the command, the follower, the bedtime fade, the
-# morning, a fresh start, the sunrise, Apple Home), is light output as a
-# percent of full, and may be a fraction. The profile turns it into the
-# setting to send, and on a hybrid light the curve to send it on.
+# Inside, brightness is light output as a percent of full, and may be a
+# fraction. The profile turns it into the setting to send.
 PROFILES = {
     "CB200C": {"kelvin_min": 2500, "kelvin_max": 7500, "curve": "", "channels": True, "colour": True,
-               "hybrid": {}, "output_curve": []},
+               "tenths": False, "firmware_curves": False, "dial": False, "switch_pause": 1.5, "output_curve": []},
     # A 600 W bi-colour COB. Checked on the light, by eye on its display:
-    # power and white frames as on the CB200C; the curve byte is honoured;
-    # the channels frame is ignored; 2500K and 6600K are dropped.
+    # power and white frames as on the CB200C but with the tenths byte; the
+    # curve byte is honoured; the channels frame is ignored; 2500K and 6600K
+    # are dropped. Kept on the exponential curve, which reaches full output.
     "AS600B": {"kelvin_min": 2700, "kelvin_max": 6500, "curve": "exp", "channels": False, "colour": False,
-               "hybrid": {"threshold": 20, "hysteresis": [18, 22], "switch_pause": 1.5,
-                          "exp_table": [[1, 0.0001], [45, 0.05], [55, 0.20]]},
-               "output_curve": []},
+               "tenths": True, "firmware_curves": True, "dial": True, "switch_pause": 1.5, "output_curve": []},
 }
-# HYBRID: the AS600B's exponential curve goes far dimmer than its linear one,
-# but is capped: exp 100 is dimmer than linear 50. So the dim end is sent on
-# the exponential curve and the bright end on the linear one.
-#   threshold     output % at which the light changes curve, when it is on neither
-#   hysteresis    [low, high]: on linear it stays linear down to `low`; on
-#                 exponential it stays there up to `high`. So a slow ramp
-#                 through the threshold changes curve once, not back and forth.
-#   exp_table     [[exp setting, output as a share of full], ...], matched by
-#                 eye against the linear curve (taken as proportional to
-#                 output): exp 45 = linear 5, exp 55 = linear 20. Exp 1 is a
-#                 guess (0.01%): below 45 the output is extrapolated.
-#                 Between points it follows a power of the setting. Past the
-#                 last point nothing is known (only that exp 100 is dimmer than
-#                 linear 50), so the output is held at the last point's, the
-#                 least it can be: a raw exp 100 counts as 20%.
-#   switch_pause  seconds between the two frames of a change to exponential
-#
-# Changing curve: the light shows the new number on its OLD curve at once and
-# changes curve a moment later. Sent carelessly, linear -> exp flashes bright
-# (the exp number shown on the linear curve). So a change always dips, never
-# overshoots:
-#   exp -> linear   the linear frame with the target number, directly: for a
-#                   moment the light shows that number on exp, which is dimmer
-#   linear -> exp   first an exp frame with the CURRENT number (the same light
-#                   on linear, then the curve changes: a dip), a pause, then
-#                   the exp target
+# The firmware's curves (from the AS600C and FS600B firmware): the light output
+# of setting n, 0.0-100.0, as a share of linear 100. Each rises all the way up.
+# On the exponential curve 0.1 gives about 0.003% and 40.0 about 5%.
+CURVE_SHARES = {
+    "linear": lambda n: n / 100.0,
+    "exp": lambda n: n / 100.0 * 1.035 ** (n - 100),
+    "log": lambda n: 0.0005 if abs(n - 0.1) < 1e-9 else 1 - (100 - n) * 0.000320601109 * 1.035 ** (100 - n),
+    "s": lambda n: (1 / (1 + math.exp(5 - n / 10.0)) - 1 / (1 + math.exp(5))) * 1.01356730981261,
+}
 DEFAULT_MODEL = "CB200C"
 
 
@@ -128,8 +124,12 @@ def power_frame(mac, on):
     return tagged(mac, 0x8D, 0x81, [0x01 if on else 0x02])
 
 
-def white_frame(mac, kelvin, brightness, tint=0, curve="linear"):
-    return tagged(mac, 0x90, 0x87, [brightness, kelvin // 100, tint + 50, CURVES[curve]])
+def white_frame(mac, kelvin, brightness, tint=0, curve="linear", tenths=False):
+    """With `tenths`, a fifth value, the brightness's tenths: 40.3 is 28 .. 03."""
+    if tenths:
+        whole, tenth = divmod(int(round(float(brightness) * 10)), 10)
+        return tagged(mac, 0x90, 0x87, [whole, kelvin // 100, tint + 50, CURVES[curve], tenth])
+    return tagged(mac, 0x90, 0x87, [int(brightness), kelvin // 100, tint + 50, CURVES[curve]])
 
 
 def colour_frame(mac, hue, saturation, brightness):
@@ -268,12 +268,14 @@ def light_profile(settings=None):
     model = given.get("model") if given.get("model") in PROFILES else DEFAULT_MODEL
     profile = dict(PROFILES[model], model=str(given.get("model") or model))
     for key, default in PROFILES[DEFAULT_MODEL].items():
-        if key in given and type(given[key]) is type(default):
+        number = isinstance(default, float) and isinstance(given.get(key), (int, float)) and not isinstance(
+            given.get(key), bool)
+        if key in given and (type(given[key]) is type(default) or number):
             if key == "curve" and given[key] not in CURVES and given[key] != "":
                 continue  # not a curve: the model's own stands
             profile[key] = given[key]
     profile["output_curve"] = rising_points(profile["output_curve"])
-    profile["hybrid"] = hybrid_settings(profile["hybrid"])
+    profile["switch_pause"] = float(max(0, min(10, profile["switch_pause"])))
     low = int(round(max(1000, min(10000, profile["kelvin_min"])) / 100.0)) * 100
     high = int(round(max(1000, min(10000, profile["kelvin_max"])) / 100.0)) * 100
     profile["kelvin_min"], profile["kelvin_max"] = min(low, high), max(low, high)
@@ -301,88 +303,67 @@ def rising_points(given):
     return points if len(points) >= 2 and good else []
 
 
-def hybrid_settings(given):
-    """The "hybrid" settings, checked, or {} for a light on one curve."""
-    if not isinstance(given, dict) or not given:
-        return {}
-    table = rising_points(given.get("exp_table"))
-    if not table:
-        return {}
-
-    def number(key, default, low, high):
-        value = given.get(key, default)
-        ok = isinstance(value, (int, float)) and not isinstance(value, bool)
-        return float(max(low, min(high, value))) if ok else float(default)
-    threshold = number("threshold", 20, 1, 100)
-    band = given.get("hysteresis")
-    try:
-        low, high = sorted(float(value) for value in band)
-    except (TypeError, ValueError):
-        low, high = threshold, threshold
-    return {"threshold": threshold, "hysteresis": (min(low, threshold), max(high, threshold)),
-            "switch_pause": number("switch_pause", 1.5, 0, 10), "exp_table": table}
+def setting_scale(profile):
+    """Settings per percent: 10 on a light that takes tenths, else 1."""
+    return 10 if profile["tenths"] else 1
 
 
-def power_law(points, setting):
-    """Output share at a setting, from (setting, share) points: a power of the setting between
-    points, the end segments' power beyond them."""
-    setting = max(0.5, float(setting))
-    for s0, f0 in points:
-        if setting == s0:
-            return min(1.0, f0)
-    for (s0, f0), (s1, f1) in zip(points, points[1:]):
-        if setting <= s1 or (s1, f1) == points[-1]:
-            power = (math.log(f1) - math.log(f0)) / (math.log(s1) - math.log(s0))
-            return min(1.0, f0 * (setting / s0) ** power)
-    return points[-1][1]
+def as_setting(profile, value):
+    """A brightness setting as this light takes it: 40.3 with tenths, else a whole number."""
+    return round(float(value), 1) if profile["tenths"] else int(round(float(value)))
 
 
 def curve_output(profile, curve, number):
     """How much light a setting gives on a curve, as a share of full."""
-    hybrid = profile["hybrid"]
     if number <= 0:
         return 0.0
-    if hybrid and curve == "exp":
-        # Past the table's last point nothing is measured (on the AS600B, only
-        # that exp 100 is dimmer than linear 50), so the output is held at the
-        # last point's: the least it can be. Leaving such a setting then dims.
-        table = hybrid["exp_table"]
-        return power_law(table, min(number, table[-1][0]))
-    if hybrid:
-        return max(0, min(100, number)) / 100.0
+    if profile["firmware_curves"]:
+        return CURVE_SHARES[curve if curve in CURVE_SHARES else "linear"](min(100.0, float(number)))
     return setting_output(profile, number)
 
 
 def pick_curve(profile, output, curve_now):
-    """The curve to show an output % on, from the curve the light is on now (hysteresis)."""
-    hybrid = profile["hybrid"]
-    if not hybrid:
-        return profile["curve"] or "linear"
-    low, high = hybrid["hysteresis"]
-    if curve_now == "linear":
-        return "linear" if output >= low else "exp"
-    if curve_now == "exp":
-        return "exp" if output < high else "linear"
-    return "linear" if output >= hybrid["threshold"] else "exp"
+    """The curve to show an output % on: the profile's."""
+    return profile["curve"] or "linear"
 
 
 def curve_number(profile, curve, output):
-    """The whole-number setting, 0-100, that gives an output % on a curve."""
+    """The setting, 0-100 (in tenths on a light that takes them), that gives an output % on a curve."""
     if output <= 0:
         return 0
-    if profile["hybrid"] and curve == "exp":
-        share = output / 100.0
-        return min(range(1, 101), key=lambda n: abs(math.log(curve_output(profile, "exp", n) / share)))
-    if profile["hybrid"]:
-        return max(1, min(100, int(round(output))))
-    return output_setting(profile, output / 100.0)
+    if not profile["firmware_curves"]:
+        return output_setting(profile, output / 100.0)
+    share = min(1.0, output / 100.0)
+    rises = CURVE_SHARES[curve if curve in CURVE_SHARES else "linear"]
+    low, high = 0.0, 100.0
+    for _ in range(60):  # the exact setting, then the nearest one the light takes
+        middle = (low + high) / 2
+        low, high = (middle, high) if rises(middle) < share else (low, middle)
+    scale = setting_scale(profile)
+    below = max(1, min(100 * scale, int(math.floor(high * scale))))
+    nearest = min({below, min(100 * scale, below + 1)}, key=lambda units: abs(math.log(rises(units / float(scale)) / share)))
+    return as_setting(profile, nearest / float(scale))
 
 
 def lowest_output(profile):
     """The least light the white frame can give, as a percent of full."""
-    if profile["hybrid"]:
-        return 100.0 * curve_output(profile, "exp", 1)
+    if profile["firmware_curves"]:
+        return 100.0 * curve_output(profile, profile["curve"] or "linear", 1.0 / setting_scale(profile))
     return 100.0 * setting_output(profile, 1)
+
+
+def dial_output(profile, setting):
+    """The light output %, on the profile's curve, of a setting as on the light's dial."""
+    return 100.0 * curve_output(profile, profile["curve"] or "linear", setting)
+
+
+def dial_setting(profile, output):
+    """The setting, as on the light's dial (its own curve), that gives an output %."""
+    return curve_number(profile, profile["curve"] or "linear", output)
+
+
+def lit_setting(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
 
 
 def shown_of(state):
@@ -402,7 +383,7 @@ def output_of(profile, state):
     if isinstance(output, (int, float)) and not isinstance(output, bool):
         return float(output)
     curve = state.get("curve") if state.get("curve") in CURVES else "linear"
-    return 100.0 * curve_output(profile, curve, int(state.get("brightness", 0) or 0))
+    return 100.0 * curve_output(profile, curve, float(state.get("brightness", 0) or 0))
 
 
 def plan_white(profile, state, kelvin_value, output, tint=0):
@@ -411,8 +392,15 @@ def plan_white(profile, state, kelvin_value, output, tint=0):
     Returns (steps, look). `steps` are the frames to send, as (kelvin,
     number, tint, curve, seconds to wait after). `look` is what to record:
     mode, kelvin, brightness (the number), tint, curve, output, and shown,
-    the last frame. See HYBRID for why a change to the exponential curve
-    takes two frames.
+    the last frame.
+
+    A light with firmware curves shows a new number on its OLD curve at once
+    and changes curve a moment later. The exponential curve is the dimmest,
+    so going to it from another curve (after a raw --curve send) or from a
+    curve not known would flash: the exp number shown on, say, linear. So it
+    dips instead: first an exp frame with the number the light shows now (or
+    the lowest setting, if that is not known), which is the same light on the
+    old curve and then dims as the curve changes; a pause; then the target.
     """
     kelvin_value = fit_kelvin(profile, kelvin_value)
     output = max(0.0, min(100.0, float(output)))
@@ -420,23 +408,28 @@ def plan_white(profile, state, kelvin_value, output, tint=0):
     curve = pick_curve(profile, output, shown["curve"]) if output > 0 else (
         shown["curve"] or profile["curve"] or "linear")
     number = curve_number(profile, curve, output)
-    lit = lambda c, n: c in CURVES and isinstance(n, int) and n > 0
-    keep = ((shown["curve"], shown["brightness"]) if lit(shown["curve"], shown["brightness"]) else
-            (state.get("curve"), state.get("brightness")))      # not known (after the fade): the record's
-    if profile["hybrid"] and output > 0 and lit(*keep) and abs(100.0 * curve_output(profile, *keep) - output) < 1e-6:
-        # The light already gives this output (a change of colour only, or the
-        # setting from before the fade): keep its number and curve, which
-        # matters for a setting sent raw with --curve.
-        curve, number = keep
     steps = []
-    if profile["hybrid"] and curve == "exp" and shown["curve"] != "exp" and number > 0:
-        current = shown["brightness"] if isinstance(shown["brightness"], int) and shown["brightness"] > 0 else 1
-        steps.append((fit_kelvin(profile, shown["kelvin"] or kelvin_value), current, tint, "exp",
-                      profile["hybrid"]["switch_pause"]))
+    if profile["firmware_curves"] and curve == "exp" and shown["curve"] != "exp" and number > 0:
+        current = shown["brightness"] if lit_setting(shown["brightness"]) else 1.0 / setting_scale(profile)
+        steps.append((fit_kelvin(profile, shown["kelvin"] or kelvin_value), as_setting(profile, current), tint, "exp",
+                      profile["switch_pause"]))
     steps.append((kelvin_value, number, tint, curve, 0.0))
     look = {"mode": "white", "kelvin": kelvin_value, "brightness": number, "tint": tint, "curve": curve,
             "output": round(output, 4), "shown": {"curve": curve, "brightness": number, "kelvin": kelvin_value}}
     return steps, look
+
+
+def setting_text(number):
+    """A setting as sent: 40.0 with tenths, 40 without."""
+    return "%.1f" % number if isinstance(number, float) else "%d" % number
+
+
+def white_text(kelvin_value, output, curve, number):
+    """White in words: "white 2700K at exp 20.0 (1.3% output)", or "white 5600K at 10%" where
+    the setting is the output on the linear curve."""
+    if curve == "linear" and abs(output - number) < 1e-6 and not isinstance(number, float):
+        return "white %dK at %s" % (kelvin_value, percent_text(output))
+    return "white %dK at %s %s (%s output)" % (kelvin_value, curve, setting_text(number), percent_text(output))
 
 
 def percent_text(value):
@@ -505,11 +498,12 @@ def nearest_white(profile, hue, saturation):
 def describe_profile(profile):
     can = [name for name, flag in (("colour", profile["colour"]), ("faint/channels", profile["channels"])) if flag]
     also = ", also " + " and ".join(can) if can else ", white only"
-    hybrid = profile["hybrid"]
-    if hybrid:
-        return "%s: %d-%dK%s; exponential curve below %s output, linear above (changing at %s going down, %s going up)" % (
-            profile["model"], profile["kelvin_min"], profile["kelvin_max"], also, percent_text(hybrid["threshold"]),
-            percent_text(hybrid["hysteresis"][0]), percent_text(hybrid["hysteresis"][1]))
+    if profile["firmware_curves"]:
+        return "%s: %d-%dK, %s curve (the firmware's)%s; settings in %s steps, lowest %s output; %s" % (
+            profile["model"], profile["kelvin_min"], profile["kelvin_max"], profile["curve"] or "linear", also,
+            "0.1" if profile["tenths"] else "1", percent_text(lowest_output(profile)),
+            "a brightness set by hand is the setting, as on its dial" if profile["dial"] else
+            "a brightness set by hand is light output")
     linear = all(abs(setting_output(profile, s) - s / 100.0) < 1e-9 for s in range(1, 101))
     return "%s: %d-%dK, %s curve%s; %s" % (
         profile["model"], profile["kelvin_min"], profile["kelvin_max"], profile["curve"] or "chosen per command", also,
@@ -541,6 +535,16 @@ def whole_setting(value):
         raise Failure("%g is not a whole number: a brightness sent as a setting goes in 1%% steps, and 1 is the"
                       " lowest lit level" % value)
     return int(value)
+
+
+def raw_setting(profile, value):
+    """A white brightness sent as a raw setting (--curve): one decimal on a light that takes tenths."""
+    if not profile["tenths"]:
+        return whole_setting(value)
+    if abs(value * 10 - round(value * 10)) > 1e-6:
+        raise Failure("%g has more than one decimal: this light's setting goes in 0.1 steps, and 0.1 is the"
+                      " lowest lit level" % value)
+    return round(value, 1)
 
 
 def output_percent(text):
@@ -594,19 +598,20 @@ def rgb_hex(text):
 # ---------------------------------------------------------------- commands
 
 def describe(state, profile=None):
-    """A setting in words. Given a hybrid light's profile, a setting recorded without
-    its output (sent before outputs were kept) is shown as output too."""
+    """A setting in words. Given the profile of a light with firmware curves, a setting
+    recorded without its output (sent before outputs were kept) is shown as output too."""
     if not state:
         return "nothing sent yet"
     power = "on" if state.get("on") else "off" if state.get("on") is False else "power unknown"
     if state.get("mode") == "white":
         output, number = state.get("output"), state.get("brightness", 0)
-        if output is None and profile and profile["hybrid"]:
+        if output is None and profile and profile["firmware_curves"]:
             output = output_of(profile, state)
         curve = state.get("curve", "linear")
-        if isinstance(output, (int, float)) and (curve != "linear" or abs(output - number) > 1e-6):
-            # A hybrid light: output, and the number and curve that give it.
-            detail = "white %dK at %s (%s %d)" % (state.get("kelvin", 0), percent_text(output), curve, number)
+        if isinstance(output, (int, float)) and (curve != "linear" or abs(output - number) > 1e-6
+                                                 or isinstance(number, float)):
+            # The setting and its curve, and the light output they give.
+            detail = white_text(state.get("kelvin", 0), output, curve, number)
         else:
             detail = "white %dK at %d%%" % (state.get("kelvin", 0), number)
             if curve != "linear":
@@ -662,16 +667,19 @@ class Light:
         self.say("on" if on else "off")
 
     def white_frame(self, kelvin_value, brightness, tint=0, curve="linear"):
-        """A white frame as this light takes it: inside its range, and on a one-curve light with its curve."""
-        curve = curve if self.profile["hybrid"] else self.profile["curve"] or curve
-        return white_frame(self.mac, fit_kelvin(self.profile, kelvin_value), brightness, tint, curve)
+        """A white frame as this light takes it: inside its range, with its tenths, and on a light
+        without firmware curves with its curve."""
+        curve = curve if self.profile["firmware_curves"] else self.profile["curve"] or curve
+        return white_frame(self.mac, fit_kelvin(self.profile, kelvin_value), as_setting(self.profile, brightness),
+                           tint, curve, self.profile["tenths"])
 
     def white(self, kelvin_value, brightness, tint, curve, no_power=False):
         """White with the setting number as given, on a curve: the raw way."""
         self.wake_if_needed(no_power)
         kelvin_value = fit_kelvin(self.profile, kelvin_value)
-        curve = curve if self.profile["hybrid"] else self.profile["curve"] or curve
-        self.bridge.send(white_frame(self.mac, kelvin_value, brightness, tint, curve))
+        curve = curve if self.profile["firmware_curves"] else self.profile["curve"] or curve
+        brightness = as_setting(self.profile, brightness)
+        self.bridge.send(white_frame(self.mac, kelvin_value, brightness, tint, curve, self.profile["tenths"]))
         self.remember(mode="white", kelvin=kelvin_value, brightness=brightness, tint=tint, curve=curve,
                       output=round(100.0 * curve_output(self.profile, curve, brightness), 4),
                       shown={"curve": curve, "brightness": brightness, "kelvin": kelvin_value})
@@ -680,9 +688,9 @@ class Light:
     def show_white(self, kelvin_value, output, tint=0, no_power=False, only_if_changed=False):
         """White at a light output, as a percent of full. Returns True if anything was sent.
 
-        On a hybrid light this picks the curve and number, and changes curve
-        without a flash (see HYBRID). `only_if_changed` skips the send when
-        the light would show just what it shows now.
+        This picks the number, and changes curve without a flash (see
+        plan_white). `only_if_changed` skips the send when the light would
+        show just what it shows now.
         """
         steps, look = plan_white(self.profile, self.state, kelvin_value, output, tint)
         if (only_if_changed and self.state.get("on") is True and self.state.get("mode") == "white"
@@ -690,7 +698,7 @@ class Light:
             return False
         self.wake_if_needed(no_power)
         for kelvin_now, number, tint_now, curve, wait in steps:
-            self.bridge.send(white_frame(self.mac, kelvin_now, number, tint_now, curve))
+            self.bridge.send(white_frame(self.mac, kelvin_now, number, tint_now, curve, self.profile["tenths"]))
             if wait:
                 pause(wait)
         self.remember(**look)
@@ -730,19 +738,28 @@ def cmd_off(light, args):
     light.power(False)
 
 
+def hand_output(profile, brightness, as_output=False):
+    """The light output % of a brightness given by hand: on a light with a dial
+    (the AS600B), the setting on its curve unless `as_output`."""
+    if profile["dial"] and not as_output:
+        return dial_output(profile, raw_setting(profile, brightness))
+    return float(brightness)
+
+
 def cmd_white(light, args):
     profile = light.profile
     if not profile["kelvin_min"] <= args.kelvin <= profile["kelvin_max"]:
         raise Failure("this light (%s) shows %d-%dK" % (profile["model"], profile["kelvin_min"], profile["kelvin_max"]))
     tint = light.state.get("tint", 0) if args.tint is None else args.tint
-    if profile["hybrid"]:
+    if profile["firmware_curves"]:
         if args.curve:
             # The raw way: the number as given, on the curve asked for, with no
             # care taken over the change of curve. For comparisons by eye.
-            number = light.state.get("brightness", 10) if args.brightness is None else whole_setting(args.brightness)
+            number = light.state.get("brightness", 10) if args.brightness is None else raw_setting(
+                profile, args.brightness)
             light.white(args.kelvin, number, tint, args.curve, args.no_power)
             return
-        output = light.output() if args.brightness is None else args.brightness
+        output = light.output() if args.brightness is None else hand_output(profile, args.brightness, args.output)
         light.show_white(args.kelvin, output, tint, args.no_power)
         return
     brightness = light.last_brightness() if args.brightness is None else whole_setting(args.brightness)
@@ -804,8 +821,9 @@ def cmd_brightness(light, args):
         light.colour(state.get("hue", 0), state.get("saturation", 100), whole_setting(args.brightness), args.no_power)
     elif state.get("mode") == "channels" and light.profile["channels"]:
         light.channels(whole_setting(args.brightness), {name: state.get(name, 0) for name in CHANNELS}, args.no_power)
-    elif light.profile["hybrid"]:
-        light.show_white(state.get("kelvin", 5600), args.brightness, state.get("tint", 0), args.no_power)
+    elif light.profile["firmware_curves"]:
+        light.show_white(state.get("kelvin", 5600), hand_output(light.profile, args.brightness, args.output),
+                         state.get("tint", 0), args.no_power)
     else:
         light.white(
             state.get("kelvin", 5600), whole_setting(args.brightness), state.get("tint", 0),
@@ -998,10 +1016,10 @@ def cmd_sunrise(light, args):
                 steps, look = plan_white(light.profile, state, setting[1], setting[2])
                 if look["shown"] == shown_of(state) and last is not None:
                     continue
-                if light.profile["hybrid"]:
-                    text += " (%s %d)" % (look["curve"], look["brightness"])
+                if light.profile["firmware_curves"]:
+                    text = white_text(setting[1], setting[2], look["curve"], look["brightness"])
                 if len(steps) > 1:
-                    text += ", changing to exponential: exp %d first, then %gs" % (steps[0][1], steps[0][4])
+                    text += ", changing to exponential: exp %s first, then %gs" % (setting_text(steps[0][1]), steps[0][4])
                 state.update(look)
             elif setting == last:
                 continue
@@ -1127,7 +1145,7 @@ SUNDIAL_CONFIG_FILE = os.path.expanduser("~/.config/sundial/config.ini")
 # Bedtime is acted on only this soon after it. Later than that (the Mac was
 # asleep, or the rule was only just installed) the night is left alone.
 BEDTIME_GRACE_SECONDS = 15 * 60
-FADE_STEP_SECONDS = 2.0
+FADE_STEP_SECONDS = 1.0
 pause = time.sleep  # the fade waits with this; the tests replace it
 # The colour moves from sundial's colour to the night colour while the sun goes
 # from the horizon down to the end of civil twilight.
@@ -1150,9 +1168,15 @@ def follow_settings():
             settings[key] = value
     settings["fade_minutes"] = max(0, settings["fade_minutes"])
     settings["morning_lead_minutes"] = max(0, settings["morning_lead_minutes"])
-    settings["night_brightness"] = int(max(1, min(100, settings["night_brightness"])))
-    settings["day_brightness"] = int(max(settings["night_brightness"], min(100, settings["day_brightness"])))
-    settings["night_kelvin"] = fit_kelvin(light_profile(), settings["night_kelvin"])
+    # Light output %. On the CB200C the lowest is 1; on the AS600B a fraction (exp 20.0 is 1.28%).
+    profile = light_profile()
+    floor = lowest_output(profile) if profile["firmware_curves"] else 1
+    settings["night_brightness"] = max(floor, min(100, settings["night_brightness"]))
+    settings["day_brightness"] = max(settings["night_brightness"], min(100, settings["day_brightness"]))
+    if not profile["firmware_curves"]:
+        settings["night_brightness"] = int(round(settings["night_brightness"]))
+        settings["day_brightness"] = int(round(settings["day_brightness"]))
+    settings["night_kelvin"] = fit_kelvin(profile, settings["night_kelvin"])
     settings["hold_minutes"] = max(0, settings["hold_minutes"])
     return settings
 
@@ -1174,8 +1198,9 @@ def follow_target(sun, settings):
     the light can show.
     """
     profile = light_profile()
-    # A one-curve light takes whole percents only; a hybrid one finer steps.
-    brightness = round(follow_output(sun, settings), 2) if profile["hybrid"] else int(round(follow_output(sun, settings)))
+    # A light without firmware curves takes whole percents only; one with them, finer steps.
+    brightness = round(follow_output(sun, settings), 2) if profile["firmware_curves"] else int(
+        round(follow_output(sun, settings)))
     night = (NIGHT_COLOUR_FROM - float(sun["sun_elevation"])) / (NIGHT_COLOUR_FROM - NIGHT_COLOUR_BY)
     night = max(0.0, min(1.0, night))
     colour = float(sun["kelvin"]) + (settings["night_kelvin"] - float(sun["kelvin"])) * night
@@ -1592,8 +1617,8 @@ def fade_out(light, memory, seconds, now):
         if state_stamp() != stamp:
             return False, now + elapsed
         # Each step is the same share dimmer than the last, in light output,
-        # which looks even. On a hybrid light it changes to the exponential
-        # curve on the way down, with a dip (see HYBRID).
+        # which looks even: from 5% over five minutes, 2.4% a second, which
+        # on the exponential curve is a few tenths of the setting a step.
         level = top * (float(low) / top) ** min(1.0, elapsed / seconds)
         if colour:
             level = max(1, int(round(level)))
@@ -1615,16 +1640,18 @@ def fade_out(light, memory, seconds, now):
                 frame = colour_frame(light.mac, before.get("hue", 0), before.get("saturation", 100), top)
             elif before["mode"] == "colour":
                 frame = light.white_frame(nearest_white(light.profile, before.get("hue", 0), before.get("saturation", 100)),
-                                          int(before.get("brightness", 1)))
+                                          before.get("brightness", 1))
             else:
-                frame = light.white_frame(before.get("kelvin", 5600), int(before.get("brightness", 1)),
+                frame = light.white_frame(before.get("kelvin", 5600), before.get("brightness", 1),
                                           before.get("tint", 0), before.get("curve", "linear"))
             light.bridge.send(frame)
         except Failure:
             pass
-        # Whether a light in standby keeps a frame is not known, so which
-        # curve it is on now is not known either.
-        light.state["shown"] = {"curve": None, "brightness": None, "kelvin": None}
+        # Whether a light in standby keeps a frame is not known, so what it
+        # shows is not known. Its curve is, if the fade and that frame share it.
+        last = shown_of(light.state)["curve"]
+        kept = before.get("curve") if before.get("mode") == "white" else light.profile["curve"]
+        light.state["shown"] = {"curve": last if last == kept else None, "brightness": None, "kelvin": None}
     shown_now = light.state.get("shown") or shown_of(light.state)
     light.state = dict(before, on=False, shown=shown_now)
     write_json(STATE_FILE, light.state)
@@ -1817,9 +1844,9 @@ def cmd_follow(light, args):
         print("following is on" + (": " + line if line else ""))
         return
     settings = follow_settings()
-    print("Following: %s (day %d%%, night %d%% at %dK, hold %g min)" % (
-        "on" if settings["enabled"] else "off", settings["day_brightness"],
-        settings["night_brightness"], settings["night_kelvin"], settings["hold_minutes"]))
+    print("Following: %s (day %s, night %s at %dK, light output; hold %g min)" % (
+        "on" if settings["enabled"] else "off", percent_text(settings["day_brightness"]),
+        percent_text(settings["night_brightness"]), settings["night_kelvin"], settings["hold_minutes"]))
     now = time.time()
     try:
         sun = sundial_target(now)
@@ -1827,9 +1854,9 @@ def cmd_follow(light, args):
             float(sun["sun_elevation"]), round(float(sun["daylight"]) * 100)))
         kelvin_now, output = follow_target(sun, settings)
         text = "white %dK at %s" % (kelvin_now, percent_text(output))
-        if light.profile["hybrid"]:
+        if light.profile["firmware_curves"]:
             look = plan_white(light.profile, light.state, kelvin_now, output)[1]
-            text += " (%s %d)" % (look["curve"], look["brightness"])
+            text = white_text(kelvin_now, output, look["curve"], look["brightness"])
         print("Target:    %s" % text)
     except Failure as failure:
         print("Sun:       unknown (%s)" % failure)
@@ -1932,12 +1959,16 @@ def cmd_selftest(light, args):
 
     The first three are captures from other lights. The channels frame is the
     one confirmed by eye on this light, with the address swapped for a placeholder.
+    The AS600B's white frame, with the tenths byte, made its display read exactly
+    exp 40.0 at 3000K.
     """
     cases = [
         ("channels", channels_frame(parse_mac("AA:BB:CC:DD:EE:FF"), 1, warm=20), "78a90eaabbccddeeffa8010000000014" + "00" + "e7"),
         ("power on", power_frame(parse_mac("F7:AC:16:F1:58:96"), True), "788d08f7ac16f158968101" + "27"),
         ("white", white_frame(parse_mac("DF:24:3A:B4:46:5D"), 6500, 29, 50, "linear"), "78900bdf243ab4465d871d416404" + "f4"),
         ("colour", colour_frame(parse_mac("F7:AC:16:F1:58:96"), 69, 92, 50), "788f0cf7ac16f1589686" + "45005c3200" + "04"),
+        ("AS600B", white_frame(parse_mac("F0:6F:33:D3:09:34"), 3000, 40.0, 0, "exp", tenths=True),
+         "78900cf06f33d3093487281e320100b6"),
     ]
     failed = 0
     for name, frame, expected in cases:
@@ -1951,8 +1982,8 @@ def cmd_selftest(light, args):
     as600b = light_profile({"profile": {"model": "AS600B"}})
     mac = parse_mac("AA:BB:CC:DD:EE:FF")
     for name, wanted, expected in (("AS600B hi", 6600, 65), ("AS600B lo", 2500, 27)):
-        frame = white_frame(mac, fit_kelvin(as600b, wanted), 5, 0, as600b["curve"])
-        ok = frame[11] == expected and frame[13] == 0x01
+        frame = white_frame(mac, fit_kelvin(as600b, wanted), 5.0, 0, as600b["curve"], as600b["tenths"])
+        ok = frame[11] == expected and frame[13] == 0x01 and frame[2] == 0x0C
         failed += 0 if ok else 1
         print("%-9s %s  %s" % (name, "ok  " if ok else "FAIL", to_hex(frame)))
     if failed:
@@ -1983,10 +2014,13 @@ def build_parser():
     white = add("white", cmd_white, "white light: neewer white 5600 10", aliases=["cct"])
     white.add_argument("kelvin", type=kelvin, help="colour temperature, within what the light shows (neewer status)")
     white.add_argument("brightness", type=output_percent, nargs="?",
-                       help="light output 0-100, fractions allowed (default: last used)")
+                       help="0-100 (default: last used): on the AS600B its setting, as on its dial, to one decimal;"
+                            " on the CB200C a whole percent")
     white.add_argument("--tint", type=bounded(-50, 50, "tint"), help="green/magenta, -50 to 50")
     white.add_argument("--curve", choices=sorted(CURVES),
                        help="send the brightness as a raw setting on this curve, with no mapping")
+    white.add_argument("--output", action="store_true",
+                       help="the brightness is light output, a percent of full, fractions allowed")
     add_no_power(white)
 
     colour = add("colour", cmd_colour, "colour by hue: neewer colour 240 100 10", aliases=["color", "hsi"])
@@ -2029,7 +2063,11 @@ def build_parser():
                         help="on, off, status (default), or apply: set the light once, as the minute timer does")
 
     brightness = add("brightness", cmd_brightness, "change brightness, keep the colour", aliases=["dim"])
-    brightness.add_argument("brightness", type=output_percent, help="light output 0-100, fractions allowed")
+    brightness.add_argument("brightness", type=output_percent,
+                            help="0-100: on the AS600B its setting, as on its dial, to one decimal; on the CB200C"
+                                 " a whole percent")
+    brightness.add_argument("--output", action="store_true",
+                            help="the brightness is light output, a percent of full, fractions allowed")
     add_no_power(brightness)
 
     status = add("status", cmd_status, "show the bridge, the link and the last setting")

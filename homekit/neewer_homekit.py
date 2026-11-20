@@ -143,9 +143,11 @@ class LightLink:
             "on": bool(state.get("on")),
             "mode": mode if mode in ("white", "colour") else "white",
             "kelvin": cli.fit_kelvin(profile, state.get("kelvin", 5600)),
-            "brightness": int(state.get("brightness", 10)),
+            # The setting as last sent: in tenths on a light that takes them.
+            "brightness": (cli.as_setting(profile, state.get("brightness", 10)) if mode == "white" else
+                           int(state.get("brightness", 10))),
             "tint": int(state.get("tint", 0)),
-            "curve": curve if profile["hybrid"] else profile["curve"] or curve,
+            "curve": curve if profile["firmware_curves"] else profile["curve"] or curve,
             "hue": int(state.get("hue", 0)),
             "saturation": int(state.get("saturation", 100)),
             # Light output as a percent of full, and what the light was last sent.
@@ -157,11 +159,15 @@ class LightLink:
         return normal
 
     def home_brightness(self, state):
-        """Home's brightness for a state: light output, a whole number, at least 1 while lit."""
+        """Home's brightness for a state, a whole number, at least 1 while lit: on a light with a dial
+        (the AS600B) its setting on its own curve, as on the dial; on others light output."""
         if state["mode"] == "colour" and self.profile["colour"]:
             return state["brightness"]
         output = state["output"]
-        return max(1, int(round(output))) if output > 0 else 0
+        if output <= 0:
+            return 0
+        level = cli.dial_setting(self.profile, output) if self.profile["dial"] else output
+        return max(1, int(round(level)))
 
     @staticmethod
     def stamp():
@@ -212,11 +218,13 @@ class LightLink:
                     wanted["mode"] = "white"
                     wanted["kelvin"] = cli.nearest_white(self.profile, wanted["hue"], wanted["saturation"])
             if "Brightness" in values:
-                # Light output. Home also writes back the number it was shown;
-                # that is not a change, and must not round a fraction away.
+                # The dial setting on the AS600B (Home 20 is exp 20.0, 1.3% output),
+                # light output on others. Home also writes back the number it was
+                # shown; that is not a change, and must not round a fraction away.
                 level = max(0, min(100, int(values["Brightness"])))
                 if level != self.home_brightness(wanted):
-                    wanted["output"] = float(level)
+                    dial = self.profile["dial"] and wanted["mode"] == "white"
+                    wanted["output"] = cli.dial_output(self.profile, level) if dial else float(level)
                     if wanted["mode"] == "colour":
                         wanted["brightness"] = level
             if "On" in values:
@@ -232,13 +240,13 @@ class LightLink:
 
     def frames(self, state):
         """The frames to show a state, from what the light was last sent: [(frame, seconds to wait after)],
-        and the look to record. On a hybrid light a change of curve can take two frames (see cli.HYBRID)."""
+        and the look to record. A change to the exponential curve can take two frames (see cli.plan_white)."""
         if state["mode"] == "colour" and self.profile["colour"]:
             return [(cli.colour_frame(self.mac, state["hue"], state["saturation"], state["brightness"]), 0.0)], {}
         kelvin = state["kelvin"] if state["mode"] == "white" else cli.nearest_white(
             self.profile, state["hue"], state["saturation"])
         steps, look = cli.plan_white(self.profile, state, kelvin, state["output"], state["tint"])
-        return [(cli.white_frame(self.mac, k, number, tint, curve), wait)
+        return [(cli.white_frame(self.mac, k, number, tint, curve, self.profile["tenths"]), wait)
                 for k, number, tint, curve, wait in steps], look
 
     def mode_frame(self, state):
@@ -248,7 +256,8 @@ class LightLink:
         shown = state["shown"]
         if None in (shown["curve"], shown["brightness"], shown["kelvin"]):
             return None
-        return cli.white_frame(self.mac, shown["kelvin"], shown["brightness"], state["tint"], shown["curve"])
+        return cli.white_frame(self.mac, shown["kelvin"], cli.as_setting(self.profile, shown["brightness"]),
+                               state["tint"], shown["curve"], self.profile["tenths"])
 
     def run(self):
         while True:

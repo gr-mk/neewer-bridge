@@ -843,8 +843,13 @@ AS600B = {"model": "AS600B"}
 EXP, LINEAR = "01", "04"
 
 
+def exp_output(n):
+    """The exponential curve from the firmware, in percent: worked out here, not taken from the code."""
+    return n * 1.035 ** (n - 100)
+
+
 class AS600BScaffold(Scaffold):
-    """The AS600B: white only, 2700-6500K, no channels frame, two curves."""
+    """The AS600B: white only, 2700-6500K, no channels frame, the firmware's curves, brightness in tenths."""
 
     def setUp(self):
         super().setUp()
@@ -864,14 +869,34 @@ class AS600BScaffold(Scaffold):
         args = cli.build_parser().parse_args(["--quiet"] + list(words))
         args.function(cli.Light(args), args)
 
-    def frame(self, kelvin, number, curve):
-        return cli.to_hex(cli.white_frame(cli.parse_mac(MAC), kelvin, number, 0, curve))
-
     @staticmethod
     def frames_of(sent):
-        """The white frames sent, as (number, curve), in order."""
+        """The white frames sent, as (number, curve), in order: 39.7 from a frame with the tenths byte."""
         curves = {EXP: "exp", LINEAR: "linear"}
-        return [(int(frame[20:22], 16), curves.get(frame[26:28], frame[26:28])) for frame in sent if frame[2:4] == "90"]
+        found = []
+        for frame in sent:
+            if frame[2:4] != "90":
+                continue
+            number = int(frame[20:22], 16)
+            if frame[4:6] == "0c":
+                number = round(number + int(frame[28:30], 16) / 10.0, 1)
+            found.append((number, curves.get(frame[26:28], frame[26:28])))
+        return found
+
+    def assert_all_tenths(self, sent):
+        white = [frame for frame in sent if frame[2:4] == "90"]
+        self.assertTrue(white)
+        self.assertEqual({(frame[4:6], len(frame)) for frame in white}, {("0c", 32)})
+
+    def fade(self):
+        with open(cli.SUNDIAL_CONFIG_FILE, "w") as handle:
+            handle.write("[sleep]\nwake = 07:00\nbedtime = 23:00\n")
+        cli.write_json(cli.FOLLOW_MEMORY_FILE, {"stamp": cli.state_stamp(), "sent": cli.follow_look(self.state())})
+        light = cli.Light(argparse.Namespace(bridge=None, mac=None, quiet=True))
+        finished, _ = cli.fade_out(light, cli.read_json(cli.FOLLOW_MEMORY_FILE, {}), 300.0, self.now)
+        self.assertTrue(finished)
+        off = FakeBridge.sent.index(cli.to_hex(cli.power_frame(cli.parse_mac(MAC), False)))
+        return self.frames_of(FakeBridge.sent[:off]), self.frames_of(FakeBridge.sent[off:])
 
 
 class AS600BTest(AS600BScaffold):
@@ -879,120 +904,166 @@ class AS600BTest(AS600BScaffold):
         profile = cli.light_profile()
         self.assertEqual((profile["model"], profile["kelvin_min"], profile["kelvin_max"]), ("AS600B", 2700, 6500))
         self.assertFalse(profile["channels"] or profile["colour"])
-        hybrid = profile["hybrid"]
-        self.assertEqual((hybrid["threshold"], hybrid["hysteresis"], hybrid["switch_pause"]), (20, (18, 22), 1.5))
-        self.assertEqual(hybrid["exp_table"], [(1, 0.0001), (45, 0.05), (55, 0.2)])
-        self.assertIn("exponential curve below 20% output, linear above", cli.describe_profile(profile))
-        cli.write_json(cli.LIGHT_FILE, {"mac": MAC, "profile": dict(AS600B, hybrid={"exp_table": [[1, 0.5], [9, 0.1]]})})
-        self.assertEqual(cli.light_profile()["hybrid"], {})   # a table that does not rise: one curve after all
+        self.assertEqual((profile["curve"], profile["tenths"], profile["firmware_curves"], profile["dial"],
+                          profile["switch_pause"]), ("exp", True, True, True, 1.5))
+        self.assertIn("exp curve", cli.describe_profile(profile))
+        self.assertIn("in 0.1 steps, lowest 0.003% output", cli.describe_profile(profile))
+        self.assertIn("set by hand is the setting, as on its dial", cli.describe_profile(profile))
+        # The live light.json of before, with the hybrid in it: the hybrid is no more, and is ignored.
+        cli.write_json(cli.LIGHT_FILE, {"mac": MAC, "profile": dict(AS600B, curve="exp", switch_pause=2, hybrid={
+            "threshold": 20, "exp_table": [[1, 0.0001], [45, 0.05], [55, 0.2]]})})
+        self.assertEqual((cli.light_profile()["tenths"], cli.light_profile()["switch_pause"]), (True, 2.0))
+        self.assertNotIn("hybrid", cli.light_profile())
         cli.write_json(cli.LIGHT_FILE, {"mac": MAC})       # no profile: the CB200C, as before
-        self.assertEqual((cli.light_profile()["model"], cli.light_profile()["hybrid"]), ("CB200C", {}))
+        self.assertEqual((cli.light_profile()["model"], cli.light_profile()["tenths"],
+                          cli.light_profile()["firmware_curves"], cli.light_profile()["dial"]), ("CB200C", False, False, False))
 
-    def test_the_mapping_on_both_sides(self):
-        profile = cli.light_profile()
-        number = lambda curve, output: cli.curve_number(profile, curve, output)
-        self.assertEqual(number("exp", 5), 45)           # measured: exp 45 = linear 5
-        self.assertEqual(number("exp", 20), 55)          # measured: exp 55 = linear 20
-        self.assertEqual(number("exp", 0.01), 1)         # the guessed bottom
-        self.assertEqual(number("linear", 20), 20)
-        self.assertEqual(number("linear", 63.4), 63)
-        self.assertAlmostEqual(cli.curve_output(profile, "exp", 45), 0.05)
-        self.assertAlmostEqual(cli.curve_output(profile, "linear", 30), 0.30)
-        power = math.log(0.05 / 0.0001) / math.log(45)    # between exp 1 and exp 45, a power of the setting
-        self.assertAlmostEqual(cli.curve_output(profile, "exp", 20), 0.0001 * 20 ** power, places=9)
-        # Past the table nothing is measured: held at its last point, the least it can be.
-        self.assertEqual([cli.curve_output(profile, "exp", n) for n in (55, 56, 100)], [0.2] * 3)
-        self.assertEqual(number("exp", 21.9), 55)        # so the top of the band on exp is exp 55
-        self.assertAlmostEqual(cli.lowest_output(profile), 0.01)
-
-    def test_hysteresis(self):
-        profile = cli.light_profile()
-        pick = lambda output, now: cli.pick_curve(profile, output, now)
-        self.assertEqual([pick(o, "linear") for o in (100, 20, 18, 17.9, 5)], ["linear"] * 3 + ["exp"] * 2)
-        self.assertEqual([pick(o, "exp") for o in (1, 20, 21.9, 22, 50)], ["exp"] * 3 + ["linear"] * 2)
-        self.assertEqual([pick(o, None) for o in (19.9, 20)], ["exp", "linear"])
-
-    def test_a_raw_exp_100_is_never_left_brighter(self):
-        # The light as calibration left it: exp 100, which is dimmer than linear 50.
-        self.on("exp", 100)
-        self.assertAlmostEqual(cli.output_of(cli.light_profile(), self.state()), 20)
-        self.assertEqual(cli.describe(self.state(), cli.light_profile()), "on, white 5600K at 20% (exp 100)")
-        self.run_command("white", "5000")                  # colour only: the same number on the same curve
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(100, "exp")])
-        self.assertEqual((self.state()["kelvin"], self.state()["curve"], self.state()["brightness"]), (5000, "exp", 100))
-        # The bedtime fade starts at exp 55 and stays on exp: no linear frame until the light is off.
-        with open(cli.SUNDIAL_CONFIG_FILE, "w") as handle:
-            handle.write("[sleep]\nwake = 07:00\nbedtime = 23:00\n")
-        self.on("exp", 100)
-        cli.write_json(cli.FOLLOW_MEMORY_FILE, {"stamp": cli.state_stamp(), "sent": cli.follow_look(self.state())})
-        light = cli.Light(argparse.Namespace(bridge=None, mac=None, quiet=True))
-        finished, _ = cli.fade_out(light, cli.read_json(cli.FOLLOW_MEMORY_FILE, {}), 300.0, self.now)
-        self.assertTrue(finished)
-        off = FakeBridge.sent.index(cli.to_hex(cli.power_frame(cli.parse_mac(MAC), False)))
-        frames = self.frames_of(FakeBridge.sent[:off])
-        self.assertEqual({c for n, c in frames}, {"exp"})
-        self.assertLessEqual(frames[0][0], 55)
-        self.assertEqual([n for n, c in frames], sorted((n for n, c in frames), reverse=True))
-        self.assertEqual(self.frames_of(FakeBridge.sent[off:]), [(100, "exp")])   # left for standby as it was
-        self.assertEqual((self.state()["curve"], self.state()["brightness"]), ("exp", 100))
-        # Switched on again (as Home does), it comes back to exp 100, from exp 1 since its curve is not known.
+    def test_the_white_frame_carries_the_tenths(self):
+        mac = cli.parse_mac("F0:6F:33:D3:09:34")
+        # Sent to the light: its display read exactly exp 40.0 at 3000K.
+        self.assertEqual(cli.to_hex(cli.white_frame(mac, 3000, 40.0, 0, "exp", tenths=True)),
+                         "78900cf06f33d3093487281e320100b6")
+        values = lambda brightness: cli.white_frame(mac, 3000, brightness, 0, "exp", tenths=True)[10:15]
+        self.assertEqual(values(40.3), [40, 30, 50, 1, 3])
+        self.assertEqual(values(0.1), [0, 30, 50, 1, 1])
+        self.assertEqual(values(100.0), [100, 30, 50, 1, 0])
+        self.assertEqual(values(39.7), [39, 30, 50, 1, 7])
+        # Without tenths, as the CB200C has always had it: four values.
+        self.assertEqual(cli.to_hex(cli.white_frame(cli.parse_mac("DF:24:3A:B4:46:5D"), 6500, 29, 50, "linear")),
+                         "78900bdf243ab4465d871d416404f4")
+        self.on("exp", 40.0)
+        self.run_command("white", "5600", "10")
+        self.assert_all_tenths(FakeBridge.sent)
+        cli.write_json(cli.LIGHT_FILE, {"mac": MAC})       # the CB200C: still four values, whole numbers
         FakeBridge.sent = []
-        light = cli.Light(argparse.Namespace(bridge=None, mac=None, quiet=True))
-        light.show_white(5600, light.output())
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(1, "exp"), (100, "exp")])
+        self.run_command("white", "5600", "10")
+        self.assertEqual([(frame[4:6], frame[20:22]) for frame in FakeBridge.sent if frame[2:4] == "90"], [("0b", "0a")])
 
-    def test_exp_to_linear_is_one_frame(self):
-        self.on("exp", 45)
-        self.run_command("white", "5600", "50")
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(50, "linear")])
+    def test_the_firmware_curves(self):
+        shares = cli.CURVE_SHARES
+        for n in (0.1, 1, 17.2, 39.7, 40, 52, 84.7, 100):
+            self.assertAlmostEqual(100 * shares["exp"](n), exp_output(n), places=9)
+        self.assertEqual([round(shares[c](100), 9) for c in ("linear", "exp", "log", "s")], [1.0] * 4)
+        self.assertEqual(shares["log"](0.1), 0.0005)
+        grid = [n / 10.0 for n in range(1, 1001)]
+        for curve, rises in shares.items():
+            values = [rises(n) for n in grid]
+            self.assertTrue(all(b > a for a, b in zip(values, values[1:])), curve)
+        self.assertAlmostEqual(exp_output(40), 5.077, places=3)   # no cap: exp reaches full output at 100
+
+    def test_light_output_maps_to_the_exp_setting(self):
+        profile = cli.light_profile()
+        number = lambda output: cli.curve_number(profile, "exp", output)
+        self.assertEqual([number(o) for o in (5, 10, 1, 100, 0.0032)], [39.7, 52.0, 17.2, 100.0, 0.1])
+        self.assertEqual(number(0), 0)
+        self.assertAlmostEqual(cli.lowest_output(profile), exp_output(0.1))
+        for n in [t / 10.0 for t in range(1, 1001)]:      # every setting comes back to itself
+            self.assertEqual(number(exp_output(n)), n)
+        for output in (0.004, 0.05, 0.7, 3.3, 5, 12.5, 37, 81):   # and the nearest setting is taken
+            got = number(output)
+            for other in (round(got - 0.1, 1), round(got + 0.1, 1)):
+                if 0.1 <= other <= 100:
+                    self.assertLessEqual(abs(math.log(exp_output(got) / output)),
+                                         abs(math.log(exp_output(other) / output)))
+
+    def test_a_night_level_below_1_percent(self):
+        settings = dict(cli.FOLLOW_DEFAULTS, night_brightness=1.28)    # exp 20.0, as he set it on the light
+        cli.write_json(cli.FOLLOW_FILE, settings)
+        self.assertEqual(cli.follow_settings()["night_brightness"], 1.28)
+        self.on("exp", 100.0, kelvin=6500)
+        self.set_elsewhere(cli.read_json(cli.STATE_FILE, {}), minutes_ago=300)
+        self.sun(NIGHT)
+        self.apply()
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(20.0, "exp")])
+        self.assertEqual(cli.describe(self.state()), "on, white 2700K at exp 20.0 (1.3% output)")
+        cli.write_json(cli.FOLLOW_FILE, dict(settings, night_brightness=0))     # never below the lowest setting
+        self.assertAlmostEqual(cli.follow_settings()["night_brightness"], exp_output(0.1))
+        cli.write_json(cli.LIGHT_FILE, {"mac": MAC})       # on the CB200C, whole percents from 1, as before
+        self.assertEqual(cli.follow_settings()["night_brightness"], 1)
+
+    def test_one_curve_everywhere(self):
+        self.on("exp", 100.0, kelvin=6500)
+        self.set_elsewhere(cli.read_json(cli.STATE_FILE, {}), minutes_ago=300)
+        self.sun(NIGHT)
+        self.assertIn("white 2700K at 5%", self.apply())
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(39.7, "exp")])   # night: 5% output, one frame
+        self.later(1)
+        self.sun(NIGHT)
+        self.assertIsNone(self.apply())                    # and not again every minute
+        FakeBridge.sent = []
+        self.later(1)
+        self.sun(DAY)
+        self.assertIn("white 6500K at 100%", self.apply())
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(100.0, "exp")])  # full output on exp
         self.assertEqual(self.waits, [])
-        self.assertEqual((self.state()["curve"], self.state()["brightness"], self.state()["output"]), ("linear", 50, 50))
+        self.assert_all_tenths(FakeBridge.sent)
+        self.assertEqual(cli.describe(self.state()), "on, white 6500K at exp 100.0 (100% output)")
 
-    def test_linear_to_exp_dips_first(self):
-        self.on("linear", 50)
-        self.run_command("white", "5600", "5")
+    def test_a_change_to_exp_from_another_curve_dips_first(self):
+        self.on("linear", 50.0)                            # after a raw --curve linear
+        self.run_command("white", "5600", "39.7")
         # An exp frame with the number the light shows now: the same light on
         # linear, then the curve changes, a dip. Then the target.
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(50, "exp"), (45, "exp")])
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(50.0, "exp"), (39.7, "exp")])
         self.assertEqual(self.waits, [1.5])
-        self.assertEqual((self.state()["curve"], self.state()["brightness"]), ("exp", 45))
-
-    def test_from_an_unknown_curve_to_exp_dips_too(self):
+        self.assertEqual((self.state()["curve"], self.state()["brightness"]), ("exp", 39.7))
         cli.write_json(cli.STATE_FILE, {"on": True, "mode": "white", "kelvin": 5600, "brightness": 30})  # no curve
-        self.run_command("white", "5600", "5")
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(30, "exp"), (45, "exp")])
-
-    def test_within_one_curve_nothing_special(self):
-        self.on("exp", 45)
-        self.run_command("white", "5600", "0.5")
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(cli.curve_number(cli.light_profile(), "exp", 0.5), "exp")])
-        self.on("linear", 50)
+        FakeBridge.sent = []
+        self.run_command("white", "5600", "5", "--output")
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(30.0, "exp"), (39.7, "exp")])
+        self.on("exp", 39.7)                               # on exp already: one frame, no pause
+        self.waits[:] = []
         self.run_command("brightness", "80")
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(80, "linear")])
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(80.0, "exp")])
         self.assertEqual(self.waits, [])
 
-    def test_the_command_takes_output_and_a_raw_way(self):
-        self.on("linear", 50)
-        self.run_command("white", "5600", "0.01")
-        self.assertEqual(self.frames_of(FakeBridge.sent)[-1], (1, "exp"))
-        self.assertEqual(cli.describe(self.state()), "on, white 5600K at 0.01% (exp 1)")
+    def test_the_command_takes_the_dial_setting_output_and_a_raw_way(self):
+        self.on("exp", 39.7)
+        self.run_command("white", "2700", "20")            # the setting, as on the light's dial
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(20.0, "exp")])
+        self.assertEqual(cli.describe(self.state()), "on, white 2700K at exp 20.0 (1.3% output)")
         FakeBridge.sent = []
-        self.run_command("white", "5600", "45", "--curve", "linear")   # raw: the number on that curve, no care taken
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(45, "linear")])
-        self.assertEqual(self.state()["output"], 45)
+        self.run_command("brightness", "0.1")
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(0.1, "exp")])
         FakeBridge.sent = []
-        self.run_command("white", "5600", "45", "--curve", "exp")
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(45, "exp")])
-        self.assertEqual(cli.describe(self.state()), "on, white 5600K at 5% (exp 45)")
+        self.run_command("white", "2700", "5", "--output")  # or light output
+        self.assertEqual(cli.describe(self.state()), "on, white 2700K at exp 39.7 (5% output)")
+        self.run_command("brightness", "0.01", "--output")
+        self.assertEqual(self.frames_of(FakeBridge.sent)[-1], (0.3, "exp"))
+        self.assertEqual(cli.describe(self.state()), "on, white 2700K at exp 0.3 (0.01% output)")
         FakeBridge.sent = []
-        with self.assertRaises(cli.Failure):               # a raw setting is a whole number: 0.4 is not 0, dark
-            self.run_command("white", "5600", "0.4", "--curve", "exp")
-        cli.write_json(cli.LIGHT_FILE, {"mac": MAC})       # nor on a light with one curve, the CB200C
+        self.run_command("white", "5600")                  # no brightness: the light output kept
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(0.3, "exp")])
+        FakeBridge.sent = []
+        for words in (["white", "5600", "20.25"], ["brightness", "0.05"]):   # the dial goes in tenths
+            with self.assertRaises(cli.Failure):
+                self.run_command(*words)
+        self.assertEqual(FakeBridge.sent, [])
+        self.run_command("white", "5600", "45.5", "--curve", "linear")   # raw: the number on that curve, no care taken
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(45.5, "linear")])
+        self.assertAlmostEqual(self.state()["output"], 45.5)
+        self.assertEqual(cli.describe(self.state()), "on, white 5600K at linear 45.5 (45.5% output)")
+        FakeBridge.sent = []
+        self.run_command("white", "3000", "40", "--curve", "exp")
+        self.assertEqual(FakeBridge.sent, [cli.to_hex(cli.white_frame(cli.parse_mac(MAC), 3000, 40.0, 0, "exp", True))])
+        self.assertEqual(FakeBridge.sent[0][4:6] + FakeBridge.sent[0][18:30], "0c87281e320100")
+        self.assertEqual(cli.describe(self.state()), "on, white 3000K at exp 40.0 (5.1% output)")
+        FakeBridge.sent = []
+        with self.assertRaises(cli.Failure):               # a raw setting has one decimal at most
+            self.run_command("white", "5600", "0.45", "--curve", "exp")
+        cli.write_json(cli.LIGHT_FILE, {"mac": MAC})       # on a light without tenths, the CB200C: whole numbers
         with self.assertRaises(cli.Failure):
             self.run_command("brightness", "0.5")
         self.assertEqual(FakeBridge.sent, [])
         self.run_command("brightness", "3.0")
         self.assertEqual(self.frames_of(FakeBridge.sent)[-1][0], 3)
+        self.assertEqual({frame[4:6] for frame in FakeBridge.sent if frame[2:4] == "90"}, {"0b"})
+
+    def test_a_setting_recorded_before_the_tenths(self):
+        self.on("exp", 100)                                # a whole number, from before
+        self.assertEqual(cli.describe(self.state(), cli.light_profile()), "on, white 5600K at exp 100 (100% output)")
+        self.run_command("white", "5000")                  # colour only: the same light
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(100.0, "exp")])
 
     def test_the_range_is_kept(self):
         with self.assertRaises(cli.Failure):
@@ -1018,105 +1089,87 @@ class AS600BTest(AS600BScaffold):
             self.assertEqual(cli.nearest_white(profile, *cli.white_hue_saturation(kelvin)), kelvin)
         self.assertEqual(cli.nearest_white(profile, 240, 100), 6500)
 
-    def test_the_follower_works_in_output_on_both_curves(self):
-        self.on("linear", 100, kelvin=6500)
-        self.set_elsewhere(cli.read_json(cli.STATE_FILE, {}), minutes_ago=300)
-        self.sun(NIGHT)
-        self.assertIn("white 2700K at 5%", self.apply())
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(100, "exp"), (45, "exp")])  # night: 5% output on exp
-        self.later(1)
-        self.sun(NIGHT)
-        self.assertIsNone(self.apply())                    # and not again every minute
-        FakeBridge.sent = []
-        self.later(1)
-        self.sun(DAY)
-        self.assertIn("white 6500K at 100%", self.apply())
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(100, "linear")])
-
-    def test_a_ramp_through_the_threshold_changes_curve_once(self):
-        self.on("exp", 45, kelvin=4000)
-        self.set_elsewhere(cli.read_json(cli.STATE_FILE, {}), minutes_ago=300)
-        curves = []
-        for minute, daylight in enumerate([0.15, 0.16, 0.14, 0.17, 0.15, 0.13, 0.18, 0.2, 0.18, 0.17, 0.14, 0.1, 0.12]):
-            self.later(1)
-            self.sun({"sun_elevation": 5.0, "daylight": daylight, "kelvin": 4000})  # 19.25% ... 24% ... 14.5% output
-            self.apply()
-            curves.append(self.state()["curve"])
-        changes = sum(1 for a, b in zip(curves, curves[1:]) if a != b)
-        self.assertEqual(curves[0], "exp")
-        self.assertIn("linear", curves)
-        self.assertEqual(changes, 2)                       # up once at 22%, down once below 18%
-
-    def test_the_bedtime_fade_crosses_down_with_a_dip(self):
-        with open(cli.SUNDIAL_CONFIG_FILE, "w") as handle:
-            handle.write("[sleep]\nwake = 07:00\nbedtime = 23:00\n")
-        self.on("linear", 100, kelvin=2700)
-        cli.write_json(cli.FOLLOW_MEMORY_FILE, {"stamp": cli.state_stamp(), "sent": cli.follow_look(self.state())})
-        light = cli.Light(argparse.Namespace(bridge=None, mac=None, quiet=True))
-        finished, _ = cli.fade_out(light, cli.read_json(cli.FOLLOW_MEMORY_FILE, {}), 300.0, self.now)
-        self.assertTrue(finished)
-        off = FakeBridge.sent.index(cli.to_hex(cli.power_frame(cli.parse_mac(MAC), False)))
-        frames = self.frames_of(FakeBridge.sent[:off])     # the fade itself, not the frame left for standby
-        linear = [n for n, c in frames if c == "linear"]
-        exp = [n for n, c in frames if c == "exp"]
-        self.assertEqual(linear[:3], sorted(linear[:3], reverse=True))
-        self.assertTrue(linear[-1] >= 18 and linear[-1] < 25)    # down on linear to the bottom of the band
-        first_exp = frames.index((exp[0], "exp"))
-        self.assertEqual(frames[first_exp - 1], (linear[-1], "linear"))
-        self.assertEqual(exp[0], linear[-1])               # the dip: exp with the number shown on linear
-        self.assertIn(1.5, self.waits)
-        self.assertEqual(exp[1:], sorted(exp[1:], reverse=True))
-        self.assertEqual(exp[-1], 1)                       # down to exp 1, about 0.01%
-        self.assertIn(cli.to_hex(cli.power_frame(cli.parse_mac(MAC), False)), FakeBridge.sent)
-        # The record keeps the setting from before the fade, and says the light's curve is not known.
+    def test_the_bedtime_fade_is_smooth_on_exp(self):
+        self.on("exp", 39.7, kelvin=2700)                  # the night's 5%
+        frames, after = self.fade()
+        self.assertEqual({curve for number, curve in frames}, {"exp"})
+        numbers = [number for number, curve in frames]
+        self.assertTrue(all(b < a for a, b in zip(numbers, numbers[1:])))
+        self.assertEqual(numbers[-1], 0.1)                 # down to exp 0.1, about 0.003%
+        for a, b in zip(numbers, numbers[1:]):
+            # Each step a few percent of light, or else the least step there is.
+            self.assertTrue(exp_output(b) / exp_output(a) >= 0.89 or round(a - b, 1) == 0.1, (a, b))
+        self.assertLessEqual(max(exp_output(b) / exp_output(a) for a, b in zip(numbers, numbers[1:])), 1)
+        self.assertGreater(len(numbers), 150)
+        self.assertNotIn(1.5, self.waits)                  # no curve change, so no pause for one
+        self.assertEqual(self.waits.count(cli.FADE_STEP_SECONDS), 300)
+        self.assertEqual(after, [(39.7, "exp")])           # left for standby as it was
+        self.assert_all_tenths(FakeBridge.sent)
+        # The record keeps the setting from before the fade, and the light's curve is known: exp.
         state = self.state()
-        self.assertEqual((state["on"], state["curve"], state["brightness"]), (False, "linear", 100))
-        self.assertIsNone(state["shown"]["curve"])
-        # So the morning comes on with a dip, never a flash.
+        self.assertEqual((state["on"], state["curve"], state["brightness"]), (False, "exp", 39.7))
+        self.assertEqual(state["shown"]["curve"], "exp")
+        # So the morning comes on in one frame.
         FakeBridge.sent = []
         light = cli.Light(argparse.Namespace(bridge=None, mac=None, quiet=True))
         light.show_white(2800, 5)
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(1, "exp"), (45, "exp")])
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(39.7, "exp")])
 
-    def test_the_sunrise_crosses_20_once_and_starts_below_1(self):
+    def test_a_fade_from_a_raw_linear_setting_dips_and_forgets_the_curve(self):
+        self.on("linear", 50.0, kelvin=2700)
+        frames, after = self.fade()
+        self.assertEqual(frames[0], (50.0, "exp"))         # the dip: exp with the number shown on linear
+        self.assertIn(1.5, self.waits)
+        self.assertEqual({curve for number, curve in frames}, {"exp"})
+        self.assertEqual(after, [(50.0, "linear")])        # left for standby as it was
+        self.assertIsNone(self.state()["shown"]["curve"])  # exp or linear, not known
+        FakeBridge.sent = []
+        light = cli.Light(argparse.Namespace(bridge=None, mac=None, quiet=True))
+        light.show_white(2800, 5)
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(0.1, "exp"), (39.7, "exp")])
+
+    def test_the_sunrise_is_all_on_exp(self):
         profile = cli.light_profile()
         steps = [cli.sunrise_setting(t / 400.0, 100, 5600, "sky", profile) for t in range(401)]
         self.assertEqual({step[0] for step in steps}, {"white"})
-        self.assertAlmostEqual(steps[0][2], 0.01)          # exp 1, far below 1%
+        self.assertAlmostEqual(steps[0][2], exp_output(0.1), places=4)   # exp 0.1, far below 1%
         self.assertEqual(steps[-1], ("white", 5600, 100))
-        state, curves, sent = {"on": True, "mode": "white", "curve": "exp", "brightness": 1, "kelvin": 5600}, [], []
+        state, numbers = {"on": True, "mode": "white", "curve": "exp", "brightness": 0.1, "kelvin": 5600}, []
         for step in steps:
             frames, look = cli.plan_white(profile, state, step[1], step[2])
-            curves.append(look["curve"])
-            sent += frames
+            self.assertEqual([frame[3] for frame in frames], ["exp"])
+            numbers.append(look["brightness"])
             state.update(look)
-        self.assertEqual(curves[0], "exp")
-        self.assertEqual(curves[-1], "linear")
-        self.assertEqual(sum(1 for a, b in zip(curves, curves[1:]) if a != b), 1)
-        self.assertTrue(all(len(frames) == 1 for frames in [cli.plan_white(profile, dict(state, curve="exp"), 5600, 50)[0]]))
+        self.assertEqual((numbers[0], numbers[-1]), (0.1, 100.0))
+        self.assertEqual(numbers, sorted(numbers))
         glow = [cli.sunrise_setting(t / 100.0, 100, 5600, "glow", profile) for t in range(101)]
-        self.assertAlmostEqual(glow[0][2], 0.01)
+        self.assertAlmostEqual(glow[0][2], exp_output(0.1), places=4)
         self.assertEqual(glow[-1][2], 100)
 
-    def test_the_sunrise_plan_shows_the_curves(self):
+    def test_the_sunrise_plan_shows_the_settings(self):
+        self.on("exp", 39.7)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.run_command("sunrise", "--plan", "--minutes", "30")
         lines = out.getvalue().splitlines()
-        self.assertIn("(exp 1)", lines[0])
-        self.assertTrue(any("(linear 22)" in line for line in lines))
-        self.assertIn("(linear 100)", lines[-1])
+        self.assertIn("white 6500K at exp 0.1 (0.003% output)", lines[0])
+        self.assertIn("at exp 100.0 (", lines[-1])
+        self.assertFalse(any("linear" in line or "changing" in line for line in lines))
 
     def test_a_sunrise_sends_only_white_frames(self):
         sleeps = []
         original = cli.time.sleep
         cli.time.sleep = sleeps.append
         self.addCleanup(lambda: setattr(cli.time, "sleep", original))
-        self.on("linear", 5)
+        self.on("exp", 39.7)
         self.run_command("sunrise", "--minutes", "0.002", "--brightness", "5", "--kelvin", "5600")
         self.assertEqual({frame[2:4] for frame in FakeBridge.sent}, {"90", "8d"})
-        self.assertEqual(self.frames_of(FakeBridge.sent)[-1], (45, "exp"))
-        self.assertEqual(self.frames_of(FakeBridge.sent)[:2], [(5, "exp"), (1, "exp")])   # from linear 5: a dip
+        self.assertEqual(self.frames_of(FakeBridge.sent)[:1], [(0.1, "exp")])   # on exp already: no dip
+        self.assertEqual(self.frames_of(FakeBridge.sent)[-1], (39.7, "exp"))
+        self.assert_all_tenths(FakeBridge.sent)
+        self.on("linear", 5.0)                             # after a raw --curve linear: a dip first
+        self.run_command("sunrise", "--minutes", "0.002", "--brightness", "5", "--kelvin", "5600")
+        self.assertEqual(self.frames_of(FakeBridge.sent)[:2], [(5.0, "exp"), (0.1, "exp")])
 
     def test_follow_on_at_midday_is_not_a_fresh_start(self):
         # The follower was off through the morning; the light is on, set by him.
@@ -1126,7 +1179,7 @@ class AS600BTest(AS600BScaffold):
         cli.write_json(os.path.join(cli.TRACKING_DIR, "settings.json"), {})
         cli.set_tracking(False, "home")
         cli.write_json(cli.FOLLOW_MEMORY_FILE, {"day": 0, "situation": "off"})
-        cli.write_json(cli.STATE_FILE, {"on": True, "mode": "white", "kelvin": 5600, "brightness": 20, "curve": "exp"})
+        cli.write_json(cli.STATE_FILE, {"on": True, "mode": "white", "kelvin": 5600, "brightness": 20.0, "curve": "exp"})
         self.run_command("follow", "off")
         noon = time.mktime(time.localtime()[:3] + (12, 0, 0, 0, 0, -1))
         original = cli.time.time
@@ -1136,7 +1189,7 @@ class AS600BTest(AS600BScaffold):
         os.utime(cli.SUNDIAL_STATE_FILE, (noon, noon))
         self.run_command("follow", "on")
         self.assertEqual(FakeBridge.sent, [])            # not 6500K at 100%
-        self.assertEqual((self.state()["kelvin"], self.state()["brightness"]), (5600, 20))
+        self.assertEqual((self.state()["kelvin"], self.state()["brightness"]), (5600, 20.0))
         self.assertFalse(cli.tracking()["on"])
 
     def test_follow_on_leaves_sun_tracking_alone(self):
@@ -1150,14 +1203,12 @@ class AS600BTest(AS600BScaffold):
         self.assertEqual(FakeBridge.sent, [])            # tracking is off, so the light is left alone
 
 
-
-
 class AS600BHomeKitTest(AS600BScaffold):
     """The Apple Home service's side, without HAP-python: the link that turns Home's values into frames."""
 
     def setUp(self):
         super().setUp()
-        self.on("exp", 45)
+        self.on("exp", 45.0)
         sys.modules["neewer_cli"] = cli
         loader = importlib.machinery.SourceFileLoader(
             "neewer_homekit", os.path.join(HERE, "..", "homekit", "neewer_homekit.py"))
@@ -1178,50 +1229,56 @@ class AS600BHomeKitTest(AS600BScaffold):
         self.assertEqual(self.homekit.mired_to_kelvin(154, self.link.profile), 6500)
         self.assertEqual(self.homekit.mired_to_kelvin(370, self.link.profile), 2700)
 
-    def test_home_is_shown_light_output(self):
-        self.assertEqual(self.link.home_brightness(self.link.snapshot()), 5)     # exp 45 is 5% output
-        self.on("exp", 1)
+    def test_home_is_shown_the_dial_setting(self):
+        self.assertEqual(self.link.home_brightness(self.link.snapshot()), 45)    # exp 45.0, as on the light's dial
+        self.on("exp", 20.0)
         self.link = self.homekit.LightLink()
-        self.assertEqual(self.link.home_brightness(self.link.snapshot()), 1)     # 0.01%, shown as 1 while lit
-
-    def test_a_raw_exp_100_from_home(self):
-        self.on("exp", 100)
+        self.assertEqual(self.link.home_brightness(self.link.snapshot()), 20)
+        self.on("exp", 0.1)
         self.link = self.homekit.LightLink()
-        self.assertEqual(self.link.home_brightness(self.link.snapshot()), 20)    # the least exp 100 can be
-        self.write(ColorTemperature=250)                   # colour only: still exp 100
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(100, "exp")])
-        self.assertEqual((self.state()["curve"], self.state()["brightness"]), ("exp", 100))
+        self.assertEqual(self.link.home_brightness(self.link.snapshot()), 1)     # exp 0.1, shown as 1 while lit
+        self.on("linear", 45.5)                            # after a raw send: the exp setting with that output
+        self.link = self.homekit.LightLink()
+        self.assertEqual(self.link.home_brightness(self.link.snapshot()), round(cli.curve_number(
+            cli.light_profile(), "exp", 45.5)))
 
-    def test_the_slider_sets_output_across_the_whole_range(self):
-        self.write(Brightness=80)
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(80, "linear")])     # exp -> linear: one frame
-        FakeBridge.sent = []
-        self.write(Brightness=10)
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(80, "exp"), (50, "exp")])  # linear -> exp: a dip first
-        self.assertEqual(self.sleeps[-1], 1.5)
-        self.assertEqual(self.state()["output"], 10)
-        self.assertEqual(self.state()["curve"], "exp")
+    def test_the_slider_is_the_dial_setting(self):
+        for level in (80, 20, 10, 1, 100):
+            FakeBridge.sent = []
+            self.write(Brightness=level)
+            self.assertEqual(self.frames_of(FakeBridge.sent), [(float(level), "exp")])
+            self.assertEqual(self.state()["brightness"], level)
+            self.assertAlmostEqual(self.state()["output"], exp_output(level), places=3)
+            self.assertEqual(self.link.home_brightness(self.link.snapshot()), level)
+            self.assert_all_tenths(FakeBridge.sent)
+        self.assertEqual(self.sleeps, [])
 
     def test_home_writing_back_what_it_was_shown_changes_nothing(self):
-        self.on("exp", 1)
+        self.on("exp", 0.1)
         self.link = self.homekit.LightLink()
         self.link.apply_home({"On": True, "Brightness": 1})
-        self.assertAlmostEqual(self.link.snapshot()["output"], 0.01)
+        self.assertAlmostEqual(self.link.snapshot()["output"], exp_output(0.1))
+        self.on("exp", 20.3)
+        self.link = self.homekit.LightLink()
+        self.link.apply_home({"Brightness": 20})
+        self.assertAlmostEqual(self.link.snapshot()["output"], exp_output(20.3))
 
     def test_a_colour_from_home_becomes_the_nearest_white(self):
         self.write(Hue=240, Saturation=100)
         self.assertEqual(self.link.snapshot()["kelvin"], 6500)
-        self.assertEqual(self.frames_of(FakeBridge.sent)[-1], (45, "exp"))
+        self.assertEqual(self.frames_of(FakeBridge.sent)[-1], (45.0, "exp"))
         self.assertTrue(all(frame[2:4] in ("90", "8d") for frame in FakeBridge.sent))
 
-    def test_a_fresh_start_sends_output_with_the_hybrid(self):
-        cli.write_json(cli.STATE_FILE, {"on": False, "mode": "white", "kelvin": 4000, "brightness": 50, "curve": "linear"})
+    def test_a_fresh_start_sends_output_on_exp(self):
+        cli.write_json(cli.STATE_FILE, {"on": False, "mode": "white", "kelvin": 4000, "brightness": 39.7, "curve": "exp",
+                                        "shown": {"curve": "exp", "brightness": None, "kelvin": None}})
         self.sun(NIGHT)
         self.link = self.homekit.LightLink()
         FakeBridge.sent = []
         self.write(On=True)
-        self.assertEqual(self.frames_of(FakeBridge.sent), [(50, "exp"), (45, "exp")])   # 5% at night, with a dip
+        self.assertEqual(self.frames_of(FakeBridge.sent), [(39.7, "exp")])   # 5% at night, one frame
         self.assertEqual((self.state()["kelvin"], self.state()["output"]), (2700, 5))
+        self.assert_all_tenths(FakeBridge.sent)
 
 
 if __name__ == "__main__":

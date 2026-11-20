@@ -17,15 +17,16 @@ The split is deliberate. Rebuilding the bridge changes its code signature, and m
 ```
 neewer on
 neewer off
-neewer white 5600 10        # colour temperature in kelvin, brightness as light output 0-100
+neewer white 5600 10        # colour temperature in kelvin, brightness 0-100 (below)
+neewer white 2700 5 --output  # brightness as light output, a percent of full
 neewer white 3200 --tint -10
-neewer brightness 0.5       # keeps the current colour
+neewer brightness 20.5      # keeps the current colour
 neewer sunrise --minutes 30 # ramp up the way a real sunrise brightens
 neewer follow               # show whether the light is following the sun
 neewer status
 ```
 
-Brightness is light output, as a percent of the light's full output. On the AS600B it can be a fraction, down to about 0.01%, because the dim end is sent on the light's exponential curve (see Two curves). On the CB200C it is a whole number from 1. Colour temperature is 2700-6500K on the AS600B, in steps of 100K, as on its display.
+On the AS600B a brightness set by hand is the light's own setting on its exponential curve, the number on its dial: 0.1 to 100.0 in steps of 0.1. That keeps control fine at the low end, where exp 20.0 is 1.3% of full output (see Brightness on the AS600B). `--output` takes light output instead, as a percent of full, fractions allowed. On the CB200C the two are the same, a whole number from 1. Colour temperature is 2700-6500K on the AS600B, in steps of 100K, as on its display.
 
 These only work on a light that has colour LEDs or takes the five-channel frame, such as the CB200C. On the AS600B each says so and sends nothing (`colour` and `rgb` also name the nearest white):
 
@@ -57,36 +58,49 @@ What the connected light can do is its profile, in `light.json` in the settings 
 | `curve` | `exp` | none: each command chooses, linear unless asked |
 | `channels` (the five-channel frame) | false | true |
 | `colour` (the hue frame) | false | true |
-| `hybrid` | exponential below 20%, linear above (below) | none |
+| `tenths` (the brightness's tenths in the white frame) | true | false |
+| `firmware_curves` (dims on the firmware's curves, below) | true | false |
+| `dial` (a brightness set by hand is the setting, not output) | true | false |
 
 Every white frame, from every path (the command, the follower, the bedtime fade, the morning, a fresh start, the sunrise, Apple Home), is kept inside the profile's colour temperatures and carries its curve. This matters on the AS600B, which:
 
 - **drops a white frame outside 2700-6500K.** 2500K and 6600K were tried; its display kept the old value. So nothing outside the range is sent: the follower and the rest bring a colour into the range, and `neewer white 6600` refuses with the range.
-- **honours the curve byte**, which sets the light's own dimming curve: 04 linear, 01 exponential. Each send chooses the curve from the brightness (see Two curves).
+- **needs a fifth value in the white frame**, the tenths of the brightness. Without it the light reads the tenths as 255, so every brightness arrives 25.5 too high, and one that comes out above 100.0 is dropped (see Command format).
+- **honours the curve byte**, which sets the light's own dimming curve: 04 linear, 01 exponential. It is kept on the exponential curve (below).
 - **ignores the channels frame altogether** (cold white at 255, brightness 15%, did nothing), so there is no `faint`, no `channels`, and a different sunrise (below).
 
-### Two curves (the AS600B)
+### Brightness on the AS600B
 
-The AS600B's exponential curve goes far dimmer than its linear one, but it is capped: exp 100 is dimmer than linear 50. So the dim end is sent on the exponential curve and the bright end on the linear one, and every brightness, everywhere, is light output as a percent of full: `neewer white` and `neewer brightness`, the Apple Home slider, the follower, the bedtime fade, the morning switch-on, a fresh start and the sunrise. The profile's `hybrid` says how:
+The AS600B's setting goes from 0.0 to 100.0 in steps of 0.1, as on its dial, and the light is kept on its exponential curve. The curves are the firmware's own, worked out from the firmware of two siblings, the AS600C and the bi-colour FS600B. For a setting n, as a share of full output (linear 100):
 
 ```
-"hybrid": {"threshold": 20, "hysteresis": [18, 22], "switch_pause": 1.5,
-           "exp_table": [[1, 0.0001], [45, 0.05], [55, 0.20]]}
+linear       n / 100
+exponential  n / 100 × 1.035^(n − 100)
 ```
 
-- **Below 20% output, exponential.** `exp_table` is how much light an exponential setting gives, as pairs of setting and share of full output. Two points were matched by eye against the linear curve, which is taken as proportional to output: exp 45 looks like linear 5, and exp 55 like linear 20. Exp 1 at 0.01% is a guess, so everything below exp 45 is an extrapolation. Between points the output follows a power of the setting, a straight line on log scales. Past exp 55 nothing is measured, so the output there is taken as 20%, the least it can be.
-- **From 20% up, linear**, with the setting the output as a whole number.
-- **Hysteresis.** On the linear curve the light stays linear down to 18%, and on the exponential curve it stays there up to 22%. So a slow ramp through 20% changes curve once, not back and forth.
+The log and S curves are in `cli/neewer` too. The exponential curve reaches full output at 100.
 
-**Changing curve never flashes.** When the curve byte changes, the light first shows the new number on its old curve and changes curve a moment later. So:
+| exp setting | light output |
+|---|---|
+| 0.1, the lowest | 0.003% |
+| 17.2 | 1% |
+| 20.0 | 1.3% |
+| 39.7 | 5% |
+| 52.0 | 10% |
+| 84.7 | 50% |
+| 100.0 | 100% |
 
-- Exponential to linear is one frame, the linear target: for that moment the light shows the number on the exponential curve, which is dimmer.
-- Linear to exponential is two. First an exponential frame with the number the light is showing now, which is the same light on linear and then dims as the curve changes. Then, after `switch_pause` (1.5 seconds), the exponential target. When the light's curve is not known (after the bedtime fade), the first frame is exp 1.
-- A change within one curve, or of colour only, is one frame.
+- **By hand** (`neewer white`, `neewer brightness`, the Apple Home slider), brightness is the setting, so control is fine at the low end. `--output` on the command takes light output instead.
+- **The follower, the bedtime fade, the morning, a fresh start and the sunrise work in light output.** They send the setting, to 0.1, whose output comes nearest. So `night_brightness: 1.28` in `follow.json` is exp 20.0.
+- `neewer status` and `neewer follow` show both: `white 2700K at exp 20.0 (1.3% output)`.
 
-`neewer white 5600 5 --curve linear` (or `--curve exp`) sends the number raw on that curve, with no mapping, for comparisons by eye. The next ordinary send maps again. `neewer status` shows the profile, and the last setting as output with the curve and number that gave it: `white 5600K at 5% (exp 45)`.
+The formula has not been measured on this light. Matches made by eye before the tenths byte was found agree with it to within 10-16%, once corrected for the 25.5: linear 30.5 looked like exp 70.5, and linear 45.5 like exp 80.5.
 
-A light without `hybrid` (the CB200C) has one curve, and an optional `output_curve` of setting and share pairs in place of the table.
+**A change to the exponential curve never flashes.** Only a raw send (`--curve`) leaves the light on another curve. When the curve byte changes, the light first shows the new number on its old curve and changes curve a moment later. The exponential curve is the dimmest, so the next ordinary send dips first. It sends an exponential frame with the number the light shows now, waits `switch_pause` (1.5 seconds), then sends the target. When the light's curve is not known, the first frame is exp 0.1.
+
+`neewer white 5600 45.5 --curve linear` (or `--curve exp`) sends the number raw on that curve, to one decimal, for comparisons by eye. No care is taken over the change of curve.
+
+A light without firmware curves (the CB200C) has one curve and whole-number settings. An optional `output_curve` of setting and share pairs says how bright each setting really is.
 
 ## Sunrise
 
@@ -106,7 +120,7 @@ The brightness follows the real sky. It uses the standard table of clear-sky ill
 
 The colour is an approximation, not a measured table. It is a view towards the sunrise: cold white in twilight, warming to about 2800K as the sun reaches the horizon, then whitening to the target.
 
-**On the AS600B** there is no channels frame, so the sky sunrise is sent as white frames only. It is the same sky in light output: `--brightness` is where it ends as a share of full output, and each step sends the setting that gives the sky's share (see Two curves). It starts where the sky is as dim, relative to the end, as the light's lowest setting is: exp 1, about 0.01%, in deep twilight. It climbs on the exponential curve to exp 55 and changes to linear once, at 22% (about 18 minutes into a 30-minute ramp), going up, so in one frame. The colour is the sky's, kept within 2700-6500K: cool white in twilight, about 2800K at the horizon, then whitening to the target. `--style glow` on this light is a plain ramp in light output from 0.01% to the target, warmest white to the target colour, changing curve in the same way. Neither has been watched on the light yet; `--plan` shows the steps, each with its curve and number.
+**On the AS600B** there is no channels frame, so the sky sunrise is sent as white frames only. It is the same sky in light output: `--brightness` is where it ends, as light output, and each step sends the exp setting, to 0.1, that gives the sky's share (see Brightness on the AS600B). It starts where the sky is as dim, relative to the end, as the light's lowest setting is: exp 0.1, about 0.003%, in deep twilight. It climbs on the exponential curve all the way, a tenth of the setting at a time. The colour is the sky's, kept within 2700-6500K: cool white in twilight, about 2800K at the horizon, then whitening to the target. `--style glow` on this light is a plain ramp in light output from 0.003% to the target, warmest white to the target colour. Neither has been watched on the light yet. `--plan` shows the steps, each with its setting and output.
 
 **On the CB200C** the whole ramp is sent as channels frames, mixing the warm and cold white LEDs, and never uses the white frame. Switching between the two frames shows a wrong colour for a moment, and the channels frame takes fractions of a percent all the way up. The mix was matched by eye against the white frame at 2800K, at 1% and at 10%: channels brightness `b` with levels adding up to 176 is as bright as white at `b`%, 2800K is about 95% warm and 5% cold, and about 1 part in 60 of red takes off a green cast. It has not been compared at other colour temperatures or near full brightness.
 
@@ -161,9 +175,9 @@ The settings are in `follow.json` in the settings folder, and are read each minu
 }
 ```
 
-- Brightness runs from `night_brightness` to `day_brightness` with sundial's "daylight" share. Both are light output as a percent of full; the setting sent is the one that gives it (see Two curves: on the AS600B the night's 5% is exp 45, the day's 100% is linear 100). With sundial's defaults that is the night level until the sun is 6 degrees below the horizon and the day level once it is 20 degrees up.
+- Brightness runs from `night_brightness` to `day_brightness` with sundial's "daylight" share. Both are light output as a percent of full, and may be fractions on the AS600B. The setting sent is the one that gives it: on the AS600B, 5% is exp 39.7, 1.28% is exp 20.0 and 100% is exp 100.0. With sundial's defaults that is the night level until the sun is 6 degrees below the horizon and the day level once it is 20 degrees up.
 - Colour is sundial's colour, kept within what the light shows (2700-6500K on the AS600B). While the sun goes from the horizon to 6 degrees below, it moves to `night_kelvin`.
-- `night_brightness` cannot go below the light's faintest output (1 on the CB200C, 0.01 on the AS600B), because 0 would switch the light off.
+- `night_brightness` cannot go below the light's lowest setting, because 0 would switch the light off. On the CB200C that is 1, a whole percent. On the AS600B it is exp 0.1, about 0.003%.
 - `hold_minutes` is how long a setting made elsewhere is left alone, in the older way without the Sun Tracking switch. With the switch it is not used.
 
 ### A fresh start
@@ -195,7 +209,7 @@ Bedtime and the wake time are sundial's (`[sleep]` in `~/.config/sundial/config.
 
 `"bedtime_rule": false` switches the whole rule off. `"morning_on": false` keeps the switching off and drops the switching on. `fade_minutes` and `morning_lead_minutes` are the five minutes and the half hour.
 
-It uses the ordinary white frame. On the AS600B the fade goes down on the linear curve to about 18% and then changes to exponential with the dip above, down to exp 1. From a setting already on the exponential curve it stays exponential, starting at exp 55 at the most (a raw exp 100 counts as 20%, so the fade opens with a step down to exp 55). On the CB200C, after a sunrise the light is in the channels mode, so there is one brief wrong colour when following takes over.
+It uses the ordinary white frame, one step a second, each the same share dimmer. On the AS600B the fade stays on the exponential curve. From 5% that is about 2.4% less light a step, a few tenths of the setting; from 1.28%, about 2%. Below about exp 5 (0.2%) each step is the least the light has, 0.1, down to exp 0.1. The light's curve stays known through the fade, so the morning comes on in one frame. On the CB200C, after a sunrise the light is in the channels mode, so there is one brief wrong colour when following takes over.
 
 Each change goes to `~/Library/Logs/neewer-follow.log`. `python3 tests/test_follow.py` checks the rules without a light.
 
@@ -214,7 +228,7 @@ Add `--qr code.svg` in place of `--pairing` to write the QR code to a file.
 
 - Home shows the light as on/off, brightness, colour and colour temperature, the range being the light's profile's (2700-6500K on the AS600B: 154-370 mired). The model shown is the profile's.
 - **On a light with white LEDs only (the AS600B)**, a colour chosen on Home's colour wheel becomes the nearest white the light can show, and Home is then shown that white. No colour frame is ever sent. The colour controls are still there, because taking them away would mean pairing the light again.
-- The brightness slider is light output (see Two curves), so on the AS600B its whole range works: 1% is exp 17, 10% is exp 50, 80% is linear 80. Home's slider stops at 1; below that is `neewer brightness 0.01`. Home is shown the output too, rounded to a whole number and never below 1 while the light is on, so exp 1 shows as 1. A change of curve from Home goes as above, so dragging down through 18% dips first and never flashes.
+- **On the AS600B the brightness slider is the light's setting**, the number on its dial: 20 is exp 20.0, 1.3% of full output, and 1 is exp 1.0, 0.03%. So the low end of the slider is fine-grained. Home is shown the setting, rounded to a whole number and never below 1 while the light is on. Below exp 1 is `neewer brightness 0.5`. On the CB200C the slider is light output.
 - Home and the `neewer` command share one record of the last setting, so a change made with either shows up in the other within a few seconds.
 - If the bridge loses the light, Home shows "No Response" rather than a state it cannot change.
 - The pairing keys are in `homekit-data/` in the settings folder, readable only by you. Deleting that folder unpairs the light; remove it from the Home app first.
@@ -615,14 +629,15 @@ Confirmed on a CB200C that advertises as `NW-20250017&00000000`, and the power a
 78 <tag> <size> <6 address bytes> <subtag> <values...> <checksum>
 
 power   tag 8D  subtag 81  values: 01 on, 02 off
-white   tag 90  subtag 87  values: brightness, kelvin/100, tint+50, dimming curve (04 = linear)
+white   tag 90  subtag 87  values: brightness, kelvin/100, tint+50, dimming curve (04 = linear),
+                           and on the AS600B the brightness's tenths (0-9)
 colour  tag 8F  subtag 86  values: hue low, hue high, saturation, brightness, 00
 channels tag A9 subtag A8  values: brightness, red, green, blue, cold white, warm white (0-255 each), 00
 ```
 
 `size` counts every byte after itself up to the checksum. The checksum is the low byte of the sum of all bytes before it. `neewer selftest` checks the builder against known-good frames.
 
-On the AS600B, judged by eye on its display: the power and white frames work as on the CB200C, and its display steps colour temperature in 100K, the same as the kelvin/100 byte. The curve byte is honoured (04 linear, 01 exponential). The channels frame is ignored. A white frame at 2500K or 6600K is dropped. It answers the device-info query with `... 41 53 36 30 30 42` ("AS600" "B") and the temperature query too.
+On the AS600B, judged by eye on its display: the power and white frames work as on the CB200C, and its display steps colour temperature in 100K, the same as the kelvin/100 byte. The curve byte is honoured (04 linear, 01 exponential). The white frame needs a fifth value, the tenths of the brightness, with size 0C: `78 90 0C F0 6F 33 D3 09 34 87 28 1E 32 01 00 B6` made its display read exactly exp 40.0 at 3000K. Sent without it, the light takes the missing tenths as 255, so the brightness arrives 25.5 too high: exp 45 read 70.5. A frame that comes out above 100.0 is dropped, but its curve byte still applies. The CB200C keeps the four-value frame. The channels frame is ignored. A white frame at 2500K or 6600K is dropped. It answers the device-info query with `... 41 53 36 30 30 42` ("AS600" "B") and the temperature query too.
 
 What was tried on the CB200C, judged by eye:
 
