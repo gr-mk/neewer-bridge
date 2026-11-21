@@ -366,15 +366,43 @@ class BedtimeTest(BedtimeScaffold):
             self.assertIsNone(self.apply())
         self.assertEqual(FakeBridge.sent, [])
 
-    def test_already_off_at_bedtime(self):
+    def test_already_off_at_bedtime_still_comes_on_in_the_morning(self):
         self.by_hand(on=False)
         self.at(23, 0)
-        self.assertEqual(self.apply(), "off by hand; left alone tonight")
+        self.assertEqual(self.apply(), "off by hand; on at 06:30")
+        self.assertEqual(self.status(), "off by hand; on at 06:30")
+        self.assertEqual(FakeBridge.sent, [])  # nothing to fade
+        self.sun({"sun_elevation": -5.0, "daylight": 0.04, "kelvin": 3400})
         self.at(6, 30, day=1)
+        self.assertEqual(self.status(), "switching on for the morning")
+        self.assertEqual(self.apply(), "morning: switched on at white 2800K at 9%")
+        self.assertEqual(FakeBridge.sent, [self.power(True), self.white(2800, 9)])
+        self.assertIs(self.state()["on"], True)
+
+    def test_switched_on_once_a_morning(self):
+        self.by_hand(on=False)
+        self.at(23, 0)
         self.apply()
-        self.at(9, 0, day=1)
+        self.at(6, 30, day=1)
+        self.assertIn("morning: switched on", self.apply())
+        self.at(8, 0, day=1)
+        self.by_hand(on=False)                 # off again by day: it stays off now
         self.apply()
-        self.assertEqual(FakeBridge.sent, [])  # he switched it off; it stays off
+        FakeBridge.sent = []
+        for hour in (9, 12, 18):
+            self.at(hour, 0, day=1)
+            self.apply()
+        self.assertEqual(FakeBridge.sent, [])
+        self.assertIs(self.state()["on"], False)
+        self.assertEqual(self.status(), "off at 23:00, on again at 06:30")
+
+    def test_a_night_the_follower_missed_gets_no_morning(self):
+        self.by_hand(on=False)
+        self.at(22, 30)
+        self.apply()                           # its last look before the Mac goes off
+        self.at(9, 0, day=1)                   # back at nine; it never saw the night
+        self.apply()
+        self.assertEqual(FakeBridge.sent, [])
         self.assertIs(self.state()["on"], False)
 
     def test_switched_back_on_in_the_night_is_left_alone(self):
@@ -406,7 +434,7 @@ class BedtimeTest(BedtimeScaffold):
         self.assertIsNone(self.apply())
         self.assertEqual(FakeBridge.sent, [])
 
-    def test_switched_off_by_hand_stays_off_in_the_morning(self):
+    def test_switched_off_by_hand_in_the_night_comes_on_in_the_morning(self):
         self.at(23, 0)
         self.apply()
         self.at(1, 0, day=1)
@@ -414,11 +442,23 @@ class BedtimeTest(BedtimeScaffold):
         self.apply()
         self.at(2, 0, day=1)
         self.by_hand(on=False)
-        self.assertEqual(self.apply(), "off by hand; left alone tonight")
+        self.assertEqual(self.apply(), "off by hand; on at 06:30")
         FakeBridge.sent = []
-        for hour, minute in ((6, 30), (7, 0), (12, 0)):
-            self.at(hour, minute, day=1)
-            self.apply()
+        self.at(6, 29, day=1)
+        self.assertIsNone(self.apply())
+        self.assertEqual(FakeBridge.sent, [])
+        self.at(6, 30, day=1)
+        self.assertIn("morning: switched on", self.apply())
+        self.assertEqual(FakeBridge.sent[0], self.power(True))
+        self.assertIs(self.state()["on"], True)
+
+    def test_off_by_hand_with_morning_on_switched_off_is_left_alone(self):
+        cli.write_json(cli.FOLLOW_FILE, {"morning_on": False})
+        self.by_hand(on=False)
+        self.at(23, 0)
+        self.assertEqual(self.apply(), "off by hand; left alone tonight")
+        self.at(6, 30, day=1)
+        self.apply()
         self.assertEqual(FakeBridge.sent, [])
         self.assertIs(self.state()["on"], False)
 
@@ -547,8 +587,8 @@ class FreshStartTest(BedtimeScaffold):
         return cli.fresh_outlook(cli.follow_settings(), cli.read_json(cli.FOLLOW_MEMORY_FILE, {}),
                                  light.state.get("on") is True, self.now)
 
-    def off_overnight(self):
-        """He switches the light off by hand at 03:20, in last night's warm white."""
+    def off_this_morning(self):
+        """It comes on for the morning in the dawn's warm white, and he switches it off at 07:20."""
         self.at(23, 0)
         self.apply()                      # the follower fades it out
         self.at(1, 0, day=1)
@@ -557,13 +597,18 @@ class FreshStartTest(BedtimeScaffold):
         self.at(3, 20, day=1)
         self.by_hand(on=False)            # and off again, himself
         self.apply()
-        for hour in (6, 7, 9):
+        self.at(6, 30, day=1)
+        self.assertIn("morning: switched on", self.apply())  # on for the morning all the same
+        self.at(7, 20, day=1)
+        self.by_hand(on=False)            # off by day: it stays off now
+        for hour in (7, 9):
             self.at(hour, 30, day=1)
             self.apply()
+        self.assertIs(self.state()["on"], False)
         FakeBridge.sent = []
 
     def test_switched_on_in_the_morning_goes_to_the_sun(self):
-        self.off_overnight()
+        self.off_this_morning()
         self.assertIn("when the light is switched on", self.outlook())
         self.sun(DAY)
         self.at(10, 58, day=1)
@@ -577,7 +622,7 @@ class FreshStartTest(BedtimeScaffold):
         self.assertIsNone(self.apply())       # followed, not held
 
     def test_after_the_fresh_start_the_hold_is_as_ever(self):
-        self.off_overnight()
+        self.off_this_morning()
         self.sun(DAY)
         self.at(10, 58, day=1)
         self.by_hand(on=True)
@@ -638,7 +683,7 @@ class FreshStartTest(BedtimeScaffold):
 
     def test_it_can_be_switched_off(self):
         cli.write_json(cli.FOLLOW_FILE, {"fresh_start": False})
-        self.off_overnight()
+        self.off_this_morning()
         self.assertEqual(self.outlook(), "switched off")
         self.sun(DAY)
         self.at(10, 58, day=1)
@@ -648,7 +693,7 @@ class FreshStartTest(BedtimeScaffold):
         self.assertIsNone(cli.fresh_start_look(self.now))
 
     def test_apple_home_gets_the_suns_setting_as_it_switches_on(self):
-        self.off_overnight()
+        self.off_this_morning()
         self.sun(DAY)
         self.at(10, 58, day=1)
         self.assertEqual(cli.fresh_start_look(self.now), (6500, 100))

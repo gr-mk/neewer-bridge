@@ -1135,7 +1135,7 @@ FOLLOW_DEFAULTS = {
     "hold_minutes": 120,     # how long a setting made elsewhere is left alone
     "fresh_start": True,     # a light switched on after being off goes straight to the sun's setting
     "bedtime_rule": True,    # fade out and switch off at bedtime
-    "morning_on": True,      # and switch on again before waking, if the rule switched it off
+    "morning_on": True,      # and switch on before waking, however it was switched off
     "fade_minutes": 5,       # how long the fade at bedtime takes
     "morning_lead_minutes": 30,  # how long before the wake time it comes back on
     "bedtime": "",           # "23:00"; empty means sundial's
@@ -1383,8 +1383,10 @@ def cmd_tracking(thing, args):
 #
 # The one place the follower switches the light off and on. At bedtime it
 # fades the light out and switches it off, once. Before the wake time it
-# switches it on again, if it was the one that switched it off. Anything done
-# by hand in between is left alone until morning.
+# switches it on, once, however it was switched off: by the fade, or by hand in
+# the evening or the night. Anything done by hand in between is left alone
+# until morning. A night the follower never saw (the Mac was off) gets no
+# morning either.
 #
 # memory["night"] is what it knows about the present night:
 #   start   when this night's bedtime was
@@ -1446,7 +1448,7 @@ def night_sentence(night, on, morning, settings):
     if night["state"] == "off":
         return "off for the night; on at %s" % hhmm(morning) if settings["morning_on"] else "off for the night"
     if not on:
-        return "off by hand; left alone tonight"
+        return "off by hand; on at %s" % hhmm(morning) if settings["morning_on"] else "off by hand; left alone tonight"
     if night.get("why") == "sunrise":
         return "a sunrise was running at bedtime; left alone tonight"
     if night.get("since"):
@@ -1470,8 +1472,10 @@ def bedtime_step(light, memory, settings, now, send, sunrise_running):
     on = light.state.get("on") is True
 
     if now >= morning:
-        # Day. Switch on once, if the follower was the one that switched off.
-        if night is None or night["state"] != "off":
+        # Day. Switch on once, however the light was switched off. Only after
+        # a night the follower saw; a night it missed (the Mac was off) is
+        # left alone.
+        if night is None or night["state"] == "done":
             return None
         if on or not settings["morning_on"] or sunrise_running():
             if send:
@@ -1676,7 +1680,8 @@ def bedtime_outlook(light, settings, memory, now):
     if now < morning and night is None:
         return "bedtime was %s; fading out now" % hhmm(start) if now - start <= BEDTIME_GRACE_SECONDS \
             else "on by hand; left alone tonight"
-    if night is not None and night["state"] == "off" and settings["morning_on"]:
+    if night is not None and night["state"] != "done" and settings["morning_on"] \
+            and light.state.get("on") is not True:
         return "switching on for the morning"
     following = night_window(now + 86400, times[0], times[1], settings["morning_lead_minutes"])
     text = "off at %02d:%02d" % (times[0] // 60, times[0] % 60)

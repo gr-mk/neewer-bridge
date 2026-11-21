@@ -197,11 +197,11 @@ At bedtime the light fades out over five minutes and switches off. Half an hour 
 
 Bedtime and the wake time are sundial's (`[sleep]` in `~/.config/sundial/config.ini`, 23:00 and 07:00 as it stands). They are read from there every minute, not copied, so changing them in sundial changes them here. `"bedtime"` and `"wake"` in `follow.json` (as `"22:30"`) take their place if set.
 
-- **Once a night.** The light is switched off once, at bedtime. If anything switches it back on before morning, or sets it, it is left alone until morning: it is not switched off a second time, and it is not followed either. If it is already off at bedtime, nothing is done.
-- **On in the morning only if the follower switched it off.** If you switched it off yourself, at any point, it stays off.
+- **Once a night.** The light is switched off once, at bedtime. If anything switches it back on before morning, or sets it, it is left alone until morning: it is not switched off a second time, and it is not followed either. If it is already off at bedtime, nothing is done until the morning.
+- **On in the morning, however it was switched off.** Switched off by the fade, or by you in the evening or the night, it comes on at the morning time. That happens once: switched off again after that, it stays off until the next morning. A night the follower never saw at all (the Mac off from before bedtime until after the morning time) gets no morning either.
 - **A setting made by hand does not put bedtime off.** A light set an hour before bedtime still goes off at bedtime.
 - **A setting made during the fade stops the fade**, and the light is yours for the night.
-- **Only near the time.** If the Mac was asleep at bedtime, or the rule was switched on in the middle of the night, that night is left alone. Bedtime is acted on within 15 minutes of it.
+- **Only near the time.** If the Mac was asleep at bedtime, or the rule was switched on in the middle of the night, that night is left alone: there is no fade, though the light still comes on in the morning. Bedtime is acted on within 15 minutes of it.
 - Switching on by hand after the fade brings back the setting from before the fade, not its last step. From Apple Home and the `neewer` command that is certain. The light's own button may wake it at its faintest: the old setting is sent to the light as it is switched off, but whether it keeps a setting sent in standby is not known.
 - A `neewer sunrise` running at bedtime or at the morning time is left to itself.
 
@@ -495,7 +495,7 @@ fixture follow on         # start again (Sun Tracking is its own switch: fixture
 
 The rules are the Neewer light's:
 
-- **It switches the fixture off and on only at bedtime and in the morning**, by the same rule as the Neewer light (see Bedtime above), with the same settings in its own `follow.json`. Otherwise it never does, and while the fixture is off it does nothing.
+- **It switches the fixture off and on only at bedtime and in the morning**, by the same rule as the Neewer light (see Bedtime above), with the same settings in its own `follow.json`, with one difference: in the morning it comes on only if the bedtime fade switched it off. Switched off by hand, it stays off. Otherwise it never does, and while the fixture is off it does nothing.
 - **A setting made elsewhere wins.** A change from Apple Home, the `fixture` command, the WiZ app or a single bulb's tile turns sun tracking off, and the fixture is left alone until it is turned on again, with `fixture tracking on` or the Sun Tracking switch.
 - **Switched on by day, it starts afresh**, as the Neewer light does (see A fresh start above), with `"fresh_start"` in its own `follow.json`. From Apple Home's Sun tile it is immediate: no bulb is sent the old setting first. From anywhere else (`fixture on`, the WiZ app, a bulb's own tile, the wall switch) the old setting shows until the follower's next look, up to a minute. Bulbs that did not answer, as when the wall switch is off, count as having been off.
 - **It only sends when what a bulb should show changes**, and writes one line to the log each time. It does not round brightness to a whole number, so through dusk and dawn the fixture moves one bulb at a time, in twelfths of a percent.
